@@ -993,6 +993,7 @@ dependencies = [
     { name = "numba" },
     { name = "numpy" },
     { name = "omegaconf" },
+    { name = "scipy" },
     { name = "typing-extensions" },
 ]
 
@@ -1005,6 +1006,7 @@ requires-dist = [
     { name = "numba", specifier = "==0.61.2" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "omegaconf", specifier = ">=2.3,<2.4" },
+    { name = "scipy", specifier = "==1.15.3" },
     { name = "typing-extensions", specifier = ">=4.1" },
 ]
 
@@ -1261,6 +1263,7 @@ dependencies = [
 ]
 wheels = [
     { url = "https://pypi.motphys.com/packages/motrixsim_core-0.10.1.dev123478+pro-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:fe585358b7c1dc9a81953e6820873e20e45a80bb226ca4ec287c5cdf72d75109" },
+    { url = "https://pypi.motphys.com/packages/motrixsim_core-0.10.1.dev123478+pro-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:7946cc8c2dd0699c9d6760276263593045008a5e6496a105a244f16c5d6f1846" },
     { url = "https://pypi.motphys.com/packages/motrixsim_core-0.10.1.dev123478+pro-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a9135536195f7139274ada6507cf1d23e0216ce0627867925bbefa06c706fca7" },
     { url = "https://pypi.motphys.com/packages/motrixsim_core-0.10.1.dev123478+pro-cp310-cp310-win_amd64.whl", hash = "sha256:be99be2772c5ef8947c9f4b171b0cc4b68204dcd1fdbe2ab000a963ee46a4252" },
 ]
@@ -2196,7 +2199,7 @@ name = "scipy"
 version = "1.15.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", marker = "sys_platform == 'linux' or sys_platform == 'win32' or extra != 'extra-10-motrix-lab-cuda' or (extra == 'extra-10-motrix-lab-cuda' and extra == 'extra-10-motrix-lab-rocm')" },
+    { name = "numpy" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/0f/37/6964b830433e654ec7485e45a00fc9a27cf868d622838f6b6d9c5ec0d532/scipy-1.15.3.tar.gz", hash = "sha256:eae3cf522bc7df64b42cad3925c876e1b0b6c35c1337c93e12c0f366f55b0eaf", size = 59419214, upload-time = "2025-05-08T16:13:05.955Z" }
 wheels = [
