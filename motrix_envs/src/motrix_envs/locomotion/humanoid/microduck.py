@@ -9,8 +9,12 @@ from motrix_env_core import registry
 from motrix_env_core.base import SimCfg
 from motrix_env_core.config.scene import HFieldTerrainCfg, SystemCameraCfg
 from motrix_env_core.manager import ManagerEnv
-from motrix_env_core.mdp.rewards import TrackingAngVelZRewardCfg, TrackingLinVelXyRewardCfg
-from motrix_env_core.mdp.terminations import CollidingTerminationCfg
+from motrix_env_core.mdp.rewards import (
+    AliveRewardCfg,
+    TrackingAngVelZRewardCfg,
+    TrackingLinVelXyRewardCfg,
+)
+from motrix_env_core.mdp.terminations import BadOrientationTerminationCfg, CollidingTerminationCfg
 from motrix_envs.config.scene import StandardSceneObjsCfg
 from motrix_envs.locomotion.humanoid import cfg as humanoid_cfg
 from motrix_envs.locomotion.humanoid.cfg import (
@@ -21,6 +25,7 @@ from motrix_envs.locomotion.humanoid.cfg import (
     WalkTerminationsCfg,
 )
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.command import WalkCommandCfg
+from motrix_envs.locomotion.humanoid.walk_manager_mdp.observations import TerrainHeightScanObsCfg
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.reset import WalkStateResetCfg
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.rewards import (
     FeetPhaseRewardCfg,
@@ -39,17 +44,18 @@ def _make_microduck_robot() -> Microduck:
 _MICRODUCK_TERMINATION_GEOMS = ("trunk_collision",)
 
 
-def _make_microduck_rewards(swing_height: float = 0.04) -> WalkRewardsCfg:
+def _make_microduck_rewards(swing_height: float = 0.04, alive_weight: float = 10.0) -> WalkRewardsCfg:
     return WalkRewardsCfg(
         tracking_lin_vel=TrackingLinVelXyRewardCfg(command_name="walk", sigma=0.15, weight=10.0),
         tracking_ang_vel=TrackingAngVelZRewardCfg(command_name="walk", sigma=0.15, weight=3.0),
+        alive=AliveRewardCfg(weight=alive_weight),
         penalty_action_rate=PenaltyActionRateRewardCfg(weight=-0.5),
         feet_phase=FeetPhaseRewardCfg(
             sole_l_site="left_foot",
             sole_r_site="right_foot",
             swing_height=swing_height,
-            feet_phase_sigma=0.002,
-            weight=8.0,
+            feet_phase_sigma=0.004,
+            weight=12.0,
         ),
         penalty_close_feet_xy=PenaltyCloseFeetXyRewardCfg(close_feet_threshold=0.05, weight=-10.0),
         pose=PoseRewardCfg(
@@ -157,11 +163,18 @@ def make_microduck_walk_stairs_cfg(step_height: float = 0.04) -> HumanoidVelocit
     assets = humanoid_cfg.make_stair_terrain_assets(
         step_height=step_height, tread_width=0.2, field_size=16.0, resolution=480
     )
-    # Stair-specific tweaks: the swing target clears the risers (3x step_height —
-    # the earlier 2x still showed feet grazing the edges), velocity commands stay
-    # within what 0.2 m treads allow, and the 480-resolution grid keeps hfield
-    # collision cheap (3.3 cm cells under 0.2 m treads).
-    rewards = _make_microduck_rewards(swing_height=3 * step_height)
+    # Stair-specific tweaks: the policy senses the height-field around the base
+    # (terrain_height_scan), the swing target stays reachable
+    # (1.5x step_height — higher targets starved feet_phase of gradient), a
+    # looser foot-height tolerance keeps the gait signal alive, a halved alive bonus keeps the robot pushing forward on
+    # fall-prone stairs, and velocity commands stay within what 0.2 m treads
+    # allow. The 480-resolution grid keeps hfield collision cheap (3.3 cm cells
+    # under 0.2 m treads).
+    rewards = _make_microduck_rewards(swing_height=1.5 * step_height, alive_weight=5.0)
+    observations = replace(
+        flat.observations,
+        policy=replace(flat.observations.policy, terrain_scan=TerrainHeightScanObsCfg()),
+    )
     commands = replace(
         flat.commands,
         walk=replace(flat.commands.walk, vel_limit=[[-0.3, -0.3, -0.3], [0.3, 0.3, 0.3]]),
@@ -170,13 +183,14 @@ def make_microduck_walk_stairs_cfg(step_height: float = 0.04) -> HumanoidVelocit
         flat,
         rewards=rewards,
         commands=commands,
+        observations=observations,
         scene=humanoid_cfg.HumanoidWalkSceneCfg(
             assets=assets,
             system_camera=SystemCameraCfg(
                 # Wide framing so the stair flights are visible.
-                lookat=(0.0, 0.0, 0.15),
-                distance=2.0,
-                elevation=-40.0,
+                lookat=(0.0, 0.0, 0.0),
+                distance=6.0,
+                elevation=-50.0,
                 azimuth=45.0,
             ),
             objs=StandardSceneObjsCfg(
@@ -188,6 +202,16 @@ def make_microduck_walk_stairs_cfg(step_height: float = 0.04) -> HumanoidVelocit
             ),
         ),
         sim_reset=WalkResetCfg(humanoid_state=WalkStateResetCfg(spawn_xy_range=4.0)),
+        terminations=WalkTerminationsCfg(
+            colliding=CollidingTerminationCfg(
+                termination_geoms=_MICRODUCK_TERMINATION_GEOMS,
+                ground_geom="floor",
+            ),
+            # On stairs the trunk scrapes a riser at only ~34° of tilt, so the
+            # contact check fires late and inconsistently; a tilt check gives
+            # an earlier, cleaner fall signal.
+            bad_orientation=BadOrientationTerminationCfg(tilt_degrees=30.0),
+        ),
         render_spacing=0.0,
     )
 

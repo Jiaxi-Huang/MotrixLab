@@ -65,7 +65,7 @@ def tracking_lin_vel_xy_reward(
     command = ctx.commands[command_name].command
     vx, vy, _ = rotate_inverse_components(base_quat, base_lin_vel)
     error = (command[0] - vx) * (command[0] - vx) + (command[1] - vy) * (command[1] - vy)
-    return math.exp(-error / sigma)
+    return math.exp(-error / (sigma * sigma))
 
 
 @configclass(kw_only=True)
@@ -99,7 +99,7 @@ def tracking_ang_vel_z_reward(
     command = ctx.commands[command_name].command
     _, _, wz = rotate_inverse_components(base_quat, base_ang_vel)
     error = (command[2] - wz) * (command[2] - wz)
-    return math.exp(-error / sigma)
+    return math.exp(-error / (sigma * sigma))
 
 
 @configclass(kw_only=True)

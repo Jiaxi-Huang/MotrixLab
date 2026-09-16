@@ -3,13 +3,16 @@
 
 """Reusable termination terms for manager-based environments."""
 
+import math
+
 import numpy as np
 
 from motrix_env_core.config import configclass
 from motrix_env_core.manager import ManagerContext, TerminationTerm, TerminationTermCfg
 from motrix_env_core.numba.manager.context import BuildContext
 from motrix_env_core.numba.manager.dispatch import dispatch
-from motrix_env_core.sim import GeomPairCollidingQuery
+from motrix_env_core.numba.math.quaternion import rotate_inverse_components
+from motrix_env_core.sim import GeomPairCollidingQuery, LinkQuaternionQuery
 
 
 @dispatch
@@ -35,7 +38,39 @@ class CollidingTerminationCfg(TerminationTermCfg):
         return TerminationTerm(colliding_termination, query)
 
 
+@dispatch
+def bad_orientation_termination(ctx: ManagerContext, base_quat: np.ndarray, gravity_z_limit: np.float32) -> bool:
+    _, _, gz = rotate_inverse_components(base_quat, (0.0, 0.0, -1.0))
+    # Upright reads gz = -1; tipping raises gz toward 0, so "too tilted" is
+    # gz above the -cos(tilt) limit.
+    return gz > gravity_z_limit
+
+
+@configclass(kw_only=True)
+class BadOrientationTerminationCfg(TerminationTermCfg):
+    """Terminate when the base tilts past ``tilt_degrees`` from upright.
+
+    Uses the projected gravity z of the base link: upright is ``-1``, and
+    ``cos(tilt)`` falls off as the base tips over. This catches falls earlier
+    than body-contact terminations, which only fire once the trunk scrapes the
+    ground.
+    """
+
+    body: str = "robot"
+    tilt_degrees: float = 30.0
+
+    def __call__(self, ctx: BuildContext) -> TerminationTerm:
+        limit = -math.cos(math.radians(self.tilt_degrees))
+        link = ctx.model.bodies[self.body].base_link_name
+        return TerminationTerm(
+            bad_orientation_termination,
+            LinkQuaternionQuery(link=link),
+            np.float32(limit),
+        )
+
+
 __all__ = [
+    "BadOrientationTerminationCfg",
     "CollidingTerminationCfg",
     "colliding_termination",
 ]

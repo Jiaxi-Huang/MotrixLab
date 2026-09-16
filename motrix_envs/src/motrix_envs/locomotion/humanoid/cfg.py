@@ -51,7 +51,7 @@ from motrix_env_core.mdp.rewards import (
     TrackingAngVelZRewardCfg,
     TrackingLinVelXyRewardCfg,
 )
-from motrix_env_core.mdp.terminations import CollidingTerminationCfg
+from motrix_env_core.mdp.terminations import BadOrientationTerminationCfg, CollidingTerminationCfg
 from motrix_env_core.sim import (
     ActuatorKpQuery,
     BodyJointPositionLimitsQuery,
@@ -60,7 +60,10 @@ from motrix_env_core.sim import (
 )
 from motrix_envs.config.scene import StandardSceneAssetsCfg, StandardSceneCfg
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.command import WalkCommandCfg
-from motrix_envs.locomotion.humanoid.walk_manager_mdp.observations import GaitPhaseObsCfg
+from motrix_envs.locomotion.humanoid.walk_manager_mdp.observations import (
+    GaitPhaseObsCfg,
+    TerrainHeightScanObsCfg,
+)
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.reset import WalkStateResetCfg
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.rewards import (
     FeetPhaseRewardCfg,
@@ -185,6 +188,8 @@ class WalkRewardsCfg(ManagerRewardsCfg):
 @configclass
 class WalkTerminationsCfg(ManagerTerminationsCfg):
     colliding: CollidingTerminationCfg = CollidingTerminationCfg()
+    # Optional early fall signal; None disables the check.
+    bad_orientation: BadOrientationTerminationCfg | None = None
 
 
 @configclass
@@ -201,6 +206,7 @@ class WalkObservationsCfg(ManagerObservationsCfg):
         actions: ActionsObsCfg = ActionsObsCfg()
         sin_phase: GaitPhaseObsCfg = GaitPhaseObsCfg(offset=0, size=2)
         cos_phase: GaitPhaseObsCfg = GaitPhaseObsCfg(offset=2, size=2)
+        terrain_scan: TerrainHeightScanObsCfg | None = None
 
     @configclass
     class ValueCfg(ManagerObservationGroupCfg):
@@ -277,5 +283,10 @@ class HumanoidVelocityTrackingManagerEnvCfg(ManagerBasedEnvCfg):
 
         # Scene-level facts shared by several terms.
         self.rewards.feet_phase.ground_geom = ground_geom
+        # Terrain-scan observations only make sense over an exported
+        # height-field; presets that opt in get the resolved ground geom here.
+        scan = getattr(self.observations.policy, "terrain_scan", None)
+        if scan is not None:
+            scan.ground_geom = ground_geom
         self.sim_reset.humanoid_state.ground_geom = ground_geom
         self.commands.walk.ctrl_dt = self.ctrl_dt
