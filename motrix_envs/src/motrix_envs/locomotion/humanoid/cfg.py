@@ -12,13 +12,17 @@ queries (height-field grid, key-pose foot frames via FK) provide the static
 data those terms consume. No environment subclass is needed.
 """
 
+from dataclasses import replace
+
 from motrix_env_core.base import SimCfg
 from motrix_env_core.config import configclass
 from motrix_env_core.config.scene import (
     HFieldTerrainCfg,
     NoiseTerrainGeneratorCfg,
     ProceduralHFieldAssetCfg,
+    StairsTerrainGeneratorCfg,
     SystemCameraCfg,
+    grid_terrain,
 )
 from motrix_env_core.manager import (
     ManagerActionsCfg,
@@ -81,6 +85,55 @@ class TerrainSceneAssetsCfg(StandardSceneAssetsCfg):
         size=(32.0, 32.0),
         shape=(320, 320),
     )
+
+
+def make_stair_terrain_assets(
+    *,
+    step_height: float = 0.02,
+    step_width: float = 0.15,
+    platform_fraction: float = 0.5,
+    grid_rows: int = 2,
+    grid_cols: int = 2,
+    field_size: float = 32.0,
+    resolution: int = 320,
+    seed: int = 0,
+) -> TerrainSceneAssetsCfg:
+    """Square grid of stair tiles for stair-walking training.
+
+    Each tile is a radial stair pyramid: treads of ``step_width`` meters, rising
+    ``step_height`` meters per step from the tile edge to a flat central
+    platform; tiles alternate between mounds (climb up then down) and pits
+    (descend into a central pit floor). ``step_height`` / ``step_width`` should
+    be tuned per robot scale — the defaults target a ~25 cm biped such as
+    Microduck (2 cm steps, 15 cm treads).
+    """
+    cell = field_size / max(grid_rows, grid_cols)
+    platform_width = platform_fraction * cell
+    rings = max(int((cell / 2.0 - platform_width / 2.0) / step_width), 1)
+    height_scale = rings * step_height
+    profiles = ("descending", "ascending")
+    cells = [
+        [
+            StairsTerrainGeneratorCfg(
+                axis="radial",
+                profile=profiles[(r + c) % 2],
+                step_count=rings + 1,
+                step_height=step_height,
+                step_width=step_width,
+                platform_width=platform_width,
+                height_scale=height_scale,
+                seed=seed + r * grid_cols + c,
+            )
+            for c in range(grid_cols)
+        ]
+        for r in range(grid_rows)
+    ]
+    terrain = ProceduralHFieldAssetCfg(
+        generator=grid_terrain(cells, height_scale=height_scale),
+        size=(field_size, field_size),
+        shape=(resolution, resolution),
+    )
+    return replace(TerrainSceneAssetsCfg(), terrain=terrain)
 
 
 @configclass

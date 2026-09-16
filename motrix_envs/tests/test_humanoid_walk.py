@@ -3,6 +3,7 @@
 
 """Behavioral contract tests for the manager-based humanoid walk presets."""
 
+import numpy as np
 import pytest
 
 from motrix_env_core import registry
@@ -23,6 +24,7 @@ from motrix_envs.locomotion.humanoid.k1 import (
 from motrix_envs.locomotion.humanoid.microduck import (
     make_microduck_walk_flat_cfg,
     make_microduck_walk_rough_cfg,
+    make_microduck_walk_stairs_cfg,
 )
 
 
@@ -115,3 +117,34 @@ def test_humanoid_walk_rejects_incomplete_joint_preset():
     # The backend rejects incomplete key poses at model compile time.
     with pytest.raises(ValueError, match="must cover every joint"):
         ManagerEnv(cfg, num_envs=2)
+
+
+def test_microduck_walk_stairs_env_registers_and_builds():
+    env = registry.make("microduck-walk-stairs", num_envs=1)
+    state = env.init_state()
+
+    assert type(env) is ManagerEnv
+    assert isinstance(env.cfg, HumanoidVelocityTrackingManagerEnvCfg)
+    assert env.action_space.shape == (14,)
+    assert state.obs.policy.shape == (1, 55)
+    env.step(np.zeros((1, 14), dtype=np.float32))
+
+
+def test_microduck_walk_stairs_step_height_is_configurable():
+    default_cfg = make_microduck_walk_stairs_cfg()
+    default_cells = default_cfg.scene.assets.terrain.generator.regions
+    assert default_cells[0].generator.step_height == pytest.approx(0.02)
+    assert default_cells[0].generator.profile == "descending"  # convex mound
+    assert default_cells[1].generator.profile == "ascending"  # concave pit
+
+    # Step height scales with the robot: raising it re-derives every tile level.
+    tall_cfg = make_microduck_walk_stairs_cfg(step_height=0.05)
+    tall_cells = tall_cfg.scene.assets.terrain.generator.regions
+    assert all(cell.generator.step_height == pytest.approx(0.05) for cell in tall_cells)
+    # Height scale covers the full stair climb: rings * step_height.
+    rings = tall_cells[0].generator.step_count - 1
+    assert tall_cells[0].generator.height_scale == pytest.approx(rings * 0.05)
+
+    heights = tall_cfg.scene.assets.terrain.generator.generate((32.0, 32.0), (320, 320))
+    assert np.all(heights >= 0.0)
+    assert np.all(heights <= 1.0)

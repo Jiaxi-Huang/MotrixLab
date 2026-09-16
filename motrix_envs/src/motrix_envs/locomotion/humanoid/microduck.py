@@ -135,3 +135,40 @@ def make_microduck_walk_rough_cfg() -> HumanoidVelocityTrackingManagerEnvCfg:
 
 registry.env("microduck-walk-flat")(ManagerEnv)
 registry.env("microduck-walk-rough")(ManagerEnv)
+
+
+@registry.envcfg("microduck-walk-stairs")
+def make_microduck_walk_stairs_cfg(step_height: float = 0.02) -> HumanoidVelocityTrackingManagerEnvCfg:
+    """Track walking commands with Microduck on a stair-tile field.
+
+    The field is a 2x2 grid of stair tiles (mounds and pits); the step geometry
+    is sized for the ~25 cm robot by default and is configurable: call this
+    factory with a different ``step_height``, or override further tile geometry
+    (``step_width``, ``platform_fraction``, grid layout) via
+    ``humanoid_cfg.make_stair_terrain_assets``.
+
+    zh_CN: 控制 Microduck 小型双足机器人在阶梯地形上跟踪行走指令；台阶高度可按
+    机器人尺度配置（默认 2 cm，适配约 25 cm 的 Microduck）。
+    """
+    flat = make_microduck_walk_flat_cfg()
+    return replace(
+        flat,
+        scene=humanoid_cfg.HumanoidWalkSceneCfg(
+            assets=humanoid_cfg.make_stair_terrain_assets(
+                step_height=step_height, step_width=0.12, platform_fraction=0.4
+            ),
+            system_camera=flat.scene.system_camera,
+            objs=StandardSceneObjsCfg(
+                floor=HFieldTerrainCfg(
+                    hfield="terrain",
+                    material="mat_ground",
+                ),
+                robot=_make_microduck_robot(),
+            ),
+        ),
+        sim_reset=WalkResetCfg(humanoid_state=WalkStateResetCfg(spawn_xy_range=4.0)),
+        render_spacing=0.0,
+    )
+
+
+registry.env("microduck-walk-stairs")(ManagerEnv)
