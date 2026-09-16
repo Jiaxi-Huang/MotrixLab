@@ -155,14 +155,16 @@ def make_microduck_walk_stairs_cfg(step_height: float = 0.04) -> HumanoidVelocit
     # Microduck-scale field: 16 m is plenty for a ~25 cm biped, and the smaller
     # extent doubles the height-field resolution per meter (1.25 cm cells).
     assets = humanoid_cfg.make_stair_terrain_assets(
-        step_height=step_height, tread_width=0.3, field_size=16.0, resolution=960
+        step_height=step_height, tread_width=0.2, field_size=16.0, resolution=480
     )
-    # Stair-specific tweaks: the swing target clears the risers (2x step_height),
-    # and velocity commands stay within what 0.3 m treads allow at this scale.
-    rewards = _make_microduck_rewards(swing_height=2 * step_height)
+    # Stair-specific tweaks: the swing target clears the risers (3x step_height —
+    # the earlier 2x still showed feet grazing the edges), velocity commands stay
+    # within what 0.2 m treads allow, and the 480-resolution grid keeps hfield
+    # collision cheap (3.3 cm cells under 0.2 m treads).
+    rewards = _make_microduck_rewards(swing_height=3 * step_height)
     commands = replace(
         flat.commands,
-        walk=replace(flat.commands.walk, vel_limit=[[-0.4, -0.4, -0.4], [0.4, 0.4, 0.4]]),
+        walk=replace(flat.commands.walk, vel_limit=[[-0.3, -0.3, -0.3], [0.3, 0.3, 0.3]]),
     )
     return replace(
         flat,
