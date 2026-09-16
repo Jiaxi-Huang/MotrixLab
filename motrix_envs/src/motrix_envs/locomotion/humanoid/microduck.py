@@ -39,7 +39,7 @@ def _make_microduck_robot() -> Microduck:
 _MICRODUCK_TERMINATION_GEOMS = ("trunk_collision",)
 
 
-def _make_microduck_rewards() -> WalkRewardsCfg:
+def _make_microduck_rewards(swing_height: float = 0.04) -> WalkRewardsCfg:
     return WalkRewardsCfg(
         tracking_lin_vel=TrackingLinVelXyRewardCfg(command_name="walk", sigma=0.15, weight=10.0),
         tracking_ang_vel=TrackingAngVelZRewardCfg(command_name="walk", sigma=0.15, weight=3.0),
@@ -47,7 +47,7 @@ def _make_microduck_rewards() -> WalkRewardsCfg:
         feet_phase=FeetPhaseRewardCfg(
             sole_l_site="left_foot",
             sole_r_site="right_foot",
-            swing_height=0.04,
+            swing_height=swing_height,
             feet_phase_sigma=0.002,
             weight=8.0,
         ),
@@ -157,8 +157,17 @@ def make_microduck_walk_stairs_cfg(step_height: float = 0.04) -> HumanoidVelocit
     assets = humanoid_cfg.make_stair_terrain_assets(
         step_height=step_height, tread_width=0.3, field_size=16.0, resolution=960
     )
+    # Stair-specific tweaks: the swing target clears the risers (2x step_height),
+    # and velocity commands stay within what 0.3 m treads allow at this scale.
+    rewards = _make_microduck_rewards(swing_height=2 * step_height)
+    commands = replace(
+        flat.commands,
+        walk=replace(flat.commands.walk, vel_limit=[[-0.4, -0.4, -0.4], [0.4, 0.4, 0.4]]),
+    )
     return replace(
         flat,
+        rewards=rewards,
+        commands=commands,
         scene=humanoid_cfg.HumanoidWalkSceneCfg(
             assets=assets,
             system_camera=SystemCameraCfg(
