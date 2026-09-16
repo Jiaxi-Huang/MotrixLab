@@ -36,7 +36,7 @@ def canonicalize_term_args(args: tuple[Any, ...], *, context: str) -> tuple[Any,
         else:
             raise TypeError(
                 f"{context} args[{index}] must be a scalar, a scalar tuple, an ndarray, "
-                f"or a @kernel_data value; got {type(value).__name__}."
+                f"a @kernel_data value, or a simulator data query; got {type(value).__name__}."
             )
     return tuple(values)
 

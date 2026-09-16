@@ -26,9 +26,10 @@ from motrix_env_core.mdp.observations import (
     ActionsObsCfg,
     BodyAngularVelocityObsCfg,
     BodyLinearVelocityObsCfg,
+    BodyProjectedGravityObsCfg,
     UniformNoiseCfg,
 )
-from motrix_env_core.mdp.rewards import ActionRateRewardCfg
+from motrix_env_core.mdp.rewards import ActionRateRewardCfg, AliveRewardCfg
 from motrix_env_core.sim import (
     ActuatorKpQuery,
     BatchLinkPositionQuery,
@@ -46,7 +47,6 @@ from motrix_envs.locomotion.ball_balance.mdp.observations import (
     BallRelativePositionObsCfg,
     BallRelativeVelocityObsCfg,
     BallVelocityObsCfg,
-    ProjectedGravityObsCfg,
 )
 from motrix_envs.locomotion.ball_balance.mdp.reset import (
     BallResetCfg,
@@ -57,7 +57,6 @@ from motrix_envs.locomotion.ball_balance.mdp.reset import (
     BodyRotVelResetCfg,
 )
 from motrix_envs.locomotion.ball_balance.mdp.rewards import (
-    AliveRewardCfg,
     BallUnderFeetRewardCfg,
     BaseHeightRewardCfg,
     DofDefaultRewardCfg,
@@ -141,7 +140,9 @@ class TerminationsCfg(ManagerTerminationsCfg):
 class ObservationsCfg(ManagerObservationsCfg):
     @configclass
     class PolicyCfg(ManagerObservationGroupCfg):
-        projected_gravity: ProjectedGravityObsCfg = ProjectedGravityObsCfg(noise=UniformNoiseCfg(amplitude=0.05))
+        projected_gravity: BodyProjectedGravityObsCfg = BodyProjectedGravityObsCfg(
+            noise=UniformNoiseCfg(amplitude=0.05)
+        )
         base_ang_vel: BodyAngularVelocityObsCfg = BodyAngularVelocityObsCfg(noise=UniformNoiseCfg(amplitude=0.1))
         ball_pos_b: BallRelativePositionObsCfg = BallRelativePositionObsCfg(noise=UniformNoiseCfg(amplitude=0.02))
         ball_vel_b: BallRelativeVelocityObsCfg = BallRelativeVelocityObsCfg(noise=UniformNoiseCfg(amplitude=0.1))
@@ -151,7 +152,7 @@ class ObservationsCfg(ManagerObservationsCfg):
 
     @configclass
     class ValueCfg(ManagerObservationGroupCfg):
-        projected_gravity: ProjectedGravityObsCfg = ProjectedGravityObsCfg()
+        projected_gravity: BodyProjectedGravityObsCfg = BodyProjectedGravityObsCfg()
         base_lin_vel: BodyLinearVelocityObsCfg = BodyLinearVelocityObsCfg()
         base_ang_vel: BodyAngularVelocityObsCfg = BodyAngularVelocityObsCfg()
         ball_pos_b: BallRelativePositionObsCfg = BallRelativePositionObsCfg()

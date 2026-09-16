@@ -17,7 +17,7 @@ dependencies = [
     "imageio-ffmpeg>=0.5",
     "numba==0.61.2",
     "numpy>=1.26",
-    "scipy==1.15.3",
+    "scipy==1.15.3", # numba requires scipy at compile time for np.linalg in kernels
     "omegaconf>=2.3,<2.4",
     "typing-extensions>=4.1",
 ]

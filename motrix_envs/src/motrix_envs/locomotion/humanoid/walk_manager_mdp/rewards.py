@@ -159,8 +159,6 @@ class PoseRewardCfg(RewardTermCfg):
     pose_weights: dict[str, float] = {}
 
     def __call__(self, ctx) -> RewardTerm:
-        cfg = ctx.cfg
-        robot = cfg.scene.objs.robot
         body = ctx.model.bodies["robot"]
         missing = sorted(set(body.joint_names).difference(self.pose_weights))
         if missing:
@@ -168,11 +166,13 @@ class PoseRewardCfg(RewardTermCfg):
         weights = np.asarray([self.pose_weights[name] for name in body.joint_names], dtype=np.float32)
         if np.any(weights < 0.0):
             raise ValueError("pose_weights must be non-negative")
+        # The query must use the compiled body joint names (prefix/suffix
+        # resolved) so it stays aligned with body.init_joint_pos and weights.
         return RewardTerm(
             pose_reward,
             body.init_joint_pos,
             weights,
-            JointPositionQuery(joints=tuple(robot.key_pose.joint_names)),
+            JointPositionQuery(joints=body.joint_names),
         )
 
 

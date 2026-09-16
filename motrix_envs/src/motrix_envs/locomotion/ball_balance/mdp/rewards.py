@@ -15,25 +15,6 @@ from motrix_env_core.numba.manager.dispatch import dispatch
 
 
 @dispatch
-def alive_reward(ctx: ManagerContext) -> float:
-    return 1.0
-
-
-@configclass(kw_only=True)
-class AliveRewardCfg(RewardTermCfg):
-    """Constant per-step survival bonus.
-
-    Dense positive rewards already reward surviving implicitly; this term
-    bottoms out the return so early policies with large action-rate penalties
-    cannot profit from terminating quickly.
-    """
-
-    def __call__(self, ctx) -> RewardTerm:
-        del ctx
-        return RewardTerm(alive_reward)
-
-
-@dispatch
 def upright_reward(ctx: ManagerContext, sigma: np.float32) -> float:
     base_quat = ctx.sim["robot_base_quat"]
     gravity = np.empty(3, dtype=np.float32)

@@ -183,8 +183,11 @@ class BodyAngularVelocityObsCfg(ObservationTermCfg):
 
 
 @dispatch
-def body_projected_gravity_obs(ctx: ManagerContext, out: np.ndarray, base_quat: np.ndarray) -> None:
+def body_projected_gravity_obs(
+    ctx: ManagerContext, out: np.ndarray, base_quat: np.ndarray, noise_amplitude: np.float32
+) -> None:
     rotate_inverse(base_quat, (0.0, 0.0, -1.0), out)
+    add_uniform_noise(out, noise_amplitude, ctx.rand.state)
 
 
 @configclass(kw_only=True)
@@ -192,10 +195,16 @@ class BodyProjectedGravityObsCfg(ObservationTermCfg):
     """Gravity direction of one scene body in its own frame."""
 
     body: str = "robot"
+    noise: UniformNoiseCfg = UniformNoiseCfg()
 
     def __call__(self, ctx: BuildContext) -> ObsTerm:
         body = _body(ctx, self.body)
-        return ObsTerm(3, body_projected_gravity_obs, LinkQuaternionQuery(link=body.base_link_name))
+        return ObsTerm(
+            3,
+            body_projected_gravity_obs,
+            LinkQuaternionQuery(link=body.base_link_name),
+            np.float32(self.noise.amplitude),
+        )
 
 
 @dispatch
