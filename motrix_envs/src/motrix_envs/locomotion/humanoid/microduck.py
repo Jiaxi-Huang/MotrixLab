@@ -201,16 +201,27 @@ def make_microduck_walk_stairs_cfg(step_height: float = 0.04) -> HumanoidVelocit
                 robot=_make_microduck_robot(),
             ),
         ),
-        sim_reset=WalkResetCfg(humanoid_state=WalkStateResetCfg(spawn_xy_range=4.0)),
+        sim_reset=WalkResetCfg(
+            humanoid_state=WalkStateResetCfg(
+                spawn_xy_range=4.0,
+                # Flat-patch spawn: keep retrying until the 9-point spawn
+                # patch is level, instead of dropping the robot onto a stair
+                # face. Combined with the spawn-range curriculum (start on
+                # the flat center platform, expand outward as episodes get
+                # longer), this removes both spawn-into-slope resets.
+                spawn_flatness_tol=0.02,
+                spawn_attempts=16,
+                spawn_curriculum=True,
+                spawn_ramp_ep_len=(150.0, 600.0),
+            )
+        ),
         terminations=WalkTerminationsCfg(
-            colliding=CollidingTerminationCfg(
-                termination_geoms=_MICRODUCK_TERMINATION_GEOMS,
-                ground_geom="floor",
-            ),
-            # On stairs the trunk scrapes a riser at only ~34° of tilt, so the
-            # contact check fires late and inconsistently; a tilt check gives
-            # an earlier, cleaner fall signal.
-            bad_orientation=BadOrientationTerminationCfg(tilt_degrees=30.0),
+            # On stairs the trunk scrapes risers at mild tilt during legitimate
+            # climbs, so the broad contact check kills recoverable stumbles
+            # (terminations fired at ~18° tilt on locally flat ground); the
+            # tilt check alone covers real topples, where the trunk necessarily
+            # drags.
+            bad_orientation=BadOrientationTerminationCfg(tilt_degrees=35.0),
         ),
         render_spacing=0.0,
     )

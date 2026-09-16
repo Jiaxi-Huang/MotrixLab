@@ -187,7 +187,8 @@ class WalkRewardsCfg(ManagerRewardsCfg):
 
 @configclass
 class WalkTerminationsCfg(ManagerTerminationsCfg):
-    colliding: CollidingTerminationCfg = CollidingTerminationCfg()
+    # Optional broad contact check; tilt-only presets leave it as None.
+    colliding: CollidingTerminationCfg | None = None
     # Optional early fall signal; None disables the check.
     bad_orientation: BadOrientationTerminationCfg | None = None
 
@@ -260,10 +261,23 @@ class HumanoidVelocityTrackingManagerEnvCfg(ManagerBasedEnvCfg):
         if "default" not in robot.key_pose.poses:
             raise ValueError("humanoid walk robot must define key pose 'default'")
 
-        ground_geom = self.terminations.colliding.ground_geom
+        # Ground-geom source of truth: the colliding termination when declared,
+        # otherwise the standard template's "floor" geom (tilt-only presets).
+        colliding = self.terminations.colliding
+        if colliding is not None:
+            ground_geom = colliding.ground_geom
+        elif getattr(self.scene.objs, "floor", None) is not None:
+            ground_geom = "floor"
+        else:
+            ground_geom = ""
         if not ground_geom:
-            raise ValueError("terminations.colliding requires a non-empty ground_geom")
-        termination_geoms = tuple(name for name in self.terminations.colliding.termination_geoms if name != ground_geom)
+            raise ValueError(
+                "humanoid walk requires a ground geom: set terminations.colliding.ground_geom "
+                "or name the scene floor object 'floor'"
+            )
+        termination_geoms = ()
+        if colliding is not None:
+            termination_geoms = tuple(name for name in colliding.termination_geoms if name != ground_geom)
         # Reward and observation terms self-declare their data queries; the
         # task declares only what no term owns.
         self.queries.data = {}
