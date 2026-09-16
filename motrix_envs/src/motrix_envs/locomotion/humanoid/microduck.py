@@ -138,26 +138,36 @@ registry.env("microduck-walk-rough")(ManagerEnv)
 
 
 @registry.envcfg("microduck-walk-stairs")
-def make_microduck_walk_stairs_cfg(step_height: float = 0.02) -> HumanoidVelocityTrackingManagerEnvCfg:
-    """Track walking commands with Microduck on a stair-tile field.
+def make_microduck_walk_stairs_cfg(step_height: float = 0.04) -> HumanoidVelocityTrackingManagerEnvCfg:
+    """Track walking commands with Microduck on a stair-flight field.
 
-    The field is a 2x2 grid of stair tiles (mounds and pits); the step geometry
-    is sized for the ~25 cm robot by default and is configurable: call this
-    factory with a different ``step_height``, or override further tile geometry
-    (``step_width``, ``platform_fraction``, grid layout) via
+    The field is a 2x2 checkerboard of four-way pyramid stairs: convex tiles
+    climb to a central platform, concave tiles sink to a central pit. The step
+    geometry is sized for the ~25 cm robot by default and is configurable: call
+    this factory with a different ``step_height``, or override further tile
+    geometry (``tread_width``, ``platform_fraction``, grid layout) via
     ``humanoid_cfg.make_stair_terrain_assets``.
 
     zh_CN: 控制 Microduck 小型双足机器人在阶梯地形上跟踪行走指令；台阶高度可按
-    机器人尺度配置（默认 2 cm，适配约 25 cm 的 Microduck）。
+    机器人尺度配置（默认 4 cm，适配约 25 cm 的 Microduck）。
     """
     flat = make_microduck_walk_flat_cfg()
+    # Microduck-scale field: 16 m is plenty for a ~25 cm biped, and the smaller
+    # extent doubles the height-field resolution per meter (1.25 cm cells).
+    assets = humanoid_cfg.make_stair_terrain_assets(
+        step_height=step_height, tread_width=0.3, field_size=16.0, resolution=960
+    )
     return replace(
         flat,
         scene=humanoid_cfg.HumanoidWalkSceneCfg(
-            assets=humanoid_cfg.make_stair_terrain_assets(
-                step_height=step_height, step_width=0.12, platform_fraction=0.4
+            assets=assets,
+            system_camera=SystemCameraCfg(
+                # Wide framing so the stair flights are visible.
+                lookat=(0.0, 0.0, 0.15),
+                distance=2.0,
+                elevation=-40.0,
+                azimuth=45.0,
             ),
-            system_camera=flat.scene.system_camera,
             objs=StandardSceneObjsCfg(
                 floor=HFieldTerrainCfg(
                     hfield="terrain",

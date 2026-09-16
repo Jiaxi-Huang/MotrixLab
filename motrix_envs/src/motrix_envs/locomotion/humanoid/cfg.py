@@ -17,6 +17,7 @@ from dataclasses import replace
 from motrix_env_core.base import SimCfg
 from motrix_env_core.config import configclass
 from motrix_env_core.config.scene import (
+    FlatTerrainGeneratorCfg,
     HFieldTerrainCfg,
     NoiseTerrainGeneratorCfg,
     ProceduralHFieldAssetCfg,
@@ -89,47 +90,53 @@ class TerrainSceneAssetsCfg(StandardSceneAssetsCfg):
 
 def make_stair_terrain_assets(
     *,
-    step_height: float = 0.02,
-    step_width: float = 0.15,
+    step_height: float = 0.04,
+    tread_width: float = 0.3,
     platform_fraction: float = 0.5,
     grid_rows: int = 2,
     grid_cols: int = 2,
     field_size: float = 32.0,
-    resolution: int = 320,
+    resolution: int = 1280,
     seed: int = 0,
 ) -> TerrainSceneAssetsCfg:
-    """Square grid of stair tiles for stair-walking training.
+    """Checkerboard of four-way pyramid stairs for stair-walking training.
 
-    Each tile is a radial stair pyramid: treads of ``step_width`` meters, rising
-    ``step_height`` meters per step from the tile edge to a flat central
-    platform; tiles alternate between mounds (climb up then down) and pits
-    (descend into a central pit floor). ``step_height`` / ``step_width`` should
-    be tuned per robot scale — the defaults target a ~25 cm biped such as
-    Microduck (2 cm steps, 15 cm treads).
+    Convex tiles climb from all four edges to a flat central platform; concave
+    tiles sink from the edges to a central pit floor. The shared base plane
+    (half of the total vertical budget) keeps every tile rim at the same height
+    so tiles join seamlessly. ``step_height`` / ``tread_width`` should be tuned
+    per robot scale — the defaults target a ~25 cm biped such as Microduck.
     """
     cell = field_size / max(grid_rows, grid_cols)
     platform_width = platform_fraction * cell
-    rings = max(int((cell / 2.0 - platform_width / 2.0) / step_width), 1)
-    height_scale = rings * step_height
+    rings = max(int((cell / 2.0 - platform_width / 2.0) / tread_width), 1)
+    # Double the vertical budget: the base plane sits at half height, mounds
+    # climb to the top and pits dip to the floor.
+    height_scale = 2 * rings * step_height
+    base_levels = {"descending": 0.5, "ascending": 0.0}
     profiles = ("descending", "ascending")
-    cells = [
-        [
-            StairsTerrainGeneratorCfg(
-                axis="radial",
-                profile=profiles[(r + c) % 2],
-                step_count=rings + 1,
-                step_height=step_height,
-                step_width=step_width,
-                platform_width=platform_width,
-                height_scale=height_scale,
-                seed=seed + r * grid_cols + c,
-            )
-            for c in range(grid_cols)
-        ]
-        for r in range(grid_rows)
-    ]
+
+    def _tile(r: int, c: int) -> StairsTerrainGeneratorCfg:
+        profile = profiles[(r + c) % 2]
+        return StairsTerrainGeneratorCfg(
+            axis="radial",
+            profile=profile,
+            step_count=rings + 1,
+            step_height=step_height,
+            step_width=tread_width,
+            platform_width=platform_width,
+            base_level=base_levels[profile],
+            height_scale=height_scale,
+            seed=seed + r * grid_cols + c,
+        )
+
+    cells = [[_tile(r, c) for c in range(grid_cols)] for r in range(grid_rows)]
     terrain = ProceduralHFieldAssetCfg(
-        generator=grid_terrain(cells, height_scale=height_scale),
+        generator=grid_terrain(
+            cells,
+            height_scale=height_scale,
+            base=FlatTerrainGeneratorCfg(height=0.5, height_scale=height_scale),
+        ),
         size=(field_size, field_size),
         shape=(resolution, resolution),
     )

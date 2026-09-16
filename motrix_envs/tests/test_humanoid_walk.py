@@ -133,18 +133,33 @@ def test_microduck_walk_stairs_env_registers_and_builds():
 def test_microduck_walk_stairs_step_height_is_configurable():
     default_cfg = make_microduck_walk_stairs_cfg()
     default_cells = default_cfg.scene.assets.terrain.generator.regions
-    assert default_cells[0].generator.step_height == pytest.approx(0.02)
-    assert default_cells[0].generator.profile == "descending"  # convex mound
-    assert default_cells[1].generator.profile == "ascending"  # concave pit
+    assert all(cell.generator.step_height == pytest.approx(0.04) for cell in default_cells)
+    # Convex (mound) and concave (pit) tiles alternate in a checkerboard.
+    assert default_cells[0].generator.profile == "descending"
+    assert default_cells[1].generator.profile == "ascending"
 
-    # Step height scales with the robot: raising it re-derives every tile level.
-    tall_cfg = make_microduck_walk_stairs_cfg(step_height=0.05)
+    tall_cfg = make_microduck_walk_stairs_cfg(step_height=0.08)
     tall_cells = tall_cfg.scene.assets.terrain.generator.regions
-    assert all(cell.generator.step_height == pytest.approx(0.05) for cell in tall_cells)
-    # Height scale covers the full stair climb: rings * step_height.
-    rings = tall_cells[0].generator.step_count - 1
-    assert tall_cells[0].generator.height_scale == pytest.approx(rings * 0.05)
+    assert all(cell.generator.step_height == pytest.approx(0.08) for cell in tall_cells)
+    # Mound tiles sit on the raised base plane, pit tiles reach down to the floor.
+    assert tall_cells[0].generator.base_level == pytest.approx(0.5)
+    assert tall_cells[1].generator.base_level == pytest.approx(0.0)
 
+    # Seamless tiling: every tile rim is at the shared base plane, so no vertical
+    # wall larger than a single step exists anywhere in the field.
     heights = tall_cfg.scene.assets.terrain.generator.generate((32.0, 32.0), (320, 320))
     assert np.all(heights >= 0.0)
     assert np.all(heights <= 1.0)
+    step_jump = 0.08 / tall_cfg.scene.assets.terrain.generator.height_scale
+    assert np.abs(np.diff(heights, axis=0)).max() <= step_jump + 1e-6
+    assert np.abs(np.diff(heights, axis=1)).max() <= step_jump + 1e-6
+
+
+def test_humanoid_walk_rejects_incomplete_joint_preset():
+    cfg = make_g129dof_walk_flat_cfg()
+    cfg.scene.objs.robot.key_pose.joint_names.pop(0)
+    cfg.scene.objs.robot.key_pose.poses["default"].pop(0)
+
+    # The backend rejects incomplete key poses at model compile time.
+    with pytest.raises(ValueError, match="must cover every joint"):
+        ManagerEnv(cfg, num_envs=2)
