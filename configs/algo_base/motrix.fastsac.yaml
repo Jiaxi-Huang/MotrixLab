@@ -95,3 +95,11 @@ trainer:
     collector_amp: true
     # Collector autocast dtype: fp16 or bf16.
     collector_amp_dtype: fp16
+    # Number of collector processes; num_envs is split evenly across them (must divide evenly).
+    num_collectors: 1
+    # One NUMA node id per collector for CPU affinity and memory binding, e.g. [0, 1]; null keeps OS default placement.
+    numa_nodes: null
+    # CPUs assigned to each collector from its node/affinity set; null uses all of them.
+    cpus_per_collector: null
+    # NUMA node the learner binds to (GPU-local memory); null keeps OS default placement.
+    learner_numa_node: null

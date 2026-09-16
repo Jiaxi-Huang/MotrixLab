@@ -17,29 +17,60 @@ async-specific orchestration (drain, UTD-ratio governance, weight publishing).
 from __future__ import annotations
 
 import time
+from collections.abc import Iterable, Iterator
+
+import torch
 
 from motrix_rl.fastsac.agent import FastSacAgent
-from motrix_rl.fastsac.async_impl.shm import Control, SharedTransitionRing, WeightSnapshot
+from motrix_rl.fastsac.async_impl.shm import (
+    Control,
+    SharedTransitionRing,
+    TransitionFields,
+    WeightSnapshot,
+)
 from motrix_rl.fastsac.config import FastSacCfg
 
 
 class Learner:
+    """Drains N independent SPSC rings (one per collector) and broadcasts weights.
+
+    Each collector owns its own ring and its own :class:`WeightSnapshot`; the
+    single-writer invariants of both primitives are preserved unchanged. The
+    learner round-robins the rings (per-ring ingest bound so a fast collector's
+    full ring never starves the others) and publishes the current actor snapshot
+    to every collector in turn — each publish is independent and lock-free, so
+    one slow reader never blocks the others.
+
+    Ring slots carry ``num_envs / num_collectors`` transitions each. The replay
+    buffer (and its n-step time adjacency per env) is built around full
+    ``num_envs`` batches, so shards are merged by generation: the k-th slot of
+    every collector assembles into the k-th full batch (env ids map to
+    contiguous shard blocks). A slow collector's generation stays pending on
+    the CPU slot views until complete — its own ring fills up and backpressures
+    only that collector; read cursors are committed only after the merged batch
+    reached the GPU, preserving the ring's no-clobber guarantee.
+    """
+
     def __init__(
         self,
         agent: FastSacAgent,
         cfg: FastSacCfg,
-        ring: SharedTransitionRing,
-        weights: WeightSnapshot,
+        rings: list[SharedTransitionRing],
+        weights: list[WeightSnapshot],
         control: Control,
     ):
         self.agent = agent
         self.cfg = cfg
         self.async_options = cfg.trainer.async_options
-        self.ring = ring
+        self.rings = rings
         self.weights = weights
         self.control = control
         self._learning_starts = agent.cfg.learning_starts
         self._last_publish_ms = 0.0
+        # generation assembly: generation index -> one shard slot per ring,
+        # still None while that ring's shard for the generation is in flight.
+        self._pending: dict[int, list[TransitionFields | None]] = {}
+        self._next_gen = 0
 
         # keep normalizers/actor in train mode: the learner is the update side.
         self.agent.set_train_mode()
@@ -53,38 +84,83 @@ class Learner:
 
     # ------------------------------------------------------------------ ingest
     def drain(self) -> int:
-        """Move up to ``max_ingest_per_iter`` ring slots into the replay buffer.
+        """Move up to ``max_ingest_per_iter`` slots per ring into the replay buffer.
 
-        Returns the number of slots ingested. Read cursor advances only after the
-        GPU copy, so the collector cannot clobber an in-flight slot.
+        Returns the number of full ``num_envs`` batches ingested. Slots are
+        assembled into generations (one shard per collector); complete
+        generations are merged, moved to the GPU and written with one
+        :meth:`extend_batch` per field per flush. With a single ring every
+        consumed slot is a complete generation, so the same path degenerates
+        to plain batched ingest with no merge barrier. Read cursors advance
+        only after the GPU copy, so a collector cannot clobber an in-flight
+        slot; a full or slow ring only blocks itself.
         """
         device = self.agent.device
-        ingested = 0
-        for _ in range(max(self.async_options.max_ingest_per_iter, 1)):
-            slot = self.ring.read_slot()
-            if slot is None:
+        num_rings = len(self.rings)
+        for ring_id, ring in enumerate(self.rings):
+            base = ring.read_idx
+            for offset in range(max(self.async_options.max_ingest_per_iter, 1)):
+                slot = ring.read_slot(offset)
+                if slot is None:
+                    break
+                parts = self._pending.setdefault(base + offset, [None] * num_rings)
+                parts[ring_id] = slot
+        return self._flush_complete_generations(device)
+
+    def _flush_complete_generations(self, device) -> int:
+        generations: list[list[TransitionFields]] = []
+        while True:
+            parts = self._pending.get(self._next_gen)
+            if parts is None or any(part is None for part in parts):
                 break
-            obs, critic_obs, actions, rewards, dones, truncations, next_obs, next_critic_obs = slot
-            self.agent.rb.extend(
-                obs.to(device),
-                critic_obs.to(device),
-                actions.to(device),
-                rewards.to(device),
-                dones.to(device),
-                truncations.to(device),
-                next_obs.to(device),
-                next_critic_obs.to(device),
-            )
-            self.ring.commit_read()
-            ingested += 1
-        return ingested
+            generations.append(parts)
+            del self._pending[self._next_gen]
+            self._next_gen += 1
+        if not generations:
+            return 0
+        # env blocks concatenate in collector order -> env id mapping is
+        # stable across batches, so per-env trajectories stay contiguous
+        # in the buffer's time dimension. A single shard skips the cat.
+        merged: Iterator[TransitionFields] = (
+            parts[0] if len(parts) == 1 else tuple(torch.cat(field) for field in zip(*parts)) for parts in generations
+        )
+        self._ingest(merged)
+        for _ in generations:
+            for ring in self.rings:
+                ring.commit_read()
+        return len(generations)
+
+    def _ingest(self, batches: Iterable[TransitionFields]) -> None:
+        """Write one or more full ``num_envs`` batches with a single buffer
+        write per field.
+
+        Batches move to the GPU first, then stack along a new time axis
+        (``(num_envs, count, dim)``), so :meth:`extend_batch` issues eight
+        contiguous GPU-side column writes instead of eight per batch — both
+        the blocking H2D count and the GPU kernel count stay flat as the
+        ingest batch grows.
+        """
+        device = self.agent.device
+        on_device = (tuple(field.to(device) for field in batch) for batch in batches)
+        self.agent.rb.extend_batch(*(torch.stack(column, dim=1) for column in zip(*on_device)))
 
     # ------------------------------------------------------------------ update
     def _ready(self) -> bool:
-        return self.control.collector_steps >= self._learning_starts and self.agent.rb.num_stored > 0
+        # Each collector warms up for learning_starts of its own (sharded)
+        # batches, so the aggregate threshold scales with the collector count;
+        # in full-batch equivalents this keeps `learning_starts` iterations of
+        # num_envs transitions before the first update, like the sync trainer.
+        return (
+            self.control.collector_steps >= self._learning_starts * self.control.num_collectors
+            and self.agent.rb.num_stored > 0
+        )
 
     def _num_updates_for(self, ingested: int) -> int:
-        """Decide how many gradient updates to run this iteration."""
+        """Decide how many gradient updates to run this iteration.
+
+        ``ingested`` counts full ``num_envs`` batches (shards are merged before
+        ingestion), so the strict ratio needs no per-collector rescaling.
+        """
         base = self.agent.cfg.num_updates
         mode = self.async_options.utd_mode
         if mode == "strict":
@@ -112,7 +188,9 @@ class Learner:
 
     # ------------------------------------------------------------------ publish
     def publish_weights(self) -> None:
-        self.weights.publish(self.agent.actor, self.agent.obs_normalizer)
+        """Broadcast the current actor snapshot to every collector's snapshot."""
+        for weights in self.weights:
+            weights.publish(self.agent.actor, self.agent.obs_normalizer)
 
     def publish_if_due(self) -> None:
         if self.agent.update_idx % max(self.async_options.weight_publish_interval, 1) == 0:

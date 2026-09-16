@@ -2,7 +2,7 @@
 
 ## 摘要
 
-异构 FastSAC 训练器把**仿真采样（collector）**与**网络训练（learner）**拆到两个进程，通过共享内存交换 transition 与权重，使 CPU 物理仿真与 GPU 梯度计算重叠，消除同步实现里「采样 → 训练 → 采样」串行循环中的 GPU 空转。
+异构 FastSAC 训练器把**仿真采样（collector）**与**网络训练（learner）**拆到两个进程，通过共享内存交换 transition 与权重，使 CPU 物理仿真与 GPU 梯度计算重叠，消除同步实现里「采样 → 训练 → 采样」串行循环中的 GPU 空转。多 NUMA node 服务器上可配置多个 collector 进程（每 node 一个），拓扑见 §8；本节先描述默认的 1 collector × 1 learner。
 
 同步与异步执行共用 `motrix` framework 下唯一的 `fastsac` provider，对外方法名统一为 `motrix.fastsac`。`algo.asynchronous` 只选择执行拓扑，不改变算法、配置类型、run 身份或 checkpoint 格式。算法本身（`Actor`/`Critic`/`SimpleReplayBuffer`/`EmpiricalNormalization`/`FastSacAgent`）**原样复用、逐字节一致**。异构执行是默认模式，首要目标是让采样与训练各自满速。
 
@@ -74,6 +74,7 @@ motrix_rl/src/motrix_rl/fastsac/
 │   └── train.py              # 同步 Trainer
 └── async_impl/
     ├── shm.py                # 共享内存原语：SharedTransitionRing / WeightSnapshot / Control
+    ├── numa.py               # 多 collector 的 NUMA/CPU 绑定（sched_setaffinity + libnuma set_membind）
     ├── collector.py          # Collector：CPU 采样进程逻辑
     ├── learner.py            # Learner：GPU 训练进程逻辑 + UTD 治理
     ├── worker.py             # module-level 进程入口（可被 spawn pickle）+ 共享 builder
@@ -161,7 +162,7 @@ producer lifetime 和 compiled collector 固定参数地址，不能只把 H2D �
 
 ### 4.3 Control — 共享标量
 
-一小组共享 int64：`stop`（停止标志）、`global_step`（learner 迭代计数）、`collector_steps`（已产出的 env-step 批数，即训练进度基准）。seed 不放这里，作为进程入口参数直接传入。
+一小组共享 int64：`stop`（停止标志）、`global_step`（learner 迭代计数）、`collector_steps`（已产出的 env-step 批数，即训练进度基准；多 collector 下为 per-collector 计数器数组，每个 collector 单写自己的计数，聚合属性求和，见 §8）。seed 不放这里，作为进程入口参数直接传入（collector 的 seed 为 `seed + collector_id`）。
 
 ---
 
@@ -221,16 +222,20 @@ learner 启动即 `publish_weights()`，让 collector 在正式采样前拿到�
 ```python
 @dataclass
 class FastSacAsyncOptionsCfg:
-    ring_capacity: int = 64  # SharedTransitionRing slot 数
+    ring_capacity: int = 64  # SharedTransitionRing slot 数（每 collector 一条独立 ring）
     utd_mode: str = "strict"  # strict=精确比例；learner_bound=吞吐优先
-    weight_publish_interval: int = 4  # learner 每 N 次更新发布一次权重
+    weight_publish_interval: int = 4  # learner 每 N 次更新发布一次权重（逐 collector 广播）
     weight_poll_interval: int = 1  # collector 每 N 个 env-step 检查一次新权重
-    max_ingest_per_iter: int = 8  # learner 每轮最多 drain 多少 slot
+    max_ingest_per_iter: int = 8  # learner 每轮对每条 ring 最多 drain 多少 slot
     idle_sleep_s: float = 0.0005  # 满环/欠数据时的退避睡眠
     collector_inference_device: str = "cuda"  # cpu / cuda / cuda:N；只控制 actor + policy normalizer
     collector_compile: bool = True  # CUDA 固定 batch 推理使用 reduce-overhead
     collector_amp: bool = True  # 默认使用实测吞吐最优的 FP16 collector autocast
     collector_amp_dtype: str = "fp16"  # fp16 / bf16
+    num_collectors: int = 1  # collector 进程数；num_envs 均分（须整除）
+    numa_nodes: list[int] | None = None  # 每 collector 一个 NUMA node（len == num_collectors）；None 不绑定
+    cpus_per_collector: int | None = None  # 每 collector 从其 node/affinity 集合取的 CPU 数；None 用全部
+    learner_numa_node: int | None = None  # learner 绑定的 NUMA node（GPU 本地）；None 不绑定
 
 
 @dataclass
@@ -249,11 +254,37 @@ class FastSacCfg:
 
 ---
 
-## 8. 不变量与关键取舍
+## 8. 多 collector 与 NUMA 绑定（多 NUMA node 服务器）
+
+默认拓扑仍是 1 collector × 1 learner。配置 `num_collectors > 1` 后，`num_envs` 均分给 N 个 collector 进程（要求整除），每个 collector 绑定一个 NUMA node 满速采样。核心原则：**learner 的 GPU 永不因数据断粮空转，collector 全速自由跑，一切同步点允许松弛**。
+
+**拓扑扩展**：
+
+- **每 collector 一条独立 SPSC ring**（不做共享 MPSC 环）：ring 的 slot 形状为 `(capacity, num_envs/N, dim)`，所有无锁原语（单写方游标、seqlock）原样保留。满环背压按 ring 独立——快的 collector 阻塞在自己的满环上，不拖住别人。
+- **每 collector 一份独立 `WeightSnapshot`**：learner 逐份非阻塞 `publish`，某份正在被读（seqlock odd）不影响其他份；staleness 以 `async/policy_lag`（聚合 max）与 `async/policy_lag_collector{i}`（多 collector 时分列）监控，不做版本对齐屏障。
+- **learner 轮询多路 ring 并按「代」合并**：`drain()` 对每条 ring 至多消费 `max_ingest_per_iter` 个 slot；第 k 代（各 collector 的第 k 个 slot）拼成完整 `num_envs` 批（env 按 collector 连续分块映射，保证 n-step 的时间相邻性）。一个循环内所有完整批次先各自 `.to(device)`，再在 GPU 侧沿时间轴 stack，最后用 `SimpleReplayBuffer.extend_batch` 每字段一次连续列写入（H2D 次数与 GPU kernel 数不随批量增长——RTX 3090 + 双 CUDA collector 实测，逐批 `extend` 的阻塞式 CPU 源拷贝在多 CUDA context 争用下显著变慢）。未集齐的「代」以 CPU slot 视图挂起——慢 collector 自己的 ring 会先填满并背压它自己，不拖住别人；所有 ring 的读游标只在合并批到达 GPU 后推进，保持 ring 的 no-clobber 保证。`strict` 模式的 UTD 记账因此无需按 collector 数缩放（合并批就是完整 `num_envs` 批），任意 collector 数下长期 UTD 精确等于 `num_updates`；`learner_bound` 下 ring 全空时 learner 不等待，在已有 buffer 上继续 `num_updates`。
+- **数据顺序无关**：off-policy + i.i.d. 采样，多 collector 的 transition 入 buffer 顺序无关，不引入全局序号。
+- **seed 按 collector 划分**（`seed + collector_id`），保证可复现且样本不重复。
+- **进度与日志**：`Control.collector_steps` 是 per-collector 计数器数组（单写方不变），聚合求和后除以 collector 数得到「完整 num_envs 批等价步」，作为训练进度 / 日志 / checkpoint / resume 的统一基准——任意 collector 数下 `num_learning_iterations`、`learning_starts`、TensorBoard x 轴与同步版语义一致；每 collector 有独立 `StatsQueue`（快照携带 `collector_id`），learner 聚合（return/ep_len/timing 取均值、episodes 求和、policy_lag 取 max）后喂给与单 collector 完全相同的面板与 TensorBoard 标量；多 collector 时额外输出 `async/policy_lag_collector{i}`、`async/ring_fill_collector{i}`，单 collector 的标量键保持不变。
+- **resume 语义**：多 collector 下 resume 与单 collector 相同——learner 从 checkpoint 恢复网络与优化器，所有 collector 重新 reset env 后从 checkpointed iteration 继续采样；ring / 在途 transition 不跨进程恢复。
+
+**NUMA 绑定**（`async_impl/numa.py`，等价 `numactl --cpunodebind= --membind=`，best-effort）：
+
+- CPU affinity：`os.sched_setaffinity` 绑到 node 的 CPU 列表（sysfs `node{X}/cpulist`）；配置 `cpus_per_collector` 时进一步切成不重叠的连续分片，避免 collector 之间抢核。
+- 内存策略：libnuma 的 `set_membind`（ctypes 加载，numactl 同款调用）把该进程**后续**分配绑到本地 node——因此绑定发生在 worker 进程的第一行，先于 env / staging / pinned buffer 的任何分配。libnuma 不可用或 node 未知时告警并沿用 OS 默认放置，单 NUMA 机器与容器行为不变。
+- learner 也可经 `learner_numa_node` 绑到 GPU 所在 node（PCIe 本地）；drain 时跨 node 读 ring 无法避免，但 replay buffer 与采样索引保持 node 本地。
+
+**collector 推理设备**：多 collector 改变 CPU/CUDA 推理的权衡（N 个 CUDA collector 与 learner 产生 N 倍 H2D/D2H burst 争用）。首版保持默认 `collector_inference_device="cuda"`（与单 collector 一致）；`scripts/bench_fastsac_collector_inference.py` 支持 `--num-collectors/--numa-nodes/--cpus-per-collector`，用实测吞吐决定多 collector 场景默认值是否调整。
+
+**明确不做**：共享 MPSC 环 / 原子游标、collector 间同步、per-step 权重同步、多机。
+
+---
+
+## 9. 不变量与关键取舍
 
 - **算法不变**：transition 构造、`rb.extend` 调用与 `sample` 语义、更新数学与同步版逐字节一致；异构只改「谁在哪个进程执行」。
 - **normalizer 单写方**：只有 learner 以 `update=True` 更新 normalizer；collector 只读快照。权重通道因此是单向的。
-- **单生产者单消费者**：环与权重快照都建立在「每个共享量只有一个写方」之上，这是无锁 / 无 CAS 的前提；游标与数据之间的顺序则依赖 x86/TSO（不插屏障，故当前 **x86-only**，弱内存序 ISA 暂不支持）。当前只支持 1 collector × 1 learner、单机；不做多机分布式。
+- **单生产者单消费者**：环与权重快照都建立在「每个共享量只有一个写方」之上，这是无锁 / 无 CAS 的前提；多 collector 通过「每 collector 一条独立 ring + 一份独立 WeightSnapshot」保持该前提，而不是引入 MPSC / 原子游标。游标与数据之间的顺序则依赖 x86/TSO（不插屏障，故当前 **x86-only**，弱内存序 ISA 暂不支持）。当前支持 1..N collector × 1 learner、单机；不做多机分布式。
 - **背压优先于放开比例**：collector 快时阻塞采样而非无界缓冲，用 `ring_capacity` 吸收抖动，避免 off-policy 失真。
 - **checkpoint 与同步版字节兼容**：保证 play / resume 互通与 A/B 对比有效。
 - **非确定性**：两进程相对速度随机，逐步复现不可能；正确性以「固定 seed 下 `strict` 模式收敛曲线落在同步版 run-to-run 方差带内」在统计层面成立。seed 同时播撒 collector（env + 采样噪声）与 learner（网络初始化 + 采样噪声）。
@@ -262,6 +293,6 @@ class FastSacCfg:
 
 ---
 
-## 9. 一句话总结
+## 10. 一句话总结
 
 FastSAC 的 off-policy 属性 + normalizer 为 learner 独占，使「collector/learner 分进程 + 共享内存」在不改算法、不改同步版的前提下成立；唯一的 `motrix.fastsac` provider 通过 `asynchronous` 字段选择 Trainer，并共用 env/config/checkpoint。默认异步执行；基础配置用 `strict` 验证算法等价，吞吐优先的任务用 `learner_bound` 让采样与训练各自满速。三个必须做对的点是：**SPSC 有界背压环**（防内存失控 / off-policy 失真）、**UTD 比例治理**（吞吐模式下监控并标注实际 UTD）、**seqlock 双缓冲权重快照**（无锁读、杜绝撕裂、靠短发布间隔压低 staleness）。

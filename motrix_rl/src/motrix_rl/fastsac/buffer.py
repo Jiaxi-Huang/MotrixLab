@@ -66,6 +66,36 @@ class SimpleReplayBuffer(nn.Module):
         self.next_critic_observations[:, ptr] = next_critic_obs
         self.ptr += 1
 
+    def extend_batch(self, obs, critic_obs, actions, rewards, dones, truncations, next_obs, next_critic_obs) -> None:
+        """Write a contiguous run of ``count`` env-step batches in one shot.
+
+        Field tensors are stacked along a batch axis: ``(n_env, count, dim)``
+        for the vector fields, ``(n_env, count)`` for scalars. Column order
+        matches successive :meth:`extend` calls, so per-env time adjacency
+        (n-step sampling) is preserved. The run may wrap the circular end.
+        """
+        count = obs.shape[1]
+        start = self.ptr % self.buffer_size
+        end = start + count
+
+        def put(tensor, buf):
+            if end <= self.buffer_size:
+                buf[:, start:end] = tensor
+                return
+            split = self.buffer_size - start
+            buf[:, start:] = tensor[:, :split]
+            buf[:, : end - self.buffer_size] = tensor[:, split:]
+
+        put(obs, self.observations)
+        put(critic_obs, self.critic_observations)
+        put(actions, self.actions)
+        put(rewards, self.rewards)
+        put(dones, self.dones)
+        put(truncations, self.truncations)
+        put(next_obs, self.next_observations)
+        put(next_critic_obs, self.next_critic_observations)
+        self.ptr += count
+
     @torch.no_grad()
     def sample(self, batch_size: int) -> dict:
         n_env, no, na, nco = self.n_env, self.n_obs, self.n_act, self.n_critic_obs

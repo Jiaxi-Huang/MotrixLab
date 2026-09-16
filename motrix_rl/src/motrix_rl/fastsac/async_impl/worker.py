@@ -16,6 +16,7 @@ Build helpers (``build_env`` / ``build_agent``) are shared with the single-proce
 from __future__ import annotations
 
 import logging
+import math
 import random
 import time
 import traceback
@@ -35,6 +36,7 @@ from motrix_rl.console import TrainingPanelStats, emit_training_panel, open_trai
 from motrix_rl.fastsac.agent import FastSacAgent
 from motrix_rl.fastsac.async_impl.collector import Collector
 from motrix_rl.fastsac.async_impl.learner import Learner
+from motrix_rl.fastsac.async_impl.numa import bind_process
 from motrix_rl.fastsac.async_impl.shm import Control, SharedTransitionRing, WeightSnapshot
 from motrix_rl.fastsac.config import FastSacCfg
 from motrix_rl.fastsac.wrap import FastSacEnvWrap
@@ -46,6 +48,55 @@ from motrix_rl.system_metrics import CpuLoadSampler, GpuMemoryUsageSampler, GpuU
 def _timing_mean(values: list[float]) -> float:
     """Mean of a non-empty timing sample list (ms)."""
     return sum(values) / len(values)
+
+
+def split_num_envs(num_envs: int, num_collectors: int) -> list[int]:
+    """Shard ``num_envs`` evenly across collectors (requires exact divisibility)."""
+    if num_collectors < 1:
+        raise ValueError(f"num_collectors must be >= 1, got {num_collectors}")
+    if num_envs % num_collectors != 0:
+        raise ValueError(
+            f"num_envs={num_envs} must divide evenly across num_collectors={num_collectors} "
+            f"({num_envs} % {num_collectors} != 0)"
+        )
+    per_collector = num_envs // num_collectors
+    return [per_collector] * num_collectors
+
+
+def aggregate_collector_stats(per_collector: dict[int, dict | None]) -> dict:
+    """Merge per-collector rollout snapshots into one panel/TB-facing stats dict.
+
+    Return/episode-length/reward/metric values are averaged over the collectors
+    that reported since the last log window; episode counts are summed;
+    ``policy_lag`` is the worst (max) staleness; timing values are averaged.
+    """
+    snapshots = [stats for stats in per_collector.values() if stats]
+
+    def _nanmean(key: str) -> float:
+        values = [stats[key] for stats in snapshots if not math.isnan(stats.get(key, float("nan")))]
+        return (sum(values) / len(values)) if values else float("nan")
+
+    def _mean_dicts(key: str) -> dict[str, float]:
+        keys = {k for stats in snapshots for k in stats.get(key, {})}
+        return {
+            k: sum(stats[key][k] for stats in snapshots if k in stats.get(key, {}))
+            / sum(1 for stats in snapshots if k in stats.get(key, {}))
+            for k in keys
+        }
+
+    return {
+        "return": _nanmean("return"),
+        "ep_len": _nanmean("ep_len"),
+        "episodes": sum(stats.get("episodes", 0) for stats in snapshots),
+        "reward_terms": _mean_dicts("reward_terms"),
+        "env_metrics": _mean_dicts("env_metrics"),
+        "policy_lag": max((stats.get("policy_lag", 0) for stats in snapshots), default=0),
+        "timing_ms": {
+            k: sum(stats["timing_ms"][k] for stats in snapshots if k in stats.get("timing_ms", {}))
+            / sum(1 for stats in snapshots if k in stats.get("timing_ms", {}))
+            for k in {k for stats in snapshots for k in stats.get("timing_ms", {})}
+        },
+    }
 
 
 # ------------------------------------------------------------------ builders
@@ -146,9 +197,23 @@ def run_collector_process(
     logging_interval: int,
     is_resume: bool,
     seed,
+    collector_id: int = 0,
+    num_collectors: int = 1,
+    numa_node: int | None = None,
+    cpus_per_collector: int | None = None,
 ) -> None:
+    role = f"collector[{collector_id}]"
     try:
         _configure_process_logging()
+        # Bind before any env / staging allocation: the memory policy only
+        # affects future pages, so this must be the first thing the worker does.
+        bind_process(
+            role,
+            numa_node,
+            cpus_per_collector=cpus_per_collector,
+            collector_id=collector_id,
+            num_collectors=num_collectors,
+        )
         set_seed(seed)
         async_options = cfg.trainer.async_options
         obs_dim, critic_obs_dim, act_dim = dims
@@ -166,16 +231,17 @@ def run_collector_process(
             weights,
             control,
             is_resume=is_resume,
+            collector_id=collector_id,
         )
         collector.reset()
         collector.sync_weights()
         collector.warmup_inference()
 
-        while not control.stop and control.collector_steps < num_iterations:
+        while not control.stop and control.collector_steps_at(collector_id) < num_iterations:
             if not collector.step_once():
                 time.sleep(async_options.idle_sleep_s)  # ring full -> backpressure
                 continue
-            if collector.control.collector_steps % max(logging_interval, 1) == 0:
+            if control.collector_steps_at(collector_id) % max(logging_interval, 1) == 0:
                 # replace any stale snapshot so the learner always sees the latest.
                 try:
                     while True:
@@ -184,7 +250,7 @@ def run_collector_process(
                     pass
                 stats_queue.put(collector.snapshot_stats())
     except BaseException:
-        error_queue.put(("collector", traceback.format_exc()))
+        error_queue.put((role, traceback.format_exc()))
         raise
     finally:
         control.set_stop()  # signal the learner if the collector exits for any reason
@@ -197,10 +263,10 @@ def run_learner_process(
     dims,
     action_scale: torch.Tensor,
     action_bias: torch.Tensor,
-    ring: SharedTransitionRing,
-    weights: WeightSnapshot,
+    rings: list[SharedTransitionRing],
+    weights: list[WeightSnapshot],
     control: Control,
-    stats_queue,
+    stats_queues: list,
     error_queue,
     num_iterations: int,
     logging_interval: int,
@@ -211,12 +277,15 @@ def run_learner_process(
     checkpoint_format: str,
     resume_from: str | None,
     seed,
+    learner_numa_node: int | None = None,
 ) -> None:
     _configure_process_logging()
     console, live = open_training_live()
     try:
+        bind_process("learner", learner_numa_node)
         set_seed(seed)
         async_options = cfg.trainer.async_options
+        num_collectors = len(rings)
         device = torch.device(cfg.device or ("cuda" if torch.cuda.is_available() else "cpu"))
         writer = None
         try:
@@ -231,12 +300,12 @@ def run_learner_process(
             ckpt = torch.load(resume_from, map_location=device, weights_only=False)
             agent.load_state_dict(ckpt, load_optimizers=True)
 
-        learner = Learner(agent, cfg, ring, weights, control)
-        learner.publish_weights()  # give the collector an initial policy before it warms up
+        learner = Learner(agent, cfg, rings, weights, control)
+        learner.publish_weights()  # give every collector an initial policy before it warms up
 
         start_time = time.time()
         last_log_time = start_time
-        resume_step = control.collector_steps
+        resume_step = control.collector_steps // num_collectors  # full-batch equivalents
         last_log_step = resume_step
         last_update_idx = 0
         last_stats = {
@@ -249,6 +318,7 @@ def run_learner_process(
             "timing_ms": {},
         }
         last_metrics = None
+        per_collector_stats: dict[int, dict | None] = {i: None for i in range(num_collectors)}
         next_log = ((resume_step // logging_interval) + 1) * logging_interval if logging_interval > 0 else 0
         next_save = ((resume_step // save_interval) + 1) * save_interval if save_interval > 0 else 0
         t_learn_win = 0.0  # wall-clock spent in learner train calls this log window
@@ -265,13 +335,19 @@ def run_learner_process(
 
         def _drain_stats():
             nonlocal last_stats
-            try:
-                while True:
-                    last_stats = stats_queue.get_nowait()
-            except Empty:
-                pass
+            for queue in stats_queues:
+                try:
+                    while True:
+                        snapshot = queue.get_nowait()
+                        per_collector_stats[snapshot.get("collector_id", 0)] = snapshot
+                except Empty:
+                    pass
+            last_stats = aggregate_collector_stats(per_collector_stats)
 
-        while not control.stop and control.collector_steps < num_iterations:
+        # Each collector runs until its own counter reaches num_iterations; the
+        # aggregate (sum) therefore reaches num_iterations * num_collectors.
+        total_collector_steps = num_iterations * num_collectors
+        while not control.stop and control.collector_steps < total_collector_steps:
             t_drain = time.perf_counter()
             ingested = learner.drain()
             if ingested:
@@ -300,7 +376,12 @@ def run_learner_process(
                 else:
                     # Data arrived, but replay/batch readiness still gated training.
                     learner_gate_wait_samples_ms.append(idle_ms)
-            step = control.collector_steps
+            # Progress basis: full num_envs-batch equivalents — the aggregate
+            # counter counts per-collector batches of per_collector_envs
+            # transitions each, so dividing by num_collectors recovers the
+            # sync-trainer "iteration collects num_envs transitions" unit
+            # (identical to the raw counter when num_collectors == 1).
+            step = control.collector_steps // num_collectors
             control.global_step = step
 
             if step >= next_log:
@@ -395,9 +476,17 @@ def run_learner_process(
                         "perf/updates_per_s", (updates - last_update_idx) / max(now - last_log_time, 1e-6), step
                     )
                     writer.add_scalar("async/policy_lag", last_stats["policy_lag"], step)
-                    writer.add_scalar("async/ring_fill", ring.size(), step)
-                    writer.add_scalar("async/weight_version", weights.version, step)
+                    writer.add_scalar("async/ring_fill", sum(ring.size() for ring in rings), step)
+                    writer.add_scalar("async/weight_version", max(w.version for w in weights), step)
                     writer.add_scalar("async/utd", utd, step)
+                    if num_collectors > 1:
+                        # Per-collector breakdowns only exist in the multi-collector
+                        # topology; the single-collector series keep their keys.
+                        for i, ring in enumerate(rings):
+                            stats_i = per_collector_stats.get(i)
+                            if stats_i:
+                                writer.add_scalar(f"async/policy_lag_collector{i}", stats_i["policy_lag"], step)
+                            writer.add_scalar(f"async/ring_fill_collector{i}", ring.size(), step)
                     writer.add_scalar("perf/collect_ms_per_batch", collector_timing_ms.get("collect", 0.0), step)
                     for k, v in collector_timing_detail_ms.items():
                         writer.add_scalar(f"perf/collector_{k}_ms", v, step)
@@ -437,7 +526,7 @@ def run_learner_process(
                 next_save += save_interval
 
         # final checkpoint (identical structure to sync fastsac)
-        agent.global_step = control.collector_steps
+        agent.global_step = control.collector_steps // num_collectors
         ckpt_path = checkpoints.final_checkpoint_path(checkpoint_format, Path(run_dir))
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(agent.state_dict(), ckpt_path)

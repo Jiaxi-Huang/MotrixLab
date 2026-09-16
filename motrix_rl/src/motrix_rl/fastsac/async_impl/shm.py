@@ -57,6 +57,21 @@ def _shared(shape, dtype) -> torch.Tensor:
     return torch.zeros(shape, dtype=dtype).share_memory_()
 
 
+# One env-step batch: the eight tensors SimpleReplayBuffer.extend consumes,
+# each with leading dim num_envs (obs, critic_obs, actions, rewards, dones,
+# truncations, next_obs, next_critic_obs).
+TransitionFields = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+
+
 # ---------------------------------------------------------------- transition ring
 class SharedTransitionRing:
     """SPSC ring of transition batches with bounded backpressure.
@@ -163,15 +178,18 @@ class SharedTransitionRing:
         self._write[0] += 1
         return True
 
-    def read_slot(self):
-        """Return CPU views of the oldest unread slot, or ``None`` if empty.
+    def read_slot(self, offset: int = 0) -> TransitionFields | None:
+        """Return CPU views of the slot ``offset`` batches after the read cursor,
+        or ``None`` if it is not unread yet.
 
-        Does NOT advance the read cursor; call :meth:`commit_read` after the
-        consumer has finished copying the data elsewhere.
+        Does NOT advance the read cursor; call :meth:`commit_read` (once per
+        consumed batch, including offsets) after the consumer has finished
+        copying the data elsewhere. Batching consumers read several slots per
+        ring before committing them together.
         """
-        if self.size() <= 0:
+        if offset >= self.size():
             return None
-        slot = self.read_idx % self.capacity
+        slot = (self.read_idx + offset) % self.capacity
         return (
             self.obs[slot],
             self.critic_obs[slot],
@@ -401,12 +419,23 @@ class WeightSnapshot:
 
 # ---------------------------------------------------------------- control block
 class Control:
-    """A handful of shared scalar controls / counters."""
+    """A handful of shared scalar controls / counters.
 
-    def __init__(self):
+    ``collector_steps`` is a per-collector counter array: each collector
+    increments only its own entry (single writer), and the aggregate property
+    sums them. The learner uses the aggregate as the training-progress basis;
+    each collector compares its own entry against ``num_iterations`` /
+    ``learning_starts`` (one entry == one env-step batch of that collector's
+    env shard). With ``num_collectors=1`` this is byte-identical to the previous
+    single-counter behavior.
+    """
+
+    def __init__(self, num_collectors: int = 1):
+        self.num_collectors = num_collectors
         self._stop = _shared((1,), torch.int64)
         self._global_step = _shared((1,), torch.int64)  # learner iteration counter
-        self._collector_steps = _shared((1,), torch.int64)  # env-step batches produced
+        # one env-step-batch counter per collector, single-writer each
+        self._collector_steps = [_shared((1,), torch.int64) for _ in range(num_collectors)]
 
     @property
     def stop(self) -> bool:
@@ -425,11 +454,22 @@ class Control:
 
     @property
     def collector_steps(self) -> int:
-        return int(self._collector_steps[0])
+        """Aggregate env-step batches produced by all collectors."""
+        return sum(int(counter[0]) for counter in self._collector_steps)
 
     @collector_steps.setter
     def collector_steps(self, v: int) -> None:
-        self._collector_steps[0] = v
+        # Resume entry point: ``v`` is in full num_envs-batch equivalents, so
+        # every collector restarts its own counter from the checkpointed
+        # iteration (aggregate becomes num_collectors * v).
+        for counter in self._collector_steps:
+            counter[0] = v
 
-    def inc_collector_steps(self) -> None:
-        self._collector_steps[0] += 1
+    def collector_steps_at(self, collector_id: int) -> int:
+        return int(self._collector_steps[collector_id][0])
+
+    def set_collector_steps(self, collector_id: int, v: int) -> None:
+        self._collector_steps[collector_id][0] = v
+
+    def inc_collector_steps(self, collector_id: int = 0) -> None:
+        self._collector_steps[collector_id][0] += 1

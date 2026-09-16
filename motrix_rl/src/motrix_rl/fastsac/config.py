@@ -69,6 +69,17 @@ class FastSacAsyncOptionsCfg:
     collector_compile: bool = MISSING
     collector_amp: bool = MISSING
     collector_amp_dtype: str = MISSING
+    # Number of collector processes; num_envs is split evenly across them.
+    num_collectors: int = MISSING
+    # One NUMA node id per collector (len == num_collectors); None keeps the OS
+    # default placement (no affinity, no memory binding).
+    numa_nodes: list[int] | None = MISSING
+    # Restrict each collector to this many CPUs taken from its node/affinity set;
+    # None uses all CPUs of the set.
+    cpus_per_collector: int | None = MISSING
+    # Bind the learner process to this NUMA node (GPU-local memory); None keeps
+    # the OS default placement.
+    learner_numa_node: int | None = MISSING
 
 
 @dataclass

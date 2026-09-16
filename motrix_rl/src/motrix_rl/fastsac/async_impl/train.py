@@ -28,12 +28,14 @@ from motrix_env_core import registry as env_registry
 from motrix_env_core.renderer import RenderConfig
 from motrix_rl.fastsac.agent import FastSacAgent
 from motrix_rl.fastsac.async_impl.collector import resolve_collector_inference_device
+from motrix_rl.fastsac.async_impl.numa import spawn_placement, validate_numa_options
 from motrix_rl.fastsac.async_impl.shm import Control, SharedTransitionRing, WeightSnapshot
 from motrix_rl.fastsac.async_impl.worker import (
     actor_param_numel,
     build_env,
     run_collector_process,
     run_learner_process,
+    split_num_envs,
 )
 from motrix_rl.fastsac.config import FastSacCfg
 from motrix_rl.fastsac.wrap import FastSacEnvWrap
@@ -131,11 +133,22 @@ class Trainer(TrainerBase):
         collector_device = resolve_collector_inference_device(async_options.collector_inference_device)
         param_numel = actor_param_numel(cfg, dims, action_scale, action_bias)
 
-        # shared-memory primitives allocated in the parent, inherited by children.
+        num_collectors = async_options.num_collectors
+        numa_nodes = validate_numa_options(num_collectors, async_options.numa_nodes, async_options.learner_numa_node)
+        cpus_per_collector = async_options.cpus_per_collector
         num_envs = self._context.num_envs
-        ring = SharedTransitionRing(async_options.ring_capacity, num_envs, obs_dim, critic_obs_dim, act_dim)
-        weights = WeightSnapshot(param_numel=param_numel, obs_dim=obs_dim)
-        control = Control()
+        env_shards = split_num_envs(num_envs, num_collectors)
+
+        # shared-memory primitives allocated in the parent, inherited by children.
+        # One SPSC ring + one WeightSnapshot per collector: every shared quantity
+        # keeps exactly one producer and one consumer, so the lock-free
+        # single-writer invariants are unchanged by the collector count.
+        rings = [
+            SharedTransitionRing(async_options.ring_capacity, shard, obs_dim, critic_obs_dim, act_dim)
+            for shard in env_shards
+        ]
+        weights = [WeightSnapshot(param_numel=param_numel, obs_dim=obs_dim) for _ in range(num_collectors)]
+        control = Control(num_collectors)
 
         resume_step = 0
         is_resume = False
@@ -149,7 +162,7 @@ class Trainer(TrainerBase):
             control.global_step = resume_step
 
         ctx = mp.get_context("spawn")
-        stats_queue = ctx.Queue(maxsize=8)
+        stats_queues = [ctx.Queue(maxsize=8) for _ in range(num_collectors)]
         error_queue = ctx.Queue(maxsize=8)
         reported_errors: set[tuple[str, str]] = set()
         seed = self._context.seed
@@ -176,8 +189,9 @@ class Trainer(TrainerBase):
             return errors
 
         print(
-            f"[motrix.fastsac async] two-process training '{self._env_name}' learner={learner_device} "
-            f"collector_env=cpu collector_inference={collector_device} num_envs={num_envs} iters={num_iterations} "
+            f"[motrix.fastsac async] collector/learner training '{self._env_name}' learner={learner_device} "
+            f"collector_env=cpu collector_inference={collector_device} num_collectors={num_collectors} "
+            f"numa_nodes={numa_nodes} num_envs={num_envs} iters={num_iterations} "
             f"from={resume_step} utd_mode={async_options.utd_mode}"
         )
 
@@ -189,10 +203,10 @@ class Trainer(TrainerBase):
                 dims,
                 action_scale,
                 action_bias,
-                ring,
+                rings,
                 weights,
                 control,
-                stats_queue,
+                stats_queues,
                 error_queue,
                 num_iterations,
                 logging_interval,
@@ -203,69 +217,92 @@ class Trainer(TrainerBase):
                 self._context.checkpoint_format,
                 self._resume_from,
                 seed,
+                async_options.learner_numa_node,
             ),
             name="fastsac-async-learner",
         )
-        p_collector = ctx.Process(
-            target=run_collector_process,
-            args=(
-                self._env_spec,
-                cfg,
-                num_envs,
-                dims,
-                action_scale,
-                action_bias,
-                ring,
-                weights,
-                control,
-                stats_queue,
-                error_queue,
-                num_iterations,
-                logging_interval,
-                is_resume,
-                seed,
-            ),
-            name="fastsac-async-collector",
-        )
+        p_collectors = [
+            ctx.Process(
+                target=run_collector_process,
+                args=(
+                    self._env_spec,
+                    cfg,
+                    env_shards[i],
+                    dims,
+                    action_scale,
+                    action_bias,
+                    rings[i],
+                    weights[i],
+                    control,
+                    stats_queues[i],
+                    error_queue,
+                    num_iterations,
+                    logging_interval,
+                    is_resume,
+                    None if seed is None else seed + i,
+                    i,
+                    num_collectors,
+                    numa_nodes[i] if numa_nodes else None,
+                    cpus_per_collector,
+                ),
+                name=f"fastsac-async-collector-{i}",
+            )
+            for i in range(num_collectors)
+        ]
 
-        p_learner.start()
-        p_collector.start()
+        # Start each child while the parent is pre-placed on the child's NUMA
+        # node: spawn children re-import torch/simulator before their entry
+        # function runs, and affinity + memory policy survive fork+exec, so
+        # the child's import-time allocations are node-local from the start
+        # (the worker re-binds itself afterwards as a no-op refinement).
+        with spawn_placement(async_options.learner_numa_node, "learner-spawn"):
+            p_learner.start()
+        for i, p in enumerate(p_collectors):
+            with spawn_placement(numa_nodes[i] if numa_nodes else None, f"collector-spawn[{i}]"):
+                p.start()
         try:
-            # monitor: exit when the learner finishes; abort both if either crashes.
+            # monitor: exit when the learner finishes; abort all if any worker crashes.
             while True:
                 if not p_learner.is_alive():
                     if p_learner.exitcode not in (0, None):
                         print(f"[motrix.fastsac async] learner crashed (exit {p_learner.exitcode}); stopping.")
                         _drain_child_errors()
                     break
-                if not p_collector.is_alive() and p_collector.exitcode not in (0, None):
-                    print(f"[motrix.fastsac async] collector crashed (exit {p_collector.exitcode}); stopping.")
-                    _drain_child_errors()
-                    break
-                time.sleep(0.5)
+                for p in p_collectors:
+                    if not p.is_alive() and p.exitcode not in (0, None):
+                        print(f"[motrix.fastsac async] {p.name} crashed (exit {p.exitcode}); stopping.")
+                        _drain_child_errors()
+                        break
+                else:
+                    time.sleep(0.5)
+                    continue
+                break
         finally:
             control.set_stop()
-            p_collector.join(timeout=30)
+            for p in p_collectors:
+                p.join(timeout=30)
             p_learner.join(timeout=30)
-            for p in (p_collector, p_learner):
+            for p in (*p_collectors, p_learner):
                 if p.is_alive():
                     print(f"[motrix.fastsac async] force-terminating {p.name}")
                     p.terminate()
                     p.join(timeout=10)
             _drain_child_errors()
-            # drain the queue so the feeder thread can shut down cleanly.
-            try:
-                while True:
-                    stats_queue.get_nowait()
-            except Exception:
-                pass
-            stats_queue.close()
+            # drain the queues so the feeder threads can shut down cleanly.
+            for stats_queue in stats_queues:
+                try:
+                    while True:
+                        stats_queue.get_nowait()
+                except Exception:
+                    pass
+                stats_queue.close()
             error_queue.close()
 
         if p_learner.exitcode not in (0, None):
             raise RuntimeError(f"motrix.fastsac async learner process failed with exit code {p_learner.exitcode}")
-        if p_collector.exitcode not in (0, None):
-            raise RuntimeError(f"motrix.fastsac async collector process failed with exit code {p_collector.exitcode}")
+        for i, p in enumerate(p_collectors):
+            if p.exitcode not in (0, None):
+                raise RuntimeError(f"motrix.fastsac async collector {i} process failed with exit code {p.exitcode}")
 
     # ------------------------------------------------------------------ play
     def play(self, policy: str) -> None:
