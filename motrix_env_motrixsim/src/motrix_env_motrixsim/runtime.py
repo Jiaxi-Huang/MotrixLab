@@ -314,7 +314,7 @@ class MotrixSimBackend(SimBackend):
         self._data: mtx.SceneData = mtx.SceneData(self._model, batch=[num_envs])
         self._num_envs = num_envs
         self._model_compiler = MotrixSimModelCompiler(self._model)
-        self._write_compiler = MotrixSimWriteCompiler(self._model, self._data, self._masked_rows)
+        self._write_compiler = MotrixSimWriteCompiler(self._model, self._data)
 
     @property
     def model_compiler(self) -> SimModelCompiler:
