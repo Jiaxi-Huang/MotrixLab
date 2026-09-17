@@ -126,7 +126,8 @@ def test_microduck_walk_stairs_env_registers_and_builds():
     assert type(env) is ManagerEnv
     assert isinstance(env.cfg, HumanoidVelocityTrackingManagerEnvCfg)
     assert env.action_space.shape == (14,)
-    assert state.obs.policy.shape == (1, 55)
+    # 55 flat-policy dims plus the 10-point terrain height scan wired into the stairs preset.
+    assert state.obs.policy.shape == (1, 65)
     env.step(np.zeros((1, 14), dtype=np.float32))
 
 
