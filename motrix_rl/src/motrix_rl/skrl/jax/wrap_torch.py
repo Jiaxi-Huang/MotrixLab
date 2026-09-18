@@ -37,7 +37,7 @@ class SkrlTorchWrapper(SkrlWrapper):
 
     def reset(self) -> tuple[jax.Array, Any]:
         state = self._env.init_state()
-        return self._to_jax(state.obs.policy, jnp.float32), state.info
+        return self._to_jax(state.obs.policy, jnp.float32), env_infos(state)
 
     def step(
         self, actions: jax.Array

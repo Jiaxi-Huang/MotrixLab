@@ -165,6 +165,17 @@ class Go1WalkStairsTask(DirectEnv):
         self.num_check = self.sim_data["termination_colliding"].shape[-1]
         self.foot_check_num = self.sim_data["foot_colliding"].shape[-1]
 
+        # Episode-scoped task state: full-batch buffers, reset writes the done
+        # rows in place.
+        num_envs = self._num_envs
+        self._commands = np.zeros((num_envs, 3), dtype=np.float32)
+        self._contacts = np.zeros((num_envs, self.foot_check_num), dtype=np.bool_)
+        self._contact_force = np.zeros((num_envs, 12), dtype=np.float32)
+        self._feet_air_time = np.zeros((num_envs, self.foot_check_num), dtype=np.float32)
+        self._last_dof_vel = np.zeros((num_envs, self._num_action), dtype=np.float32)
+        self._current_actions = np.zeros((num_envs, self._num_action), dtype=np.float32)
+        self._last_actions = np.zeros((num_envs, self._num_action), dtype=np.float32)
+
         spacing = 2.0
         cols = int(np.ceil(np.sqrt(self._num_envs)))
         offsets = []
@@ -178,11 +189,11 @@ class Go1WalkStairsTask(DirectEnv):
         self.offsets = np.array(offsets)
 
     def apply_action(self, actions, state):
-        # Copy: the inputs slice is a view over the shared read buffer, which
-        # the upcoming physics-step read overwrites in place.
-        state.info["last_dof_vel"] = self.get_dof_vel().copy()
-        state.info["last_actions"] = state.info["current_actions"]
-        state.info["current_actions"] = actions
+        # Copy values: the read buffer is a view that the upcoming physics-step
+        # read overwrites in place.
+        self._last_dof_vel[:] = self.get_dof_vel()
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = actions
         ctrl = self._ctrl_writes.buffer("ctrl")
         ctrl[:] = np.asarray(self._compute_torques(actions), dtype=np.float32)
         self._ctrl_writes.execute()
@@ -202,7 +213,7 @@ class Go1WalkStairsTask(DirectEnv):
         return self.sim_data["gyro"]
 
     def compute_observation(self, state: ArrayEnvState):
-        """Build the full observation from cached sim reads and info."""
+        """Build the full observation from cached sim reads and episode state."""
         inputs = self.sim_data
         linear_vel = inputs["local_linvel"]
         gyro = inputs["gyro"]
@@ -213,9 +224,9 @@ class Go1WalkStairsTask(DirectEnv):
         noisy_gyro = gyro * self.cfg.normalization.ang_vel
         noisy_joint_angle = diff * self.cfg.normalization.dof_pos
         noisy_joint_vel = inputs["robot_joint_vel"] * self.cfg.normalization.dof_vel
-        command = state.info["commands"] * self.commands_scale
-        last_actions = state.info["current_actions"]
-        contact_force = state.info["contact_force"]
+        command = self._commands * self.commands_scale
+        last_actions = self._current_actions
+        contact_force = self._contact_force
 
         obs = np.hstack(
             [
@@ -234,9 +245,9 @@ class Go1WalkStairsTask(DirectEnv):
     def compute_transition(self, state):
         self.sim_data.execute()
         # Contact bookkeeping is reward state derived from the refreshed cache.
-        state.info["contacts"] = self.sim_data["foot_colliding"].astype(bool)
-        state.info["feet_air_time"] = self.update_feet_air_time(state.info)
-        state.info["contact_force"] = self.update_contact_force(state)
+        self._contacts[:] = self.sim_data["foot_colliding"]
+        self.update_feet_air_time()
+        self.update_contact_force()
         state = self.update_terminated(state)
         state = self.update_reward(state)
         return state
@@ -251,13 +262,11 @@ class Go1WalkStairsTask(DirectEnv):
             terminated=terminated,
         )
 
-    def update_feet_air_time(self, info: dict):
-        feet_air_time = info["feet_air_time"]
-        feet_air_time += self.cfg.ctrl_dt
-        feet_air_time *= ~info["contacts"]
-        return feet_air_time
+    def update_feet_air_time(self):
+        self._feet_air_time += self.cfg.ctrl_dt
+        self._feet_air_time *= ~self._contacts
 
-    def update_contact_force(self, state: ArrayEnvState):
+    def update_contact_force(self):
         base_quat = self.sim_data["root_quat"]
         foot_forces = self.sim_data["foot_contact_forces"]
         force = []
@@ -265,7 +274,7 @@ class Go1WalkStairsTask(DirectEnv):
             contact_force = foot_forces[:, 3 * k : 3 * k + 3]
             contact_force = quaternion.rotate_inverse(base_quat, contact_force)
             force.append(contact_force)
-        return np.concatenate(force, axis=1)
+        self._contact_force[:] = np.concatenate(force, axis=1)
 
     def resample_commands(self, num_envs: int):
         commands = np.random.uniform(
@@ -278,7 +287,7 @@ class Go1WalkStairsTask(DirectEnv):
     def update_reward(self, state: ArrayEnvState) -> ArrayEnvState:
         terminated = state.terminated
 
-        reward_dict = self._get_reward(state.info)
+        reward_dict = self._get_reward()
 
         rewards = {k: v * self.cfg.reward_config.scales[k] for k, v in reward_dict.items()}
         rwd = sum(rewards.values())
@@ -291,7 +300,7 @@ class Go1WalkStairsTask(DirectEnv):
 
         return state.replace(reward=rwd)
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num_reset = len(env_ids)
 
         base_pose = np.tile(self._init_base_pose, (num_reset, 1))
@@ -311,36 +320,30 @@ class Go1WalkStairsTask(DirectEnv):
         self._reset_program.execute(env_ids)
         self.sim_data.execute(np.asarray(env_ids, dtype=np.int64))
 
-        info = {
-            "current_actions": np.zeros((num_reset, self._num_action), dtype=np.float32),
-            "last_actions": np.zeros((num_reset, self._num_action), dtype=np.float32),
-            "commands": self.resample_commands(num_reset),
-            "last_dof_vel": np.zeros((num_reset, self._num_action), dtype=np.float32),
-            "feet_air_time": np.zeros((num_reset, self.foot_check_num), dtype=np.float32),
-            "contacts": np.zeros((num_reset, self.foot_check_num), dtype=np.bool_),
-            "contact_force": np.zeros((num_reset, 12), dtype=np.float32),
-        }
-        return info
+        self._commands[env_ids] = self.resample_commands(num_reset)
+        self._current_actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0
+        self._last_dof_vel[env_ids] = 0.0
+        self._feet_air_time[env_ids] = 0.0
+        self._contacts[env_ids] = False
+        self._contact_force[env_ids] = 0.0
 
-    def _get_reward(
-        self,
-        info: dict,
-    ) -> dict[str, np.ndarray]:
-        commands = info["commands"]
+    def _get_reward(self) -> dict[str, np.ndarray]:
+        commands = self._commands
         return {
             "lin_vel_z": self._reward_lin_vel_z(),
             "ang_vel_xy": self._reward_ang_vel_xy(),
             "orientation": self._reward_orientation(),
             "torques": self._reward_torques(),
             "dof_vel": self._reward_dof_vel(),
-            "dof_acc": self._reward_dof_acc(info),
-            "action_rate": self._reward_action_rate(info),
+            "dof_acc": self._reward_dof_acc(),
+            "action_rate": self._reward_action_rate(),
             "tracking_lin_vel": self._reward_tracking_lin_vel(commands),
             "tracking_ang_vel": self._reward_tracking_ang_vel(commands),
             "stand_still": self._reward_stand_still(commands),
             "hip_pos": self._reward_hip_pos(commands),
             "calf_pos": self._reward_calf_pos(commands),
-            "feet_air_time": self._reward_feet_air_time(commands, info),
+            "feet_air_time": self._reward_feet_air_time(commands),
             "feet_stumble": self._reward_feet_stumble(),
         }
 
@@ -367,26 +370,26 @@ class Go1WalkStairsTask(DirectEnv):
         # Penalize dof velocities
         return np.sum(np.square(self.get_dof_vel()), axis=1)
 
-    def _reward_dof_acc(self, info):
+    def _reward_dof_acc(self):
         # Penalize dof accelerations
         return np.sum(
-            np.square((info["last_dof_vel"] - self.get_dof_vel()) / self.cfg.ctrl_dt),
+            np.square((self._last_dof_vel - self.get_dof_vel()) / self.cfg.ctrl_dt),
             axis=1,
         )
 
-    def _reward_action_rate(self, info: dict):
+    def _reward_action_rate(self):
         # Penalize changes in actions
-        action_diff = info["current_actions"] - info["last_actions"]
+        action_diff = self._current_actions - self._last_actions
         return np.sum(np.square(action_diff), axis=1)
 
     def _reward_termination(self, done):
         # Terminal reward / penalty
         return done
 
-    def _reward_feet_air_time(self, commands: np.ndarray, info: dict):
+    def _reward_feet_air_time(self, commands: np.ndarray):
         # Reward long steps
-        feet_air_time = info["feet_air_time"]
-        first_contact = (feet_air_time > 0.0) * info["contacts"]
+        feet_air_time = self._feet_air_time
+        first_contact = (feet_air_time > 0.0) * self._contacts
         # reward only on first contact with the ground
         rew_airTime = np.sum((feet_air_time - 0.5) * first_contact, axis=1)
         # no reward for zero command

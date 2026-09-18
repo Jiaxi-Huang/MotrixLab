@@ -34,7 +34,7 @@ class FastSacNpEnvWrap(FastSacEnvWrap):
 
     def reset(self) -> tuple[torch.Tensor, torch.Tensor]:
         state = self._env.init_state()
-        self.last_info = state.info
+        self.last_info = env_infos(state)
         return self._to_torch(state.obs.policy), self._to_torch(state.obs.value_or_policy)
 
     def step(self, actions: torch.Tensor):

@@ -120,7 +120,7 @@ class LqrEnv(DirectEnv):
             "success": success.astype(np.float32),
             "out_of_bounds": out_of_bounds.astype(np.float32),
         }
-        state.info["Reward"] = {
+        state.reward_terms = {
             "state_cost": (-state_cost).astype(np.float32),
             "velocity_cost": (-velocity_cost).astype(np.float32),
             "control_cost": (-control_cost).astype(np.float32),
@@ -133,7 +133,7 @@ class LqrEnv(DirectEnv):
             terminated=terminated,
         )
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num_envs = len(env_ids)
 
         qpos = np.random.standard_normal((num_envs, self._nq)).astype(np.float32)
@@ -149,5 +149,3 @@ class LqrEnv(DirectEnv):
         self._reset_velocity[env_ids] = qvel
         self._reset_program.execute(env_ids)
         self.sim_data.execute(np.asarray(env_ids, np.int64))
-
-        return {}

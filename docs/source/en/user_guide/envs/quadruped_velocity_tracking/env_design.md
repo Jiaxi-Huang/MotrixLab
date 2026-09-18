@@ -79,7 +79,7 @@ a body reference frame. Contact matching, swing clearance, and early swing-conta
 | `swing_contact`      | Measure the fraction of feet still touching the ground during swing                                  | Penalize dragging and early touchdown       |
 
 Each raw term is first multiplied by its `RewardScales` weight; negative weights turn non-negative measurements into
-penalties. `info["Reward"]` stores these weighted values before timestep scaling. Their sum is multiplied by `ctrl_dt` to
+penalties. `state.reward_terms` stores these weighted values before timestep scaling. Their sum is multiplied by `ctrl_dt` to
 produce the reward returned to the training algorithm. The current environment has no reward curriculum.
 
 On rough terrain, `base_height` uses terrain height beneath the robot as its zero point. `swing_feet_z` consumes foot

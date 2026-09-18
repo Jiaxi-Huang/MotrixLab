@@ -34,7 +34,7 @@ Every stage is orchestrated by the `ArrayEnv` base class; environment implementa
 hooks and must not re-implement the lifecycle. Semantics:
 
 - `terminated` marks episode-ending conditions such as task failure; `truncated` marks
-  the time limit, and `info["time_outs"]` flags rows that timed out without failing;
+  the time limit;
 - environments that are done are reset automatically at the end of each step, and
   observations are recomputed after the reset.
 

@@ -108,6 +108,13 @@ class FrankaOpenCabinetEnv(DirectEnv):
         # Set print options to 2 decimal places
         np.set_printoptions(precision=2)
 
+        # Episode-scoped task state: full-batch buffers, reset writes the done
+        # rows in place.
+        num_envs = self._num_envs
+        self._current_actions = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+        self._last_actions = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+        self._current_gripper_action = np.zeros(num_envs, dtype=np.float32)
+
     @property
     def observation_space(self):
         return self._observation_space
@@ -119,8 +126,8 @@ class FrankaOpenCabinetEnv(DirectEnv):
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState):
         assert not np.isnan(actions).any(), "actions contain nan"
 
-        state.info["last_actions"] = state.info["current_actions"]
-        state.info["current_actions"] = actions
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = actions
 
         # no gripper
         old_joint_pos = self.get_robot_joint_pos(slice(None))[:, : self._action_dim - 1]
@@ -135,7 +142,7 @@ class FrankaOpenCabinetEnv(DirectEnv):
         sampled_gripper_action = np.where(probabilities > np.random.rand(*probabilities.shape), 0, 0.04)[
             :, None
         ]  # 0 for closed, 0.04 for open
-        state.info["current_gripper_action"] = sampled_gripper_action.squeeze(-1)
+        self._current_gripper_action[:] = sampled_gripper_action.squeeze(-1)
 
         new_pos = np.concatenate([new_joint_pos, sampled_gripper_action], axis=-1)
 
@@ -155,8 +162,8 @@ class FrankaOpenCabinetEnv(DirectEnv):
         """Build the full observation batch from cached simulator data.
 
         Reads only the cache left by the last read-program execution in the
-        transition; never performs reads itself and never touches reward,
-        termination, or info.
+        transition; never performs reads itself and never touches reward or
+        termination.
         """
         rows = slice(None)
         num_envs = self.num_envs
@@ -214,7 +221,7 @@ class FrankaOpenCabinetEnv(DirectEnv):
 
         return state
 
-    def reset(self, env_ids):
+    def reset(self, env_ids) -> None:
         num_reset = len(env_ids)
         row_ids = np.asarray(env_ids, dtype=np.int64)
 
@@ -232,13 +239,10 @@ class FrankaOpenCabinetEnv(DirectEnv):
         self._reset_program.execute(row_ids)
         self.sim_data.execute(row_ids)
 
-        info = {
-            "current_actions": np.zeros((num_reset, self._action_dim), dtype=np.float32),
-            "last_actions": np.zeros((num_reset, self._action_dim), dtype=np.float32),
-            "phase2_mask": np.zeros(num_reset, dtype=bool),  # 1D array
-            "current_gripper_action": np.zeros(num_reset, dtype=np.float32),  # 1D array
-        }
-        return info
+        # Write episode-scoped state for the reset rows
+        self._current_actions[row_ids] = 0.0
+        self._last_actions[row_ids] = 0.0
+        self._current_gripper_action[row_ids] = 0.0
 
     def _compute_reward(self, state: ArrayEnvState, truncated: np.ndarray):
         robot_grasp_pose = self._grasp_pose(slice(None), "gripper")
@@ -259,7 +263,7 @@ class FrankaOpenCabinetEnv(DirectEnv):
         # When gripper distance > 0.025, closing gripper gets penalty
         # When gripper distance > 0.025 or < 0.025, opening gripper gets no reward
         open_gripper = np.where(gripper_drawer_dist < 0.025, 100.0, -20) * (
-            0.04 - state.info["current_gripper_action"]
+            0.04 - self._current_gripper_action
         )  # dist_reward * 0 or 0.04
 
         ## open drawer reward
@@ -278,7 +282,7 @@ class FrankaOpenCabinetEnv(DirectEnv):
         ##################### Penalty Terms #####################"
         ## Action penalty
         ## Joint velocity penalty - sometimes some joints rotate more while others rotate less
-        action_penalty = np.sum(np.square(state.info["current_actions"] - state.info["last_actions"]), axis=-1)
+        action_penalty = np.sum(np.square(self._current_actions - self._last_actions), axis=-1)
         joint_vel_penalty = np.sum(np.square(self.sim_data["robot_joint_vel"][:, : self._action_dim]), axis=-1)
 
         ## finger position penalty

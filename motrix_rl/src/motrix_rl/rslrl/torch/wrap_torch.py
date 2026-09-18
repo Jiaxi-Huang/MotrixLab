@@ -99,9 +99,8 @@ class RslrlTorchEnvWrap(VecEnv):
         obs = self._to_tensordict(state.obs)
 
         # Build extras dict (RSLRL calls it "extras" not "infos")
-        extras = {}
-        if "time_outs" in state.info:
-            extras["time_outs"] = torch.as_tensor(state.info["time_outs"], device=self._device)
+        # time_outs: rows truncated without failing, for value bootstrapping.
+        extras = {"time_outs": (state.truncated & ~state.terminated).to(self._device)}
 
         return obs, rewards, dones, extras
 

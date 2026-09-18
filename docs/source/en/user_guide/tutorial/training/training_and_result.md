@@ -95,7 +95,7 @@ TensorBoard logs are written under the run directory and can be viewed per envir
 tensorboard --logdir runs/cartpole
 ```
 
-Besides the standard return and loss curves, if an environment exposes per-term rewards via `info["Reward"]`, they are also logged to TensorBoard during training.
+Besides the standard return and loss curves, if an environment exposes per-term rewards via `state.reward_terms`, they are also logged to TensorBoard during training.
 
 ## Model Evaluation and Testing
 

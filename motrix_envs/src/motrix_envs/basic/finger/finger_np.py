@@ -119,6 +119,11 @@ class FingerEnv(DirectEnv):
             ctrl_ranges[:, 0], ctrl_ranges[:, 1], (self.num_actuators,), dtype=np.float32
         )
 
+        # Episode-scoped action history: full-batch buffers, reset writes the
+        # done rows in place.
+        self._actions = np.zeros((self._num_envs, self.num_actuators), dtype=np.float32)
+        self._last_actions = np.zeros((self._num_envs, self.num_actuators), dtype=np.float32)
+
     @property
     def observation_space(self) -> gym.spaces.Box:
         return self._observation_space
@@ -129,12 +134,8 @@ class FingerEnv(DirectEnv):
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState) -> ArrayEnvState:
         # Keep track of actions for reward shaping (e.g., smoothness penalties)
-        if "actions" not in state.info:
-            state.info["actions"] = np.zeros_like(actions, dtype=np.float32)
-        if "last_actions" not in state.info:
-            state.info["last_actions"] = np.zeros_like(actions, dtype=np.float32)
-        state.info["last_actions"] = state.info["actions"]
-        state.info["actions"] = actions
+        self._last_actions[:] = self._actions
+        self._actions[:] = actions
         ctrl = self._ctrl_writes.buffer("ctrl")
         ctrl[:] = np.asarray(actions, dtype=np.float32)
         self._ctrl_writes.execute()
@@ -192,7 +193,7 @@ class FingerEnv(DirectEnv):
             # reproduces the legacy global ``num_contacts > 0`` check exactly.
             pending = self.sim_data["colliding"][env_ids].max(axis=-1) > 0
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         raise NotImplementedError
 
 
@@ -259,7 +260,7 @@ class FingerSpinEnv(FingerEnv):
             spin = np.clip(spin + touch_bonus + approach_reward, 0.0, 1.0).astype(np.float32)
 
         rwd = spin
-        state.info["Reward"] = {
+        state.reward_terms = {
             "hinge_velocity": hinge_velocity.copy(),
             "spin": spin.copy(),
             "spin_sparse": spin_sparse.copy(),
@@ -272,25 +273,12 @@ class FingerSpinEnv(FingerEnv):
         rwd[terminated] = 0.0
         return state.replace(reward=rwd, terminated=terminated)
 
-    def reset(self, env_ids: np.ndarray) -> dict:
-        num = len(env_ids)
+    def reset(self, env_ids: np.ndarray) -> None:
         self._reset_collision_free_joint_angles(env_ids)
 
-        info: dict = {"Reward": {}}
-        info["actions"] = np.zeros((num, self.num_actuators), dtype=np.float32)
-        info["last_actions"] = np.zeros((num, self.num_actuators), dtype=np.float32)
-        info["Reward"] = {
-            "hinge_velocity": np.zeros((num,), dtype=np.float32),
-            "spin": np.zeros((num,), dtype=np.float32),
-            "spin_sparse": np.zeros((num,), dtype=np.float32),
-            "touch_raw": np.zeros((num,), dtype=np.float32),
-            "touch_bonus": np.zeros((num,), dtype=np.float32),
-            "approach_dist": np.zeros((num,), dtype=np.float32),
-            "approach_reward": np.zeros((num,), dtype=np.float32),
-        }
-
+        self._actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0
         self.sim_data.execute(np.asarray(env_ids, np.int64))
-        return info
 
 
 @registry.env("dm-finger-turn-easy")
@@ -362,8 +350,8 @@ class FingerTurnEnv(FingerEnv):
             touch_bonus = self._cfg.turn_touch_bonus_scale * np.tanh(touch_raw / self._cfg.turn_touch_bonus_tanh_scale)
 
             # Reduce jitter: penalize large actions and action changes
-            actions = state.info.get("actions", inputs["actuator_ctrls"]).astype(np.float32)
-            last_actions = state.info.get("last_actions", actions).astype(np.float32)
+            actions = self._actions
+            last_actions = self._last_actions
             action_l2 = np.mean(np.square(actions), axis=-1).astype(np.float32)
             action_delta_l2 = np.mean(np.square(actions - last_actions), axis=-1).astype(np.float32)
 
@@ -379,7 +367,7 @@ class FingerTurnEnv(FingerEnv):
             turn = turn_sparse
 
         rwd = turn
-        state.info["Reward"] = {
+        state.reward_terms = {
             "dist_to_target": dist_to_target.copy(),
             "turn": turn.copy(),
             "turn_sparse": turn_sparse.copy(),
@@ -390,12 +378,11 @@ class FingerTurnEnv(FingerEnv):
             "action_l2": action_l2.copy(),
             "action_delta_l2": action_delta_l2.copy(),
         }
-        state.info["target_info"] = {"positions": self._target_xyz.copy(), "radius": self._target_radius}
 
         rwd[terminated] = 0.0
         return state.replace(reward=rwd, terminated=terminated)
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num = len(env_ids)
         self._reset_collision_free_joint_angles(env_ids)
 
@@ -420,14 +407,5 @@ class FingerTurnEnv(FingerEnv):
             self._reset_target(env_ids, self._target_xyz[env_ids])
             self.sim_data.execute(np.asarray(env_ids, np.int64))
 
-        info: dict = {"Reward": {}}
-        info["actions"] = np.zeros((num, self.num_actuators), dtype=np.float32)
-        info["last_actions"] = np.zeros((num, self.num_actuators), dtype=np.float32)
-        info["target_info"] = {"positions": self._target_xyz.copy(), "radius": self._target_radius}
-        info["Reward"] = {
-            "dist_to_target": np.zeros((num,), dtype=np.float32),
-            "turn": np.zeros((num,), dtype=np.float32),
-            "turn_sparse": np.zeros((num,), dtype=np.float32),
-        }
-
-        return info
+        self._actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0

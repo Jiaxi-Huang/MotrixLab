@@ -133,7 +133,8 @@ class BounceBallEnvCfg(DirectEnvCfg):
     action_bias: list = None
 
     # Debug options
-    store_reward_details: bool = False  # Whether to store detailed reward breakdown in state.info, it's very slow
+    # Whether to store the detailed reward breakdown in state.reward_terms (very slow)
+    store_reward_details: bool = False
 
     def __post_init__(self):
         if self.ball_init_pos is None:

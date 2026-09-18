@@ -139,7 +139,7 @@ class CartPoleEnv(DirectEnv):
 
 | 钩子                                 | 职责                                                                                    |
 | ------------------------------------ | ---------------------------------------------------------------------------------------- |
-| `reset(env_ids)`                     | 为选中的环境写入重置状态（随机化初始姿态等），返回 info 字典；观测交给后续的 `compute_observation` |
+| `reset(env_ids)`                     | 为选中的环境写入重置状态（随机化初始姿态等）；观测交给后续的 `compute_observation` |
 | `apply_action(actions, state)`       | 将动作写入仿真（通常是 ctrl 目标）                                                       |
 | `compute_transition(state)`          | 执行读取程序并派生 `state.reward`、`state.terminated` 等；这是每步唯一的全量数据刷新点，**不得**写 `state.obs` |
 | `compute_observation(state)`         | 纯粹用已刷新的仿真数据拼装 `state.obs`，不再执行读取                                     |
@@ -148,8 +148,7 @@ class CartPoleEnv(DirectEnv):
 语义约定：
 
 - `terminated` 表示任务失败等回合终止条件；`truncated` 表示达到 `max_episode_steps`
-  的时间截断。两者由 `ArrayEnv` 合成 `done` 并触发 auto-reset；
-  `info["time_outs"]` 标记"截断但未失败"的行。
+  的时间截断。两者由 `ArrayEnv` 合成 `done` 并触发 auto-reset。
 - 环境维度必须使用 NumPy 向量化操作；只有遍历固定数量的关节、脚或 term 时才允许普通循环。
 - 常量（初始姿态、空间定义、query 名称）在 `__init__` 或配置构造阶段预计算，
   不在 step 循环中重复创建。

@@ -5,12 +5,12 @@
 
 Every ``*_np`` basic environment must follow the split:
 
-- ``reset(env_ids)`` only writes reset rows and returns a plain dict;
+- ``reset(env_ids)`` only writes reset rows and returns None;
 - ``compute_transition`` executes the read program exactly once at the top and
-  only fills reward / terminated / truncated / info / metrics — never obs;
+  only fills reward / terminated / truncated / reward_terms / metrics — never obs;
 - ``compute_observation`` fully rebuilds obs from the cache left by the last
   read-program execution — it must not execute reads itself and must not
-  modify reward, termination, or info.
+  modify reward, termination, or reward_terms.
 """
 
 from collections.abc import Iterable
@@ -126,7 +126,9 @@ def test_compute_observation_reads_cache_without_executing(env_name: str) -> Non
     reward_before = state.reward.copy()
     terminated_before = state.terminated.copy()
     truncated_before = state.truncated.copy()
-    info_before = {key: np.copy(value) if isinstance(value, np.ndarray) else value for key, value in state.info.items()}
+    reward_terms_before = {
+        key: np.copy(value) if isinstance(value, np.ndarray) else value for key, value in state.reward_terms.items()
+    }
 
     calls = _spy_execute(env)
     observed = env.compute_observation(state)
@@ -136,19 +138,19 @@ def test_compute_observation_reads_cache_without_executing(env_name: str) -> Non
     obs = observed.obs.policy if isinstance(observed.obs, NpObs) else observed.obs
     assert obs.shape == (num_envs, *env.observation_space.shape)
     assert not np.isnan(obs).any()
-    # Reward / termination / info must not be modified by observation.
+    # Reward / termination / reward_terms must not be modified by observation.
     np.testing.assert_array_equal(observed.reward, reward_before)
     np.testing.assert_array_equal(observed.terminated, terminated_before)
     np.testing.assert_array_equal(observed.truncated, truncated_before)
-    assert observed.info is state.info
-    for key, value in info_before.items():
-        assert key in observed.info
+    assert observed.reward_terms is state.reward_terms
+    for key, value in reward_terms_before.items():
+        assert key in observed.reward_terms
         if isinstance(value, np.ndarray):
-            np.testing.assert_array_equal(observed.info[key], value)
+            np.testing.assert_array_equal(observed.reward_terms[key], value)
 
 
 @pytest.mark.parametrize("env_name", _BASIC_ENVS)
-def test_reset_only_writes_reset_state_and_returns_dict(env_name: str) -> None:
+def test_reset_only_writes_reset_state(env_name: str) -> None:
     num_envs = 2
     env = registry.make(env_name, num_envs=num_envs)
     rng = np.random.default_rng(3)
@@ -158,9 +160,9 @@ def test_reset_only_writes_reset_state_and_returns_dict(env_name: str) -> None:
     env_ids = np.array([0], dtype=np.int64)
     obs_before = env.state.obs.policy.copy()
 
-    info = env.reset(env_ids)
+    result = env.reset(env_ids)
 
-    assert isinstance(info, dict)
+    assert result is None
     # Reset writes simulator rows (and refreshes their cache) but must not
     # touch the published observation batch.
     np.testing.assert_array_equal(env.state.obs.policy, obs_before)

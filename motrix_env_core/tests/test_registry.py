@@ -188,8 +188,8 @@ def test_custom_environment_can_be_registered_and_created_without_builtins():
         def compute_transition(self, state: ArrayEnvState) -> ArrayEnvState:
             return state
 
-        def reset(self, env_ids: np.ndarray):
-            return {}
+        def reset(self, env_ids: np.ndarray) -> None:
+            pass
 
     env = registry.make(env_name, num_envs=2, sim="fake-registry")
 
@@ -247,8 +247,8 @@ def test_direct_env_resolves_sim_backend_through_registry():
         def compute_transition(self, state: ArrayEnvState) -> ArrayEnvState:
             return state
 
-        def reset(self, env_ids: np.ndarray):
-            return {}
+        def reset(self, env_ids: np.ndarray) -> None:
+            pass
 
     env = registry.make(env_name, num_envs=2, sim="fake-registry")
 

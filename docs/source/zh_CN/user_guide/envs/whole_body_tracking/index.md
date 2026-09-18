@@ -154,7 +154,7 @@ python scripts/train.py task=g1-wbt-dance/motrix.fastsac \
 ```
 
 训练期间，环境从 motion 的不同时间点开始，并利用失败记录提高困难片段的采样概率。奖励分项写入
-`info["Reward"]`，bad-tracking 比例、motion 进度和自适应采样统计写入 `info["metrics"]`；各项定义见
+`state.reward_terms`，bad-tracking 比例、motion 进度和自适应采样统计写入 `state.metrics`；各项定义见
 [任务环境设计](env_design.md)。
 
 ### 回放策略

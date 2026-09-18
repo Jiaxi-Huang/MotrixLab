@@ -122,7 +122,7 @@ reward_config = RewardConfig(
 
 `base_height_target` 和 `initial_base_position[2]` 通常应接近机器人的默认站立高度。`target_foot_height` 应结合
 腿长和地形起伏设置；过低容易拖脚，过高可能要求超出合理关节范围。调节某个奖励权重时，应查看
-`info["Reward"]` 中对应项的量级，而不只比较配置数值。
+`state.reward_terms` 中对应项的量级，而不只比较配置数值。
 
 ## 7. `sensor`：传感器名称映射
 

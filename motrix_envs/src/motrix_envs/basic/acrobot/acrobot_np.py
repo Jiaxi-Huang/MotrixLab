@@ -135,7 +135,7 @@ class AcrobotEnv(DirectEnv):
         state.terminated = terminated
         return state
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num_reset = len(env_ids)
 
         shoulder_angle = np.random.uniform(-np.pi, np.pi, size=num_reset).astype(np.float32)
@@ -148,8 +148,6 @@ class AcrobotEnv(DirectEnv):
         self._reset_velocity[env_ids] = dof_vel
         self._reset_program.execute(env_ids)
         self.sim_data.execute(np.asarray(env_ids, np.int64))
-
-        return {}
 
     def _reset_done_envs(self):
         """

@@ -46,6 +46,8 @@ class PendulumEnv(DirectEnv):
         self._action_high = float(ctrl_limits[1, 0])
         self._action_space = gym.spaces.Box(-1.0, 1.0, (1,), dtype=np.float32)
         self._observation_space = gym.spaces.Box(-np.inf, np.inf, (3,), dtype=np.float32)
+        # Episode-scoped control history for the control-delta penalty.
+        self._prev_ctrl = np.zeros(self._num_envs, dtype=np.float32)
 
     @property
     def observation_space(self):
@@ -84,7 +86,7 @@ class PendulumEnv(DirectEnv):
         # In this model, zero angle corresponds to the hanging-down position.
         # Shift the target by pi to encourage the upright (inverted) posture.
         upright = (1.0 + np.cos(angle_wrapped)) * 0.5
-        prev_ctrl = state.info.get("prev_ctrl", np.zeros_like(ctrl))
+        prev_ctrl = self._prev_ctrl
         ctrl_delta = ctrl - prev_ctrl
         vel_penalty = 0.2 * (ang_vel**2)
         energy = 0.5 * ang_vel**2 + (1.0 - np.cos(angle_wrapped))
@@ -105,10 +107,10 @@ class PendulumEnv(DirectEnv):
 
         state.reward = reward
         state.terminated = terminated
-        state.info["prev_ctrl"] = ctrl
+        self._prev_ctrl[:] = ctrl
         return state
 
-    def reset(self, env_ids: np.ndarray):
+    def reset(self, env_ids: np.ndarray) -> None:
         cfg: PendulumEnvCfg = self._cfg
         reset_noise_scale = getattr(cfg, "reset_noise_scale", 0.0)
         num_reset = len(env_ids)
@@ -122,4 +124,4 @@ class PendulumEnv(DirectEnv):
         self._reset_velocity[env_ids] = dof_vel
         self._reset_program.execute(env_ids)
         self.sim_data.execute(np.asarray(env_ids, np.int64))
-        return {"prev_ctrl": np.zeros((num_reset,), dtype=np.float32)}
+        self._prev_ctrl[env_ids] = 0.0

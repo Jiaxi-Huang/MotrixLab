@@ -43,7 +43,10 @@ class TorchEnvState:
     terminated: torch.Tensor
     truncated: torch.Tensor
     episode_steps: torch.Tensor
-    info: dict
+    # Per-term reward breakdown for the latest transition: term name to a
+    # ``(num_envs,)`` tensor. Empty when the environment does not decompose
+    # its reward.
+    reward_terms: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
     # Instantaneous diagnostics snapshot: scalar per key, reduced across all
     # environments. Recomputed every step by ``update_state``; resets do not
     # clear or recompute it.
@@ -187,9 +190,8 @@ class TorchEnv(ABEnv, Generic[EnvCfgType]):
         terminated = torch.ones((self._num_envs,), dtype=torch.bool, device=self._device)
         truncated = torch.zeros((self._num_envs,), dtype=torch.bool, device=self._device)
         episode_steps = torch.zeros((self._num_envs,), dtype=torch.int64, device=self._device)
-        info = {"time_outs": torch.zeros((self._num_envs,), dtype=torch.bool, device=self._device)}
         data = mtx.SceneData(self._model, batch=[self._num_envs])
-        self._state = TorchEnvState(data, obs, reward, terminated, truncated, episode_steps, info)
+        self._state = TorchEnvState(data, obs, reward, terminated, truncated, episode_steps)
         self._reset_done_envs()
         self._state.validate(self._device, self._num_envs)
         return self._state
@@ -224,16 +226,6 @@ class TorchEnv(ABEnv, Generic[EnvCfgType]):
         else:
             assert src.value is None
 
-    def _replace_info_values(self, dst: dict, new_values: dict, mask: torch.Tensor) -> None:
-        for key, value in new_values.items():
-            if key not in dst:
-                dst[key] = value
-            elif isinstance(value, torch.Tensor):
-                dst[key][mask] = value
-            elif isinstance(value, dict):
-                assert isinstance(dst[key], dict)
-                self._replace_info_values(dst[key], value, mask)
-
     def _reset_done_envs(self) -> None:
         assert self._state is not None
         state = self._state
@@ -244,10 +236,8 @@ class TorchEnv(ABEnv, Generic[EnvCfgType]):
 
         state.episode_steps[done] = 0
         data = state.data[done.detach().cpu().numpy()]
-        obs, info = self.reset(data)
+        obs = self.reset(data)
         self._assign_obs(state.obs, done, obs)
-        if info:
-            self._replace_info_values(state.info, info, done)
 
     def _max_episode_steps(self) -> int | None:
         return self._cfg.max_episode_steps
@@ -261,7 +251,6 @@ class TorchEnv(ABEnv, Generic[EnvCfgType]):
         if not max_episode_steps:
             return
         self._state.truncated = self._state.episode_steps >= max_episode_steps
-        self._state.info["time_outs"] = self._state.truncated & ~self._state.terminated
 
     @abc.abstractmethod
     def apply_action(self, actions: torch.Tensor, state: TorchEnvState) -> TorchEnvState:
@@ -286,7 +275,7 @@ class TorchEnv(ABEnv, Generic[EnvCfgType]):
     def reset(
         self,
         data: mtx.SceneData,
-    ) -> tuple[TorchObs | torch.Tensor, dict]:
+    ) -> TorchObs | torch.Tensor:
         """
         Reset the environment for the done envs
 
@@ -294,7 +283,7 @@ class TorchEnv(ABEnv, Generic[EnvCfgType]):
             data (mtx.SceneData): The scene data to reset
 
         Returns:
-            tuple[torch.Tensor, dict]: The initial observations and info after reset
+            TorchObs | torch.Tensor: The initial observations after reset
         """
         pass
 

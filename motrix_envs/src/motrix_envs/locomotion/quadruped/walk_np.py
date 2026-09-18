@@ -221,6 +221,16 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         self.feet_contact = np.zeros((num_envs, self._num_feet), dtype=bool)
         self.feet_pos = np.zeros((num_envs, self._num_feet, 3), dtype=np.float32)
 
+        # Episode-scoped task state: full-batch buffers, reset writes the done
+        # rows in place.
+        self._commands = np.zeros((num_envs, 3), dtype=np.float32)
+        self._command_resampling_time = np.full(num_envs, np.inf, dtype=np.float32)
+        self._phase = np.zeros(num_envs, dtype=np.float32)
+        self._feet_phase = np.zeros((num_envs, self._num_feet), dtype=np.float32)
+        self._current_actions = np.zeros((num_envs, self._num_action), dtype=np.float32)
+        self._last_actions = np.zeros((num_envs, self._num_action), dtype=np.float32)
+        self._action_delay_steps = np.zeros(num_envs, dtype=np.int32)
+
     # ---- obs/action space plumbing ----------------------------------------
 
     def _policy_obs_dim(self) -> int:
@@ -287,21 +297,20 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             contacts[rows, i] = value[:, 0] > 0.0
         return contacts
 
-    def _update_feet_buffers(self, env_ids: np.ndarray | None = None) -> np.ndarray:
+    def _update_feet_buffers(self, env_ids: np.ndarray | None = None) -> None:
         contacts = self._read_feet_contact(env_ids)
         rows = slice(None) if env_ids is None else env_ids
         self.feet_contact[rows, :] = contacts[rows, :]
         for i, name in enumerate(self._feet_position_sensors):
             self.feet_pos[rows, i, :] = self.sim_data[name][rows]
-        return contacts if env_ids is None else contacts[env_ids]
 
-    def _advance_phase(self, info: dict):
-        commands = info["commands"]
+    def _advance_phase(self):
+        commands = self._commands
         standing = np.linalg.norm(commands, axis=1) < self.cfg.commands.velocity.standing_threshold
-        phase = info["phase"]
-        phase = np.fmod(phase + self.cfg.ctrl_dt * self.cfg.gait_frequency, 1.0).astype(np.float32, copy=False)
+        phase = self._phase
+        np.fmod(phase + self.cfg.ctrl_dt * self.cfg.gait_frequency, 1.0, out=phase)
         phase[standing] = 0.0
-        feet_phase = info["feet_phase"]
+        feet_phase = self._feet_phase
         # Each trot pair swings together; pair ``n`` is offset by half a cycle
         # relative to pair ``n-1``.
         for pair_idx, (i, j) in enumerate(self.cfg.trot_pairs):
@@ -310,20 +319,18 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             feet_phase[:, i] = value
             feet_phase[:, j] = value
         feet_phase[standing] = 0.0
-        info["phase"] = phase
-        info["feet_phase"] = feet_phase
 
     # ---- env loop ---------------------------------------------------------
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState) -> ArrayEnvState:
         actions = np.asarray(actions, dtype=np.float32)
-        state.info["last_actions"] = state.info["current_actions"]
-        state.info["current_actions"] = actions
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = actions
         if self._randomize_action_delay:
-            use_last = state.info["action_delay_steps"] == 1
-            exec_actions = np.where(use_last[:, None], state.info["last_actions"], actions)
+            use_last = self._action_delay_steps == 1
+            exec_actions = np.where(use_last[:, None], self._last_actions, actions)
         else:
-            exec_actions = state.info["last_actions"] if self.cfg.control_config.simulate_action_latency else actions
+            exec_actions = self._last_actions if self.cfg.control_config.simulate_action_latency else actions
         targets = exec_actions * self.cfg.control_config.action_scale + self.default_angles
         ctrl = self._ctrl_writes.buffer("ctrl")
         ctrl[:] = targets.astype(np.float32, copy=False)
@@ -338,9 +345,9 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         noisy_diff = self._obs_noise(diff, noise_cfg.scale_joint_angle)
         noisy_dof_vel = self._obs_noise(self.get_dof_vel(), noise_cfg.scale_joint_vel)
         noisy_linvel = self._obs_noise(self.get_local_linvel(), noise_cfg.scale_linvel)
-        command = state.info["commands"]
-        last_actions = state.info["current_actions"]
-        feet_phase = state.info["feet_phase"]
+        command = self._commands
+        last_actions = self._current_actions
+        feet_phase = self._feet_phase
 
         policy = np.concatenate(
             [
@@ -367,15 +374,17 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
 
     def compute_transition(self, state: ArrayEnvState) -> ArrayEnvState:
         self.sim_data.execute()
-        self._update_commands(state.info)
-        self._advance_phase(state.info)
-        state.info["contacts"] = self._update_feet_buffers()
+        self._update_commands()
+        self._advance_phase()
+        self._update_feet_buffers()
 
         terminated = self.get_gravity()[:, 2] <= 0.5
-        reward = self._compute_reward(state.info, self.get_local_linvel(), self.get_gyro(), self.get_dof_pos())
+        reward = self._compute_reward(state, self.get_local_linvel(), self.get_gyro(), self.get_dof_pos())
         return state.replace(reward=reward, terminated=terminated)
 
-    def _compute_reward(self, info: dict, linvel: np.ndarray, gyro: np.ndarray, dof_pos: np.ndarray) -> np.ndarray:
+    def _compute_reward(
+        self, state: ArrayEnvState, linvel: np.ndarray, gyro: np.ndarray, dof_pos: np.ndarray
+    ) -> np.ndarray:
         reward = np.zeros((self._num_envs,), dtype=np.float32)
         reward_cfg = self.cfg.reward_config
         reward_fns = {
@@ -395,15 +404,15 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             scale = getattr(reward_cfg.scales, name)
             if scale == 0:
                 continue
-            rew = reward_fn(info, linvel, gyro, dof_pos)
+            rew = reward_fn(linvel, gyro, dof_pos)
             weighted = (rew * scale).astype(np.float32, copy=False)
             reward += weighted
             reward_items[name] = weighted
 
-        info["Reward"] = reward_items
+        state.reward_terms = reward_items
         return reward * self.cfg.ctrl_dt
 
-    def reset(self, env_ids: np.ndarray):
+    def reset(self, env_ids: np.ndarray) -> None:
         num_reset = len(env_ids)
         base_pose = np.tile(self._init_base_pose, (num_reset, 1))
         base_linear_velocity = np.zeros((num_reset, 3), dtype=np.float32)
@@ -429,23 +438,17 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         self._reset_joint_position[env_ids] = joint_position
         self._reset_joint_velocity[env_ids] = joint_velocity
         self._reset_program.execute(env_ids)
-        action_delay_steps = self._randomize_params(env_ids)
+        self._randomize_params(env_ids)
 
         self.sim_data.execute(np.asarray(env_ids, dtype=np.int64))
-        contacts = self._update_feet_buffers(env_ids)
+        self._update_feet_buffers(env_ids)
 
-        info = {
-            "current_actions": np.zeros((num_reset, self._num_action), dtype=np.float32),
-            "last_actions": np.zeros((num_reset, self._num_action), dtype=np.float32),
-            "commands": self.resample_commands(num_reset),
-            "command_resampling_time": self._sample_command_resampling_time(num_reset),
-            "phase": np.zeros((num_reset,), dtype=np.float32),
-            "feet_phase": np.zeros((num_reset, self._num_feet), dtype=np.float32),
-            "contacts": contacts,
-        }
-        if action_delay_steps is not None:
-            info["action_delay_steps"] = action_delay_steps
-        return info
+        self._commands[env_ids] = self.resample_commands(num_reset)
+        self._command_resampling_time[env_ids] = self._sample_command_resampling_time(num_reset)
+        self._phase[env_ids] = 0.0
+        self._feet_phase[env_ids] = 0.0
+        self._current_actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0
 
     def resample_commands(self, num_envs: int) -> np.ndarray:
         return self._velocity_command_binding.read_command(batch_size=num_envs).values.copy()
@@ -456,16 +459,16 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             return np.full((num_envs,), np.inf, dtype=np.float32)
         return self._command_rng.uniform(*interval, size=num_envs).astype(np.float32)
 
-    def _update_commands(self, info: dict) -> None:
+    def _update_commands(self) -> None:
         if self.cfg.commands.velocity.resampling_seconds_range is None:
             return
-        remaining = info["command_resampling_time"] - self.cfg.ctrl_dt
+        remaining = self._command_resampling_time
+        remaining -= self.cfg.ctrl_dt
         due = remaining <= 0.0
         num_due = int(np.count_nonzero(due))
         if num_due:
-            info["commands"][due] = self.resample_commands(num_due)
+            self._commands[due] = self.resample_commands(num_due)
             remaining[due] = self._sample_command_resampling_time(num_due)
-        info["command_resampling_time"] = remaining.astype(np.float32, copy=False)
 
     def _randomize_dof_noise(
         self,
@@ -512,26 +515,25 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
                 -base_ang_vel_noise, base_ang_vel_noise, size=(num_reset, 3)
             ).astype(np.float32)
 
-    def _randomize_params(self, env_ids: np.ndarray) -> np.ndarray | None:
+    def _randomize_params(self, env_ids: np.ndarray) -> None:
         num_reset = len(env_ids)
         randomization = self.cfg.randomization
         if not randomization.enabled:
-            return None
+            return
         rng = self._randomization_rng
         num_action = self._num_action
 
-        action_delay_steps = None
         if self._randomize_action_delay:
             delay_low, delay_high = randomization.action_delay_steps
             if delay_low == delay_high:
-                action_delay_steps = np.full((num_reset,), delay_low, dtype=np.int32)
+                self._action_delay_steps[env_ids] = delay_low
             else:
-                action_delay_steps = rng.integers(delay_low, delay_high + 1, size=num_reset, dtype=np.int32)
+                self._action_delay_steps[env_ids] = rng.integers(delay_low, delay_high + 1, size=num_reset)
 
         # All override writes for this reset batch into one program execution.
         program = self._randomize_writes
         if program is None:
-            return action_delay_steps
+            return
 
         if self._randomize_kp:
             kp_scale = rng.uniform(*self.cfg.randomization.kp_scale_range, size=(num_reset, num_action)).astype(
@@ -560,52 +562,50 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             program.buffer("com")[env_ids, 0] = np.tile(self.model.others["base_com"], (num_reset, 1)) + base_com_offset
         program.execute(env_ids)
 
-        return action_delay_steps
-
     # ---- reward functions -------------------------------------------------
 
-    def _reward_tracking_lin_vel(self, info, linvel, gyro, dof_pos) -> np.ndarray:
+    def _reward_tracking_lin_vel(self, linvel, gyro, dof_pos) -> np.ndarray:
         del gyro, dof_pos
-        commands = info["commands"]
+        commands = self._commands
         error = np.sum(np.square(commands[:, :2] - linvel[:, :2]), axis=1)
         return np.exp(-error / self.cfg.reward_config.tracking_lin_vel_sigma)
 
-    def _reward_tracking_ang_vel(self, info, linvel, gyro, dof_pos) -> np.ndarray:
+    def _reward_tracking_ang_vel(self, linvel, gyro, dof_pos) -> np.ndarray:
         del linvel, dof_pos
-        commands = info["commands"]
+        commands = self._commands
         error = np.square(commands[:, 2] - gyro[:, 2])
         return np.exp(-error / self.cfg.reward_config.tracking_ang_vel_sigma)
 
-    def _reward_lin_vel_z(self, info, linvel, gyro, dof_pos) -> np.ndarray:
-        del info, gyro, dof_pos
+    def _reward_lin_vel_z(self, linvel, gyro, dof_pos) -> np.ndarray:
+        del gyro, dof_pos
         return np.square(linvel[:, 2])
 
-    def _reward_ang_vel_xy(self, info, linvel, gyro, dof_pos) -> np.ndarray:
-        del info, linvel, dof_pos
+    def _reward_ang_vel_xy(self, linvel, gyro, dof_pos) -> np.ndarray:
+        del linvel, dof_pos
         return np.sum(np.square(gyro[:, :2]), axis=1)
 
-    def _reward_base_height(self, info, linvel, gyro, dof_pos) -> np.ndarray:
-        del info, linvel, gyro, dof_pos
+    def _reward_base_height(self, linvel, gyro, dof_pos) -> np.ndarray:
+        del linvel, gyro, dof_pos
         base_pos = self.sim_data["base_pos"]
         env_ids = np.arange(self._num_envs, dtype=np.int64)
         ground_height = self.sim.sample_terrain_height(self.cfg.ground_geom_name, env_ids, base_pos[:, None, :2])[:, 0]
         base_height = base_pos[:, 2].astype(np.float32) - ground_height
         return np.square(base_height - self.cfg.reward_config.base_height_target)
 
-    def _reward_action_rate(self, info, linvel, gyro, dof_pos) -> np.ndarray:
+    def _reward_action_rate(self, linvel, gyro, dof_pos) -> np.ndarray:
         del linvel, gyro, dof_pos
-        current = info["current_actions"]
-        last = info["last_actions"]
+        current = self._current_actions
+        last = self._last_actions
         return np.sum(np.square(current - last), axis=1)
 
-    def _reward_similar_to_default(self, info, linvel, gyro, dof_pos) -> np.ndarray:
-        del info, linvel, gyro
+    def _reward_similar_to_default(self, linvel, gyro, dof_pos) -> np.ndarray:
+        del linvel, gyro
         return np.sum(np.abs(dof_pos - self.default_angles), axis=1)
 
-    def _reward_swing_feet_z(self, info, linvel, gyro, dof_pos) -> np.ndarray:
+    def _reward_swing_feet_z(self, linvel, gyro, dof_pos) -> np.ndarray:
         del linvel, gyro, dof_pos
-        feet_phase = info["feet_phase"]
-        contacts = info["contacts"]
+        feet_phase = self._feet_phase
+        contacts = self.feet_contact
         valid_swing = (feet_phase >= 0.6) & ~contacts
         reward_cfg = self.cfg.reward_config
         # feet_pos is body-relative (framepos with ref=imu). The foot lifts
@@ -618,20 +618,20 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         swing_rew = np.exp(-height_error / sigma_sq) * valid_swing
         return np.sum(swing_rew, axis=1) / self._num_feet
 
-    def _reward_contact(self, info, linvel, gyro, dof_pos) -> np.ndarray:
+    def _reward_contact(self, linvel, gyro, dof_pos) -> np.ndarray:
         del linvel, gyro, dof_pos
         res = np.zeros((self._num_envs,), dtype=np.float32)
-        feet_phase = info["feet_phase"]
-        contacts = info["contacts"]
+        feet_phase = self._feet_phase
+        contacts = self.feet_contact
         for i in range(self._num_feet):
             target_contact = feet_phase[:, i] < 0.6
             res += (contacts[:, i] == target_contact).astype(np.float32)
         return res / self._num_feet
 
-    def _reward_swing_contact(self, info, linvel, gyro, dof_pos) -> np.ndarray:
+    def _reward_swing_contact(self, linvel, gyro, dof_pos) -> np.ndarray:
         del linvel, gyro, dof_pos
-        is_swing = info["feet_phase"] >= 0.6
-        swing_contacts = info["contacts"] & is_swing
+        is_swing = self._feet_phase >= 0.6
+        swing_contacts = self.feet_contact & is_swing
         return np.sum(swing_contacts, axis=1) / self._num_feet
 
 

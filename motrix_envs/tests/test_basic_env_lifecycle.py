@@ -26,4 +26,5 @@ def test_basic_environment_step_preserves_numpy_observation_contract(env_name: s
     assert isinstance(state.obs, NpObs)
     assert state.obs.policy.shape == (num_envs, *env.observation_space.shape)
     if env_name == "franka-open-cabinet":
-        assert state.info["current_gripper_action"].shape == (num_envs,)
+        # Episode-scoped gripper state lives on the env instance, not in info.
+        assert env._current_gripper_action.shape == (num_envs,)

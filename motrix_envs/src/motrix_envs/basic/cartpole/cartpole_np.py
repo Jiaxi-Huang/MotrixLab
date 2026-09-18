@@ -82,7 +82,7 @@ class CartPoleEnv(DirectEnv):
         assert obs.shape == (self._num_envs, 4)
         return state.replace(obs=obs)
 
-    def reset(self, env_ids: np.ndarray):
+    def reset(self, env_ids: np.ndarray) -> None:
         cfg: CartPoleEnvCfg = self._cfg
         rows = len(env_ids)
         noise_pos = np.random.uniform(
@@ -103,4 +103,3 @@ class CartPoleEnv(DirectEnv):
         self._reset_velocity[env_ids] = dof_vel
         self._reset_program.execute(env_ids)
         self.sim_data.execute(env_ids)
-        return {}

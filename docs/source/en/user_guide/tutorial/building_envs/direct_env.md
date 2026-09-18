@@ -146,7 +146,7 @@ Hooks a subclass implements:
 
 | Hook                                        | Responsibility                                                                        |
 | ------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `reset(env_ids)`                            | Write reset state (randomized initial poses, ...) for the selected rows and return an info dict; observations are produced afterwards by `compute_observation` |
+| `reset(env_ids)`                            | Write reset state (randomized initial poses, ...) for the selected rows; observations are produced afterwards by `compute_observation` |
 | `apply_action(actions, state)`              | Write the action into the simulator (usually ctrl targets)                             |
 | `compute_transition(state)`                 | Execute the read program and derive `state.reward`, `state.terminated`, ...; this is the only full data refresh of a step and must **not** write `state.obs` |
 | `compute_observation(state)`                | Assemble `state.obs` purely from already refreshed simulator data, without further reads |
@@ -156,7 +156,7 @@ Semantics:
 
 - `terminated` marks episode-ending conditions such as task failure; `truncated` marks
   the time limit at `max_episode_steps`. `ArrayEnv` combines both into `done` and
-  triggers auto-reset; `info["time_outs"]` flags rows that timed out without failing.
+  triggers auto-reset.
 - The environment dimension must use vectorized NumPy operations; plain loops are only
   allowed over a fixed number of joints, feet, or terms.
 - Constants (initial poses, space definitions, query names) are precomputed in

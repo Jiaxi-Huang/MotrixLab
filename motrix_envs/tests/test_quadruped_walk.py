@@ -56,11 +56,9 @@ def quadruped_env():
 
 
 def _swing_reward(quadruped_env, contacts: np.ndarray) -> np.ndarray:
-    info = {
-        "feet_phase": np.full((1, quadruped_env._num_feet), 0.75, dtype=np.float32),
-        "contacts": contacts,
-    }
-    return quadruped_env._reward_swing_feet_z(info, None, None, None)
+    quadruped_env._feet_phase[:] = 0.75
+    quadruped_env.feet_contact[:] = contacts
+    return quadruped_env._reward_swing_feet_z(None, None, None)
 
 
 def test_quadruped_reward_scales_are_structured_and_not_shared():
@@ -75,8 +73,8 @@ def test_quadruped_reward_scales_are_structured_and_not_shared():
 def test_go2_velocity_commands_remain_constant_before_resampling_interval():
     np.random.seed(7)
     env = registry.make("go2-walk-flat", num_envs=64, mode="train")
-    state = env.init_state()
-    commands = state.info["commands"].copy()
+    env.init_state()
+    commands = env._commands.copy()
     velocity_cfg = env.cfg.commands.velocity
 
     assert commands.shape == (64, 3)
@@ -86,7 +84,7 @@ def test_go2_velocity_commands_remain_constant_before_resampling_interval():
 
     env.step(np.zeros((env.num_envs, *env.action_space.shape), dtype=np.float32))
 
-    np.testing.assert_array_equal(state.info["commands"], commands)
+    np.testing.assert_array_equal(env._commands, commands)
 
 
 def test_go2_randomization_is_enabled_for_training_and_disabled_for_play():
@@ -115,7 +113,7 @@ def test_go2_uses_position_actuators_for_pd_randomization(env_name: str):
 @pytest.mark.parametrize("env_name", ["go2-walk-flat", "go2-walk-rough"])
 def test_go2_reset_randomization_stays_within_configured_ranges(env_name: str):
     env = registry.make(env_name, num_envs=32, mode="train")
-    state = env.init_state()
+    env.init_state()
     randomization = env.cfg.randomization
     joint_pos_diff = env.get_dof_pos() - env.default_angles
     dof_vel = env.sim_data["dof_vel"]
@@ -129,8 +127,8 @@ def test_go2_reset_randomization_stays_within_configured_ranges(env_name: str):
     assert np.unique(joint_pos_diff, axis=0).shape[0] > 1
     command_interval = env.cfg.commands.velocity.resampling_seconds_range
     if command_interval is not None:
-        assert np.all(state.info["command_resampling_time"] >= command_interval[0])
-        assert np.all(state.info["command_resampling_time"] <= command_interval[1])
+        assert np.all(env._command_resampling_time >= command_interval[0])
+        assert np.all(env._command_resampling_time <= command_interval[1])
 
 
 def test_go2_pd_and_friction_randomization_is_per_env_and_episode_constant():
@@ -189,8 +187,8 @@ def test_go2_action_delay_selects_current_or_previous_action_per_env():
     state = env.init_state()
     previous = np.full((2, env._num_action), -0.2, dtype=np.float32)
     current = np.full((2, env._num_action), 0.3, dtype=np.float32)
-    state.info["current_actions"] = previous
-    state.info["action_delay_steps"][:] = (0, 1)
+    env._current_actions[:] = previous
+    env._action_delay_steps[:] = (0, 1)
 
     env.apply_action(current, state)
     env.sim_data.execute()
@@ -202,19 +200,19 @@ def test_go2_action_delay_selects_current_or_previous_action_per_env():
 
 def test_go2_command_resampling_only_updates_due_environments(monkeypatch: pytest.MonkeyPatch):
     env = registry.make("go2-walk-flat", num_envs=3, mode="train")
-    state = env.init_state()
+    env.init_state()
     commands = np.array([[0.1, 0.0, 0.0], [0.2, 0.1, 0.0], [0.3, 0.0, -0.1]], dtype=np.float32)
     replacement = np.array([[0.4, -0.2, 0.3], [0.5, 0.2, -0.3]], dtype=np.float32)
-    state.info["commands"][:] = commands
-    state.info["command_resampling_time"][:] = (0.0, 1.0, 0.0)
+    env._commands[:] = commands
+    env._command_resampling_time[:] = (0.0, 1.0, 0.0)
     monkeypatch.setattr(env, "resample_commands", lambda num_envs: replacement[:num_envs].copy())
 
-    env._update_commands(state.info)
+    env._update_commands()
 
-    np.testing.assert_array_equal(state.info["commands"][[0, 2]], replacement)
-    np.testing.assert_array_equal(state.info["commands"][[1]], commands[[1]])
-    assert state.info["command_resampling_time"][1] == pytest.approx(1.0 - env.cfg.ctrl_dt)
-    assert np.all(state.info["command_resampling_time"][[0, 2]] > 0.0)
+    np.testing.assert_array_equal(env._commands[[0, 2]], replacement)
+    np.testing.assert_array_equal(env._commands[[1]], commands[[1]])
+    assert env._command_resampling_time[1] == pytest.approx(1.0 - env.cfg.ctrl_dt)
+    assert np.all(env._command_resampling_time[[0, 2]] > 0.0)
 
 
 def test_random_planar_velocity_binding_is_seeded_vectorized_and_task_specific():
@@ -260,8 +258,8 @@ def test_go2_partial_reset_only_resamples_finished_environments(monkeypatch: pyt
         ],
         dtype=np.float32,
     )
-    state.info["commands"][:] = commands
-    action_delay_steps = state.info["action_delay_steps"].copy()
+    env._commands[:] = commands
+    action_delay_steps = env._action_delay_steps.copy()
     _, kp, damping, friction = _read_param_overrides(env)
     mass, center_of_mass = _read_mass_overrides(env)
     state.terminated[:] = (False, True, False)
@@ -270,9 +268,9 @@ def test_go2_partial_reset_only_resamples_finished_environments(monkeypatch: pyt
 
     env._reset_done_envs()
 
-    np.testing.assert_array_equal(state.info["commands"][[0, 2]], commands[[0, 2]])
-    np.testing.assert_array_equal(state.info["commands"][[1]], replacement)
-    np.testing.assert_array_equal(state.info["action_delay_steps"][[0, 2]], action_delay_steps[[0, 2]])
+    np.testing.assert_array_equal(env._commands[[0, 2]], commands[[0, 2]])
+    np.testing.assert_array_equal(env._commands[[1]], replacement)
+    np.testing.assert_array_equal(env._action_delay_steps[[0, 2]], action_delay_steps[[0, 2]])
     _, kp_after, damping_after, friction_after = _read_param_overrides(env)
     mass_after, com_after = _read_mass_overrides(env)
     np.testing.assert_array_equal(kp_after[[0, 2]], kp[[0, 2]])
@@ -298,7 +296,7 @@ def test_go2_play_reset_preserves_nominal_joint_state_and_runtime_parameters():
         "sliding_friction",
         "base_mass_scale",
         "base_com_offset",
-    }.isdisjoint(env.state.info)
+    }.isdisjoint(env.state.reward_terms)
     mass, center_of_mass = _read_mass_overrides(env)
     nominal_mass, nominal_center_of_mass = _nominal_masses(env)
     np.testing.assert_array_equal(mass, nominal_mass)
@@ -335,16 +333,15 @@ def test_quadruped_randomization_config_rejects_invalid_ranges(update, message):
 
 def test_zero_velocity_command_freezes_gait_phase():
     env = registry.make("go2-walk-flat", num_envs=2, mode="train")
-    info = {
-        "commands": np.zeros((2, 3), dtype=np.float32),
-        "phase": np.full(2, 0.5, dtype=np.float32),
-        "feet_phase": np.full((2, env._num_feet), 0.5, dtype=np.float32),
-    }
+    env.init_state()
+    env._commands[:] = 0.0
+    env._phase[:] = 0.5
+    env._feet_phase[:] = 0.5
 
-    env._advance_phase(info)
+    env._advance_phase()
 
-    np.testing.assert_array_equal(info["phase"], np.zeros(2, dtype=np.float32))
-    np.testing.assert_array_equal(info["feet_phase"], np.zeros((2, env._num_feet), dtype=np.float32))
+    np.testing.assert_array_equal(env._phase, np.zeros(2, dtype=np.float32))
+    np.testing.assert_array_equal(env._feet_phase, np.zeros((2, env._num_feet), dtype=np.float32))
 
 
 @pytest.mark.parametrize(
@@ -383,7 +380,7 @@ def test_quadruped_rough_walk_reset_and_base_height_are_terrain_relative(env_nam
     assert np.all(relative_height >= env.cfg.initial_base_position[2] - 1e-6)
     assert np.all(relative_height <= env.cfg.initial_base_position[2] + height_scale + 1e-6)
     expected = np.square(relative_height - env.cfg.reward_config.base_height_target)
-    np.testing.assert_allclose(env._reward_base_height(None, None, None, None), expected)
+    np.testing.assert_allclose(env._reward_base_height(None, None, None), expected)
 
     next_state = env.step(np.zeros((env.num_envs, *env.action_space.shape), dtype=np.float32))
     assert next_state.reward.shape == (env.num_envs,)
@@ -442,18 +439,11 @@ def test_swing_contact_penalty_detects_dragging_feet(quadruped_env):
     no_contacts = np.zeros((1, quadruped_env._num_feet), dtype=bool)
     all_contacts = np.ones((1, quadruped_env._num_feet), dtype=bool)
 
-    no_drag = quadruped_env._reward_swing_contact(
-        {"feet_phase": feet_phase, "contacts": no_contacts},
-        None,
-        None,
-        None,
-    )
-    all_drag = quadruped_env._reward_swing_contact(
-        {"feet_phase": feet_phase, "contacts": all_contacts},
-        None,
-        None,
-        None,
-    )
+    quadruped_env._feet_phase[:] = feet_phase
+    quadruped_env.feet_contact[:] = no_contacts
+    no_drag = quadruped_env._reward_swing_contact(None, None, None)
+    quadruped_env.feet_contact[:] = all_contacts
+    all_drag = quadruped_env._reward_swing_contact(None, None, None)
 
     np.testing.assert_array_equal(no_drag, np.zeros((1,), dtype=np.float32))
     np.testing.assert_array_equal(all_drag, np.ones((1,), dtype=np.float32))

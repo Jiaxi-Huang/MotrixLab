@@ -73,7 +73,7 @@ sole every step, so clearance remains relative to the local surface.
 Each raw term is multiplied by its `RewardScales` weight and the control timestep; negative weights turn constraint
 measurements such as `penalty_*` and `pose` into penalties. Curriculum-selected penalties are also multiplied by the
 current `penalty_scale` according to completed episode length. This factor is exposed through
-`info["metrics"]["penalty_scale"]`, and the final weighted terms through `info["Reward"]`.
+`state.metrics["penalty_scale"]`, and the final weighted terms through `state.reward_terms`.
 
 ## Termination conditions
 

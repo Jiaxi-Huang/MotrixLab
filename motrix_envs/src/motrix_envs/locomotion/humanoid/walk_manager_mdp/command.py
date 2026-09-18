@@ -58,7 +58,7 @@ def _lane_resample_command(ctx, commands, low, high, stand_prob) -> None:
 class WalkCommand(CommandTerm):
     """Per-environment velocity command and gait-phase clock.
 
-    Mirrors the direct env's ``info["commands"]`` / ``info["phase"]`` state:
+    Mirrors the direct env's ``commands`` / ``phase`` episode state:
     commands resample every ``resample_steps`` transitions, the phase advances
     by ``phase_dt`` per step from a per-env offset, and standing commands pin
     the phase to ``pi``.

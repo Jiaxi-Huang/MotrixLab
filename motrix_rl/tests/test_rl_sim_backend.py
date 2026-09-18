@@ -46,7 +46,6 @@ def _make_env(sim_backend: str):
             terminated=np.zeros(_NUM_ENVS, dtype=bool),
             truncated=np.zeros(_NUM_ENVS, dtype=bool),
             episode_steps=np.zeros(_NUM_ENVS, dtype=np.uint64),
-            info={"time_outs": np.zeros(_NUM_ENVS, dtype=bool)},
         )
     else:
         env = Mock(spec=TorchEnv)
@@ -60,7 +59,6 @@ def _make_env(sim_backend: str):
             terminated=torch.zeros(_NUM_ENVS, dtype=torch.bool, device=env.device),
             truncated=torch.zeros(_NUM_ENVS, dtype=torch.bool, device=env.device),
             episode_steps=torch.zeros(_NUM_ENVS, dtype=torch.int64, device=env.device),
-            info={"time_outs": torch.zeros(_NUM_ENVS, dtype=torch.bool, device=env.device)},
         )
 
     env.cfg = SimpleNamespace(max_episode_steps=100)
@@ -207,7 +205,6 @@ class _AsyncNpEnv(_AsyncEnv, DirectEnv):
             terminated=np.zeros(self.num_envs, dtype=bool),
             truncated=np.zeros(self.num_envs, dtype=bool),
             episode_steps=np.zeros(self.num_envs, dtype=np.uint64),
-            info=_async_info(lambda data: np.asarray(data, dtype=np.float32)),
             metrics={"progress": 0.5},
         )
 
@@ -221,7 +218,6 @@ class _AsyncTorchEnv(_AsyncEnv, TorchEnv):
             terminated=torch.zeros(self.num_envs, dtype=torch.bool),
             truncated=torch.zeros(self.num_envs, dtype=torch.bool),
             episode_steps=torch.zeros(self.num_envs, dtype=torch.int64),
-            info=_async_info(lambda data: torch.as_tensor(data, dtype=torch.float32)),
             metrics={"progress": 0.5},
         )
 

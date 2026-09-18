@@ -82,6 +82,13 @@ class FrankaLiftCubeEnv(DirectEnv):
 
         self.count = 0
 
+        # Episode-scoped task state: full-batch buffers, reset writes the done
+        # rows in place.
+        num_envs = self._num_envs
+        self._commands = np.zeros((num_envs, 3), dtype=np.float32)
+        self._current_actions = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+        self._last_actions = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+
     @property
     def observation_space(self):
         return self._observation_space
@@ -91,8 +98,8 @@ class FrankaLiftCubeEnv(DirectEnv):
         return self._action_space
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState):
-        state.info["last_actions"] = state.info["current_actions"]
-        state.info["current_actions"] = actions
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = actions
 
         # no gripper
         old_joint_pos = self.get_dof_pos(slice(None))[:, : self._action_dim - 1]
@@ -107,7 +114,6 @@ class FrankaLiftCubeEnv(DirectEnv):
         sampled_gripper_action = np.where(probabilities > np.random.rand(*probabilities.shape), 0, 0.04)[
             :, None
         ]  # Close 0, Open 0.04
-        state.info["current_gripper_action"] = sampled_gripper_action.squeeze(axis=-1)
 
         new_pos = np.concatenate([new_joint_pos, sampled_gripper_action], axis=-1)
 
@@ -126,10 +132,9 @@ class FrankaLiftCubeEnv(DirectEnv):
         """Build the full observation batch from cached simulator data.
 
         Reads only the cache left by the last read-program execution in the
-        transition; never performs reads itself and never touches reward,
-        termination, or info.
+        transition; never performs reads itself and never touches reward or
+        termination.
         """
-        info = state.info
         dof_pos = self.get_dof_pos(slice(None))
         dof_vel = self.get_dof_vel(slice(None))
         dof_pos_rel = self._get_joint_pos_rel(dof_pos)
@@ -137,9 +142,9 @@ class FrankaLiftCubeEnv(DirectEnv):
 
         object_pick_pose = self.get_cube_pose(slice(None))
 
-        object_lift_pos = info["commands"]
+        object_lift_pos = self._commands
 
-        last_actions = info["current_actions"]
+        last_actions = self._current_actions
 
         obs = np.concatenate([dof_pos_rel, dof_vel_rel, object_pick_pose, object_lift_pos, last_actions], axis=-1)
 
@@ -170,7 +175,7 @@ class FrankaLiftCubeEnv(DirectEnv):
 
         return state
 
-    def reset(self, env_ids):
+    def reset(self, env_ids) -> None:
         num_reset = len(env_ids)
         row_ids = np.asarray(env_ids, dtype=np.int64)
 
@@ -199,17 +204,13 @@ class FrankaLiftCubeEnv(DirectEnv):
         self._reset_program.execute(row_ids)
         self.sim_data.execute(row_ids)
 
-        info = {
-            "current_actions": np.zeros((num_reset, self._action_dim), dtype=np.float32),
-            "last_actions": np.zeros((num_reset, self._action_dim), dtype=np.float32),
-            "commands": self._generated_commands(num_reset),  #
-            "current_gripper_action": np.zeros(num_reset, dtype=np.float32),  # 1D
-        }
+        commands = self._generated_commands(num_reset)
+        assert not np.isnan(commands).any(), "commands contain nan"
 
-        # Check for nan
-        assert not np.isnan(info["commands"]).any(), "commands contain nan"
-
-        return info
+        # Write episode-scoped state for the reset rows
+        self._commands[row_ids] = commands
+        self._current_actions[row_ids] = 0.0
+        self._last_actions[row_ids] = 0.0
 
     def _check_termination(self, state: ArrayEnvState):
         cube_height = self.get_cube_pose(slice(None))[:, 2]
@@ -240,7 +241,7 @@ class FrankaLiftCubeEnv(DirectEnv):
         lifted = lift_height > minimal_height
 
         # object_command_tracking reward
-        object_command_dist = np.linalg.norm(cube_pos - state.info["commands"], axis=-1)
+        object_command_dist = np.linalg.norm(cube_pos - self._commands, axis=-1)
 
         def shifted_sigmoid_reward(d, k=8, center=0.3):
             # Sigmoid(-k * (d - center))
@@ -262,7 +263,7 @@ class FrankaLiftCubeEnv(DirectEnv):
         )
 
         # action_diff_sq: Sum of squares of action changes
-        action_diff_sq = np.sum(np.square(state.info["current_actions"] - state.info["last_actions"]), axis=-1)
+        action_diff_sq = np.sum(np.square(self._current_actions - self._last_actions), axis=-1)
         # joint_vel_sq: Sum of squares of joint velocities
         joint_vel_sq = np.sum(np.square(self.get_dof_vel(slice(None))[:, : self._num_dof_vel]), axis=1)
 

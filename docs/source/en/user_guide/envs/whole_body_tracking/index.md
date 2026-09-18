@@ -160,8 +160,8 @@ python scripts/train.py task=g1-wbt-dance/motrix.fastsac \
 ```
 
 During training, environments start at different points in the motion, and failure records increase the sampling probability
-of difficult regions. Weighted reward terms are written to `info["Reward"]`; bad-tracking rates, motion progress, and
-adaptive-sampling statistics are written to `info["metrics"]`. See [Task Environment Design](env_design.md) for definitions.
+of difficult regions. Weighted reward terms are written to `state.reward_terms`; bad-tracking rates, motion progress, and
+adaptive-sampling statistics are written to `state.metrics`. See [Task Environment Design](env_design.md) for definitions.
 
 ### Play the policy
 

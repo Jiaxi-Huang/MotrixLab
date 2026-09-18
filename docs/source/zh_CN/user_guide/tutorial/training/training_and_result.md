@@ -95,7 +95,7 @@ TensorBoard 日志写在 run 目录下，可按环境查看：
 tensorboard --logdir runs/cartpole
 ```
 
-除标准的回报、损失曲线外，若环境通过 `info["Reward"]` 暴露了各 reward 分项，训练时也会将其记录到 TensorBoard。
+除标准的回报、损失曲线外，若环境通过 `state.reward_terms` 暴露了各 reward 分项，训练时也会将其记录到 TensorBoard。
 
 ## 模型评估和测试
 

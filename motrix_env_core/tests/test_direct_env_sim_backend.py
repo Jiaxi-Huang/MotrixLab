@@ -224,7 +224,6 @@ class _FakeDirectEnv(DirectEnv[_FakeDirectCfg]):
         self._reset_program.buffer("state_velocity")[env_ids] = dof_vel
         self._reset_program.execute(env_ids)
         self.sim_data.execute(env_ids)
-        return {}
 
 
 def _make_env(num_envs: int = 3) -> _FakeDirectEnv:

@@ -81,7 +81,7 @@ This makes the relative body-configuration reward independent of the current hor
 | `undesired_contacts`                         | Count robot links whose net contact force exceeds the threshold and are absent from `allowed_contact_links` | Suppress body contacts not required by the motion    |
 
 Each raw term is multiplied by its `WbtRewardScales` weight and then by `ctrl_dt`. Negative weights turn `action_rate_l2`,
-`limits_dof_pos`, and `undesired_contacts` into penalties. Final weighted terms are written to `info["Reward"]`.
+`limits_dof_pos`, and `undesired_contacts` into penalties. Final weighted terms are written to `state.reward_terms`.
 
 ## Termination conditions
 
@@ -96,7 +96,7 @@ Each raw term is multiplied by its `WbtRewardScales` weight and then by `ctrl_dt
 | Motion final frame          | Neither      | `motion_steps` reaches the clip end                                                                                    | Resample and reset motion state during training; restart at frame 0 during play |
 
 `undesired_contacts` contributes only a reward penalty and does not terminate the episode. Termination rates and error means
-are written to `info["metrics"]`.
+are written to `state.metrics`.
 
 ## Reset logic
 

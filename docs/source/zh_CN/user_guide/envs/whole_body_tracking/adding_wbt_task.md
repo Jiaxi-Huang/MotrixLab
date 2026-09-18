@@ -136,7 +136,7 @@ python scripts/train.py task=g1-wbt-dance1-subject1/motrix.fastsac \
 ```
 
 检查 motion/joint/body 名称没有缺失，reset 后没有系统性 NaN、joint limit 违规或立即 bad-tracking，并确认
-`info["Reward"]` 与 `info["metrics"]` 能进入日志。随后使用默认规模训练：
+`state.reward_terms` 与 `state.metrics` 能进入日志。随后使用默认规模训练：
 
 ```bash
 python scripts/train.py task=g1-wbt-dance1-subject1/motrix.fastsac algo.asynchronous=true

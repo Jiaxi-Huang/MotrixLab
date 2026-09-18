@@ -27,7 +27,7 @@ def test_go2_training_and_deployment_task_golden_probe(env_name: str) -> None:
     context = PolicyContext(
         step=0,
         elapsed_time_s=0.0,
-        command=PlanarVelocityCommand(env_state.info["commands"]),
+        command=PlanarVelocityCommand(env._commands),
     )
     task = create_task(profile.task, profile.robot)
     command_scale = np.asarray(profile.task.config["command_scale"], dtype=np.float32)
@@ -53,7 +53,7 @@ def test_go2_training_and_deployment_task_golden_probe(env_name: str) -> None:
     next_context = PolicyContext(
         step=1,
         elapsed_time_s=profile.control.period_s,
-        command=PlanarVelocityCommand(stepped.info["commands"]),
+        command=PlanarVelocityCommand(env._commands),
     )
     np.testing.assert_allclose(
         task.build_observation(next_state, next_context),

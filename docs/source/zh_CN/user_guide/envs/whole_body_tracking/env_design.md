@@ -77,7 +77,7 @@ Actor 的参考身体姿态、基座角速度、关节位置和关节速度会�
 | `undesired_contacts`                         | 统计净接触力超过阈值且不在 `allowed_contact_links` 中的机器人 links | 抑制动作不需要的身体接触         |
 
 每个原始项先乘以 `WbtRewardScales` 中的权重，再乘以 `ctrl_dt`；`action_rate_l2`、`limits_dof_pos` 和
-`undesired_contacts` 通过负权重成为惩罚。最终加权项写入 `info["Reward"]`。
+`undesired_contacts` 通过负权重成为惩罚。最终加权项写入 `state.reward_terms`。
 
 ## 终止条件
 
@@ -91,7 +91,7 @@ Actor 的参考身体姿态、基座角速度、关节位置和关节速度会�
 | 时间上限         | `truncated`  | 训练回合达到 `max_episode_seconds`，内置配置为 10 s                                | 正常达到训练时限，不表示 bad tracking                      |
 | Motion 末帧      | 两者都不是   | `motion_steps` 到达 clip 末尾                                                      | 训练时重采样起始帧并重置 motion 状态；play 时从第 0 帧重播 |
 
-`undesired_contacts` 只产生奖励惩罚，不直接终止回合。各类终止比例与误差均值记录在 `info["metrics"]`。
+`undesired_contacts` 只产生奖励惩罚，不直接终止回合。各类终止比例与误差均值记录在 `state.metrics`。
 
 ## 重置逻辑
 

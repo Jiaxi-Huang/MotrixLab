@@ -138,7 +138,7 @@ class Walker2DEnv(DirectEnv):
 
         rwd = rwd_stand
 
-        state.info["Reward"] = {
+        reward_terms = {
             "height": rwd_height,
             "upright": rwd_upright,
             "stand": rwd_stand,
@@ -152,9 +152,10 @@ class Walker2DEnv(DirectEnv):
                 value_at_margin=0.5,
                 sigmoid="linear",
             )
-            state.info["Reward"]["move"] = rwd_move
+            reward_terms["move"] = rwd_move
             rwd = rwd_stand * (5 * rwd_move + 1) / 6
 
+        state.reward_terms = reward_terms
         rwd[terminated] = 0.0
 
         return state.replace(
@@ -162,7 +163,7 @@ class Walker2DEnv(DirectEnv):
             terminated=terminated,
         )
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num_reset = len(env_ids)
 
         dof_pos = np.zeros((num_reset, self._reset_position.shape[1]))
@@ -178,12 +179,3 @@ class Walker2DEnv(DirectEnv):
         self._reset_velocity[env_ids] = dof_vel
         self._reset_program.execute(env_ids)
         self.sim_data.execute(np.asarray(env_ids, np.int64))
-        rewards = {
-            "height": np.zeros((num_reset,)),
-            "upright": np.zeros((num_reset,)),
-            "stand": np.zeros((num_reset,)),
-        }
-        if self._move_speed > 0.0:
-            rewards["move"] = np.zeros((num_reset,))
-
-        return {"Reward": rewards}

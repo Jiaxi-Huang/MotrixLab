@@ -219,7 +219,7 @@ class Humanoid3DEnv(DirectEnv):
         torso_upright = self._get_torso_upright(slice(None))
         rwd, reward_components = self._compute_reward(head_height, torso_upright, pelvis_height)
         rwd, reward_components = self._apply_termination_mask(terminated, rwd, reward_components)
-        state.info["Reward"] = reward_components
+        state.reward_terms = reward_components
         return state.replace(reward=rwd)
 
     def _apply_termination_mask(
@@ -233,9 +233,8 @@ class Humanoid3DEnv(DirectEnv):
             reward_components[k] = np.where(terminated, 0.0, v).astype(np.float32)
         return rwd, reward_components
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         self._randomize_joints(env_ids)
-        return {}
 
     def _get_head_height(self, rows) -> np.ndarray:
         return self.sim_data["head_pos"][rows][:, 2]

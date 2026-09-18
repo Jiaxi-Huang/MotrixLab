@@ -109,7 +109,7 @@ class CheetahEnv(DirectEnv):
             terminated=terminated,
         )
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num = len(env_ids)
 
         qpos = np.zeros((num, self._reset_position.shape[1]), dtype=np.float32)
@@ -120,5 +120,3 @@ class CheetahEnv(DirectEnv):
 
         row_ids = np.asarray(env_ids, np.int64)
         self.sim_data.execute(row_ids)
-
-        return {}

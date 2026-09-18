@@ -156,6 +156,7 @@ class HopperEnv(DirectEnv):
             contact_reward = np.clip(contact_strength, 0.0, 1.0) * 0.1 * standing
 
             rwd = standing * 0.8 + effective_hop_reward * 0.8 + leg_bonus * 0.5 + extend_reward + contact_reward
+            state.reward_terms = {"stand": standing, "hop": effective_hop_reward, "total": rwd}
             if np.average(rwd) > 1000:
                 print(
                     "standing",
@@ -182,7 +183,7 @@ class HopperEnv(DirectEnv):
             small_control = (small_control + 4) / 5
 
             rwd = standing * small_control
-            state.info["Reward"] = {"stand": standing, "control": small_control, "total": rwd}
+            state.reward_terms = {"stand": standing, "control": small_control, "total": rwd}
 
         rwd[terminated] = 0.0
 
@@ -191,7 +192,7 @@ class HopperEnv(DirectEnv):
             terminated=terminated,
         )
 
-    def reset(self, env_ids: np.ndarray):
+    def reset(self, env_ids: np.ndarray) -> None:
         num_reset = len(env_ids)
 
         dof_pos = np.zeros((num_reset, self._reset_position.shape[1]))
@@ -211,9 +212,3 @@ class HopperEnv(DirectEnv):
         self._reset_velocity[env_ids] = dof_vel
         self._reset_program.execute(env_ids)
         self.sim_data.execute(np.asarray(env_ids, np.int64))
-
-        rewards = {"stand": np.zeros((num_reset,))}
-        if self._hop_speed > 0.0:
-            rewards["hop"] = np.zeros((num_reset,))
-
-        return {"Reward": rewards}

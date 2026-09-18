@@ -29,7 +29,7 @@ class SkrlNpWrapper(SkrlWrapper):
 
     def reset(self) -> tuple[jax.Array, Any]:
         state = self._env.init_state()
-        return jnp.asarray(state.obs.policy, dtype=jnp.float32), state.info
+        return jnp.asarray(state.obs.policy, dtype=jnp.float32), env_infos(state)
 
     def step(
         self, actions: jax.Array

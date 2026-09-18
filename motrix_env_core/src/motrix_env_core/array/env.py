@@ -40,7 +40,10 @@ class ArrayEnvState:
     terminated: np.ndarray
     truncated: np.ndarray
     episode_steps: np.ndarray
-    info: dict
+    # Per-term reward breakdown for the latest transition: term name to a
+    # ``(num_envs,)`` array. Freshly written every transition; empty when the
+    # environment does not decompose its reward.
+    reward_terms: dict[str, np.ndarray] = dataclasses.field(default_factory=dict)
     # Live diagnostics view: per-environment quantities stay unreduced as
     # ``(num_envs,)`` arrays and are views into manager buffers that kernels
     # overwrite every step; batch-level gauges are scalars. Values always
@@ -150,8 +153,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         terminated = np.ones((self._num_envs,), dtype=bool)
         truncated = np.zeros((self._num_envs,), dtype=bool)
         episode_steps = np.zeros((self._num_envs,), dtype=np.uint64)
-        info = {"time_outs": np.zeros((self._num_envs,), dtype=bool)}
-        self._state = self._new_state(obs, reward, terminated, truncated, episode_steps, info)
+        self._state = self._new_state(obs, reward, terminated, truncated, episode_steps)
         self._reset_done_envs()
         with self.perf.scope("observation"):
             self._state = self.compute_observation(self._state)
@@ -166,7 +168,6 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         terminated: np.ndarray,
         truncated: np.ndarray,
         episode_steps: np.ndarray,
-        info: dict,
     ) -> ArrayEnvState:
         """Assemble the environment state; subclasses add simulator-owned fields."""
         return ArrayEnvState(
@@ -175,7 +176,6 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
             terminated=terminated,
             truncated=truncated,
             episode_steps=episode_steps,
-            info=info,
         )
 
     @property
@@ -223,31 +223,11 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
             np.putmask(state.episode_steps, done, 0)
             env_ids = np.flatnonzero(done)
         with self.perf.scope("reset_envs"):
-            info1 = self.reset(env_ids)
-        self._merge_reset_info(state, info1, done)
-
-    def _merge_reset_info(self, state: ArrayEnvState, info1: dict, done: np.ndarray) -> None:
-        """Merge one selected-row reset's info entries into the state info."""
-        if not info1:
-            return
-
-        def replace_dict_values(dst, new_values, mask):
-            for key, value in new_values.items():
-                if key not in dst:
-                    dst[key] = value
-                else:
-                    if isinstance(value, np.ndarray):
-                        dst[key][mask] = value
-                    elif isinstance(value, dict):
-                        assert isinstance(dst[key], dict)
-                        replace_dict_values(dst[key], value, mask)
-
-        with self.perf.scope("merge_info"):
-            replace_dict_values(state.info, info1, done)
+            self.reset(env_ids)
 
     @abc.abstractmethod
-    def reset(self, env_ids: np.ndarray) -> dict:
-        """Write reset rows for the selected environments and return reset info.
+    def reset(self, env_ids: np.ndarray) -> None:
+        """Write reset rows for the selected environments.
 
         Subclasses address their simulator's rows themselves. Observation
         generation is deferred until :meth:`compute_observation`, after reset
@@ -265,7 +245,6 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         if not max_episode_steps:
             return
         self._state.truncated = self._state.episode_steps >= max_episode_steps
-        self._state.info["time_outs"] = self._state.truncated & ~self._state.terminated
 
     @abc.abstractmethod
     def create_renderer(self, config: RenderConfig) -> SimRenderer:

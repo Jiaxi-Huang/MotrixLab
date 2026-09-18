@@ -22,9 +22,11 @@ class AdaptiveTimestepsSampler:
     histogram (with an exponential spatial kernel and a uniform floor), then
     draws start-frame indices.
 
-    Typical per-step usage::
+    Typical per-step usage (``motion_steps`` tracks each env's current
+    frame index into the clip; ``terminated`` marks failed episodes)::
 
-        sampler.record_failures(state.info["motion_steps"][state.terminated])
+        failed = motion_steps[env_ids][terminated[env_ids]]
+        sampler.record_failures(failed)
         sampler.update()
         start_steps = sampler.sample(num_resets)
     """
@@ -88,7 +90,7 @@ class AdaptiveTimestepsSampler:
         Args:
             failed_steps: 1D array of motion-step indices where episodes
                 terminated this step (typically
-                ``state.info["motion_steps"][state.terminated]``).
+                ``motion_steps[env_ids][terminated[env_ids]]``).
         """
         if failed_steps.size == 0:
             return

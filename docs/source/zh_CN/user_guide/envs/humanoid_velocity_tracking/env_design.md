@@ -66,7 +66,7 @@ $$
 
 每个原始项先乘以 `RewardScales` 中的权重，再乘以控制步长；`penalty_*` 和 `pose` 等约束项通过负权重成为惩罚。
 课程指定的惩罚项还会根据已结束回合的平均长度乘以当前 `penalty_scale`。该缩放记录在
-`info["metrics"]["penalty_scale"]`，最终的各加权项记录在 `info["Reward"]`。
+`state.metrics["penalty_scale"]`，最终的各加权项记录在 `state.reward_terms`。
 
 ## 终止条件
 

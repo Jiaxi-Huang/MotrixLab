@@ -128,7 +128,7 @@ reward_config = RewardConfig(
 
 `base_height_target` and `initial_base_position[2]` should normally be close to the robot's default standing height.
 Choose `target_foot_height` according to leg length and terrain variation: too little encourages dragging, while too much
-can require unreasonable joint motion. When tuning a reward weight, inspect the matching value in `info["Reward"]`
+can require unreasonable joint motion. When tuning a reward weight, inspect the matching value in `state.reward_terms`
 rather than comparing configuration numbers alone.
 
 ## 7. `sensor`: sensor-name mapping

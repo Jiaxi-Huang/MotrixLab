@@ -66,6 +66,15 @@ class BounceBallEnv(DirectEnv):
         # Action space: 6D joint position control
         self._action_space = gym.spaces.Box(-1.0, 1.0, (6,), dtype=np.float32)
 
+        # Episode-scoped task state: full-batch buffers, reset writes the
+        # done rows in place.
+        num_envs = self._num_envs
+        self._ball_was_upward = np.zeros(num_envs, dtype=bool)
+        self._consecutive_bounces = np.zeros(num_envs, dtype=np.int32)
+        self._target_heights = np.zeros(num_envs, dtype=np.float32)
+        self._current_actions = np.zeros((num_envs, 6), dtype=np.float32)
+        self._last_actions = np.zeros((num_envs, 6), dtype=np.float32)
+
         # Observation space: joint states + paddle position + target height (29D)
         self._observation_space = gym.spaces.Box(-np.inf, np.inf, (29,), dtype=np.float32)
 
@@ -126,11 +135,11 @@ class BounceBallEnv(DirectEnv):
         dof_pos: np.ndarray,
         dof_vel: np.ndarray,
         paddle_pos: np.ndarray,
-        consecutive_bounces: np.ndarray = None,
-        bounce_detected: np.ndarray = None,
-        target_heights: np.ndarray = None,
-        current_actions: np.ndarray = None,
-        last_actions: np.ndarray = None,
+        consecutive_bounces: np.ndarray,
+        bounce_detected: np.ndarray,
+        target_heights: np.ndarray,
+        current_actions: np.ndarray,
+        last_actions: np.ndarray,
     ) -> tuple:
         """
         Compute reward based on ball position, velocity, and paddle alignment.
@@ -307,9 +316,6 @@ class BounceBallEnv(DirectEnv):
         # Encourages paddle to actively move directly below ball
         # Extra reward at bounce moment to reinforce correct hitting behavior
         # ============================================================================
-        if bounce_detected is None:
-            bounce_detected = np.zeros(ball_x.shape[0], dtype=bool)
-
         ball_xy = np.stack([ball_x, ball_y], axis=1)
         paddle_ball_xy_error = np.linalg.norm(ball_xy - paddle_xy, axis=1)
 
@@ -349,12 +355,6 @@ class BounceBallEnv(DirectEnv):
         # Penalizes drastic action changes and excessive joint velocities
         # Encourages smooth and energy-efficient control
         # ============================================================================
-        num_envs = dof_pos.shape[0]
-        if current_actions is None:
-            current_actions = np.zeros((num_envs, 6), dtype=np.float32)
-        if last_actions is None:
-            last_actions = np.zeros((num_envs, 6), dtype=np.float32)
-
         action_diff = current_actions - last_actions
         action_penalty = np.sum(np.square(action_diff), axis=-1)
 
@@ -457,9 +457,9 @@ class BounceBallEnv(DirectEnv):
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState) -> ArrayEnvState:
         """Apply action to control paddle position"""
-        # Store last actions for penalty calculation
-        state.info["last_actions"] = state.info.get("current_actions", np.zeros_like(actions))
-        state.info["current_actions"] = actions
+        # Save last actions for penalty calculation
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = actions
 
         # Get current joint positions
         current_joint_pos = self.sim_data["dof_pos"][:, :6]  # First 6 DOFs are arm joints
@@ -478,13 +478,10 @@ class BounceBallEnv(DirectEnv):
 
     def compute_observation(self, state: ArrayEnvState) -> ArrayEnvState:
         inputs = self.sim_data
-        target_heights = state.info.get("target_heights")
-        if target_heights is None:
-            target_heights = np.full(self._num_envs, np.mean(self._cfg.target_height_range), dtype=np.float32)
         # Observation: joint states + paddle position + target height (29D)
         # Concatenate: DOF pos (13) + DOF vel (12) + paddle xyz (3) + target height (1)
         obs = np.concatenate(
-            [inputs["dof_pos"], inputs["dof_vel"], inputs["paddle_pos"], target_heights[:, np.newaxis]], axis=-1
+            [inputs["dof_pos"], inputs["dof_vel"], inputs["paddle_pos"], self._target_heights[:, np.newaxis]], axis=-1
         )
         return state.replace(obs=obs.astype(np.float32))
 
@@ -492,14 +489,11 @@ class BounceBallEnv(DirectEnv):
         """Update state with rewards and termination flags"""
         self.sim_data.execute()
         inputs = self.sim_data
-        num_envs = self._num_envs
 
-        # Get bounce tracking and target heights from info
-        consecutive_bounces = state.info.get("consecutive_bounces", np.zeros(num_envs, dtype=np.int32))
-        ball_was_upward = state.info.get("ball_was_upward", np.zeros(num_envs, dtype=bool))
-        # Use mean of target_height_range as fallback
-        default_height = np.mean(self._cfg.target_height_range)
-        target_heights = state.info.get("target_heights", np.full(num_envs, default_height, dtype=np.float32))
+        # Episode-scoped bounce tracking and target heights live in env buffers.
+        consecutive_bounces = self._consecutive_bounces
+        ball_was_upward = self._ball_was_upward
+        target_heights = self._target_heights
 
         # Detect bounces and update consecutive bounce count.
         # The ball's free joint contributes (x, y, z) at dof 6:9.
@@ -518,18 +512,9 @@ class BounceBallEnv(DirectEnv):
 
         # Reset count if ball is falling too much (not bouncing properly)
         falling = (current_ball_vz < -0.5) & (current_ball_z < 0.4)
-        consecutive_bounces = np.where(falling, 0, consecutive_bounces)
-
-        # Update tracking variables in info
-        state.info["consecutive_bounces"] = consecutive_bounces
-        state.info["ball_was_upward"] = moving_upward
-
-        # Track maximum bounces achieved
-        max_current = np.max(consecutive_bounces)
-        if "max_consecutive_bounces" not in state.info:
-            state.info["max_consecutive_bounces"] = 0
-        if max_current > state.info["max_consecutive_bounces"]:
-            state.info["max_consecutive_bounces"] = max_current
+        consecutive_bounces[falling] = 0
+        self._consecutive_bounces = consecutive_bounces
+        self._ball_was_upward = moving_upward
 
         # Compute reward and termination from simulator quantities
         reward, reward_details = self._compute_reward(
@@ -539,8 +524,8 @@ class BounceBallEnv(DirectEnv):
             consecutive_bounces,
             bounce_detected=bounce_detected,
             target_heights=target_heights,
-            current_actions=state.info.get("current_actions"),
-            last_actions=state.info.get("last_actions"),
+            current_actions=self._current_actions,
+            last_actions=self._last_actions,
         )
         terminated = self._compute_terminated(inputs["dof_pos"], inputs["dof_vel"], target_heights=target_heights)
 
@@ -549,12 +534,11 @@ class BounceBallEnv(DirectEnv):
 
         # Store reward details for debugging
         if self._cfg.store_reward_details:
-            state.info["Reward"] = reward_details
-        state.info["target_heights"] = target_heights  # Ensure target_heights persists across steps
+            state.reward_terms = reward_details
 
         return state
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         """Reset environment to initial state with randomized target heights"""
         cfg: BounceBallEnvCfg = self._cfg
         num_reset = len(env_ids)
@@ -612,14 +596,9 @@ class BounceBallEnv(DirectEnv):
         # compute_observation (which never executes) sees post-reset state.
         self.sim_data.execute(np.asarray(env_ids, dtype=np.int64))
 
-        # Initialize info dict with bounce tracking variables
-        info = {
-            "consecutive_bounces": np.zeros(num_reset, dtype=np.int32),
-            "ball_was_upward": np.zeros(num_reset, dtype=bool),
-            "max_consecutive_bounces": 0,
-            "target_heights": new_target_heights.copy(),  # Return target heights for this reset batch
-            "current_actions": np.zeros((num_reset, 6), dtype=np.float32),
-            "last_actions": np.zeros((num_reset, 6), dtype=np.float32),
-        }
-
-        return info
+        # Write episode-scoped state for the reset rows
+        self._consecutive_bounces[env_ids] = 0
+        self._ball_was_upward[env_ids] = False
+        self._target_heights[env_ids] = new_target_heights
+        self._current_actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0

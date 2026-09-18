@@ -23,7 +23,6 @@ def test_torch_environment_state_matches_numpy_state_contract() -> None:
         terminated=torch.tensor([False, True]),
         truncated=torch.tensor([True, False]),
         episode_steps=torch.zeros(2, dtype=torch.int64),
-        info={},
     )
 
     state.validate()
@@ -65,8 +64,8 @@ class _LifecycleTorchEnv(TorchEnv[EnvCfg]):
             terminated=self._actions[:, 0] > 0.5,
         )
 
-    def reset(self, data) -> tuple[torch.Tensor, dict]:
-        return torch.full((*data.shape, 1), -1.0, dtype=torch.float64, device=self.device), {}
+    def reset(self, data) -> torch.Tensor:
+        return torch.full((*data.shape, 1), -1.0, dtype=torch.float64, device=self.device)
 
 
 def test_torch_environment_rejects_gpu_until_gpu_simulation_is_available() -> None:
@@ -87,13 +86,12 @@ def test_np_simulation_places_torch_environment_lifecycle_on_cpu() -> None:
     assert device == torch.device("cpu")
     assert initial.obs.policy.dtype == torch.float64
     assert initial.obs.policy.device == device
-    assert "steps" not in initial.info
+    assert initial.reward_terms == {}
 
     terminated = env.step(torch.tensor([[1.0], [0.25]], dtype=torch.float32, device=device))
     torch.testing.assert_close(terminated.reward, torch.tensor([1.0, 0.25], device=device))
     torch.testing.assert_close(terminated.terminated, torch.tensor([True, False], device=device))
     torch.testing.assert_close(terminated.truncated, torch.tensor([False, False], device=device))
-    torch.testing.assert_close(terminated.info["time_outs"], torch.tensor([False, False], device=device))
     torch.testing.assert_close(terminated.episode_steps, torch.tensor([0, 1], device=device))
     torch.testing.assert_close(
         terminated.obs.policy[:, 0],
@@ -103,7 +101,6 @@ def test_np_simulation_places_torch_environment_lifecycle_on_cpu() -> None:
     truncated = env.step(torch.tensor([[0.2], [0.2]], dtype=torch.float32, device=device))
     torch.testing.assert_close(truncated.terminated, torch.tensor([False, False], device=device))
     torch.testing.assert_close(truncated.truncated, torch.tensor([False, True], device=device))
-    torch.testing.assert_close(truncated.info["time_outs"], torch.tensor([False, True], device=device))
     torch.testing.assert_close(truncated.episode_steps, torch.tensor([1, 0], device=device))
     torch.testing.assert_close(
         truncated.obs.policy[:, 0],

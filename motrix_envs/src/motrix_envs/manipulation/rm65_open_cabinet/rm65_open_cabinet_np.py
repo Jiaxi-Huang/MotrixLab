@@ -98,12 +98,12 @@ class RM65OpenCabinetEnv(DirectEnv):
         np.set_printoptions(precision=2)
 
     def _init_obs_buffers(self) -> None:
-        """Allocate env-owned observation caches.
+        """Allocate env-owned episode and observation state buffers.
 
-        These back :meth:`compute_observation` (finite-difference velocities and
-        observation-noise state). They live on the environment, never in
-        ``state.info``, so computing observations never mutates info; reset only
-        overwrites the rows being reset.
+        The episode-scoped task state (action pipeline, gripper logic, grasp
+        tracking, arm randomization) and the observation caches (finite-difference
+        velocities, observation-noise state) live on the environment, never in
+        per-step state; reset only overwrites the rows being reset.
         """
         num_envs = self.num_envs
         # None until the first observation: the first finite-difference
@@ -117,6 +117,43 @@ class RM65OpenCabinetEnv(DirectEnv):
         self._obs_handle_pose_buffer = (
             np.zeros((num_envs, latency_steps + 1, handle_dim), dtype=np.float32) if latency_steps > 0 else None
         )
+
+        # Action pipeline state
+        action_dim = self._action_dim
+        self._current_actions = np.zeros((num_envs, action_dim), dtype=np.float32)
+        self._last_actions = np.zeros((num_envs, action_dim), dtype=np.float32)
+        buffer_len = max(int(self._arm_action_delay_buffer_len), 1)
+        self._action_delay_buffer = np.zeros((num_envs, buffer_len, action_dim), dtype=np.float32)
+        if self._action_history_len > 0:
+            self._action_history = np.zeros((num_envs, self._action_history_len, action_dim), dtype=np.float32)
+
+        # Per-episode arm randomization
+        self._arm_action_delay_steps_per_env = np.zeros(num_envs, dtype=np.int32)
+        self._arm_actuator_lag_alpha_per_env = np.zeros(num_envs, dtype=np.float32)
+        self._arm_max_step_per_env = np.zeros(num_envs, dtype=np.float32)
+        self._arm_max_acc_step_per_env = np.zeros(num_envs, dtype=np.float32)
+
+        # Arm action filtering state
+        arm_dim = self._arm_action_dim
+        self._arm_target_smooth = np.zeros((num_envs, arm_dim), dtype=np.float32)
+        self._arm_prev_delta = np.zeros((num_envs, arm_dim), dtype=np.float32)
+        self._arm_actuator_target = np.zeros((num_envs, arm_dim), dtype=np.float32)
+
+        # Gripper logic state
+        self._gripper_target_smooth = np.zeros(num_envs, dtype=np.float32)
+        self._gripper_binary_closed = np.zeros(num_envs, dtype=bool)
+        self._gripper_closed_cmd = np.zeros(num_envs, dtype=bool)
+        self._prev_gripper_closed_cmd = np.zeros(num_envs, dtype=bool)
+        self._gripper_steps_since_switch = np.zeros(num_envs, dtype=np.int32)
+        self._gripper_close_ratio = np.zeros(num_envs, dtype=np.float32)
+        self._current_gripper_action = np.zeros(num_envs, dtype=np.float32)
+
+        # Grasp / opening task state
+        self._grasp_hold_steps = np.zeros(num_envs, dtype=np.int32)
+        self._grasped = np.zeros(num_envs, dtype=bool)
+        self._phase2_mask = np.zeros(num_envs, dtype=bool)
+        self._prev_open_dist = np.zeros(num_envs, dtype=np.float32)
+        self._open_bonus_progress = np.zeros(num_envs, dtype=np.int32)
 
     def _init_action_spaces(self) -> None:
         self._action_dim = len(self._cfg.action_scale) + 1
@@ -296,53 +333,26 @@ class RM65OpenCabinetEnv(DirectEnv):
             max_acc_step = np.full((num_envs,), float(self._arm_max_acc_step), dtype=np.float32)
         return delay_steps, lag_alpha, max_step, max_acc_step
 
-    def _apply_action_delay(self, actions: np.ndarray, episode_steps: np.ndarray, info: dict) -> np.ndarray:
+    def _apply_action_delay(self, actions: np.ndarray) -> np.ndarray:
         num_envs = actions.shape[0]
-        delay_steps = info.get("arm_action_delay_steps")
-        if not isinstance(delay_steps, np.ndarray) or delay_steps.shape != (num_envs,):
-            delay_steps = np.full((num_envs,), int(self._arm_action_delay_steps), dtype=np.int32)
-        else:
-            delay_steps = delay_steps.astype(np.int32, copy=False)
-        delay_steps = np.maximum(delay_steps, 0)
-        buffer_len = max(int(self._arm_action_delay_buffer_len), 1)
-        delay_steps = np.minimum(delay_steps, buffer_len - 1)
+        buffer_len = self._action_delay_buffer.shape[1]
+        delay_steps = np.clip(self._arm_action_delay_steps_per_env, 0, buffer_len - 1)
 
-        buffer = info.get("action_delay_buffer")
-        expected_shape = (num_envs, buffer_len, actions.shape[1])
-        if buffer is None or buffer.shape != expected_shape:
-            buffer = np.repeat(actions[:, None, :], buffer_len, axis=1)
-        else:
-            buffer = np.roll(buffer, 1, axis=1)
-            buffer[:, 0, :] = actions
-            reset_mask = episode_steps == 0
-            if np.any(reset_mask):
-                buffer[reset_mask] = np.repeat(actions[reset_mask][:, None, :], buffer_len, axis=1)
-        info["action_delay_buffer"] = buffer
+        buffer = self._action_delay_buffer
+        buffer = np.roll(buffer, 1, axis=1)
+        buffer[:, 0, :] = actions
+        self._action_delay_buffer = buffer
         return buffer[np.arange(num_envs), delay_steps, :]
 
-    def _update_action_history(
-        self,
-        raw_actions: np.ndarray,
-        delayed_actions: np.ndarray,
-        episode_steps: np.ndarray,
-        info: dict,
-    ) -> None:
+    def _update_action_history(self, raw_actions: np.ndarray) -> None:
         if self._action_history_len <= 0:
             return
 
-        hist = info.get("action_history")
-        expected_shape = (delayed_actions.shape[0], self._action_history_len, delayed_actions.shape[1])
-        if hist is None or hist.shape != expected_shape:
-            hist = np.repeat(raw_actions[:, None, :], self._action_history_len, axis=1)
-        else:
-            hist = np.roll(hist, 1, axis=1)
-            hist[:, 0, :] = raw_actions
-            reset_mask = episode_steps == 0
-            if np.any(reset_mask):
-                hist[reset_mask] = np.repeat(raw_actions[reset_mask][:, None, :], self._action_history_len, axis=1)
-        info["action_history"] = hist
+        hist = np.roll(self._action_history, 1, axis=1)
+        hist[:, 0, :] = raw_actions
+        self._action_history = hist
 
-    def _apply_arm_action(self, arm_action: np.ndarray, old_joint_pos: np.ndarray, info: dict) -> np.ndarray:
+    def _apply_arm_action(self, arm_action: np.ndarray, old_joint_pos: np.ndarray) -> np.ndarray:
         arm_min_limit = self.robot_joint_pos_min_limit[: self._arm_action_dim]
         arm_max_limit = self.robot_joint_pos_max_limit[: self._arm_action_dim]
         smoothing_active = self._arm_action_mode == "joint_target" and self._arm_target_smoothing_alpha > 0.0
@@ -361,9 +371,7 @@ class RM65OpenCabinetEnv(DirectEnv):
                 target_joint_pos = arm_action
             target_joint_pos = np.clip(target_joint_pos, arm_min_limit, arm_max_limit)
             if smoothing_active:
-                prev_target = info.get("arm_target_smooth", old_joint_pos)
-                if not isinstance(prev_target, np.ndarray) or prev_target.shape != target_joint_pos.shape:
-                    prev_target = old_joint_pos
+                prev_target = self._arm_target_smooth
                 target_joint_pos = (
                     1.0 - self._arm_target_smoothing_alpha
                 ) * prev_target + self._arm_target_smoothing_alpha * target_joint_pos
@@ -372,83 +380,47 @@ class RM65OpenCabinetEnv(DirectEnv):
 
         action_delta = target_joint_pos - old_joint_pos
         if self._arm_use_speed_limit:
-            max_step = info.get("arm_max_step")
-            if isinstance(max_step, np.ndarray) and max_step.shape == (action_delta.shape[0],):
-                max_step_vec = np.maximum(max_step.astype(np.float32, copy=False), 0.0)
-                action_delta = np.clip(action_delta, -max_step_vec[:, None], max_step_vec[:, None])
-            else:
-                action_delta = np.clip(action_delta, -self._arm_max_step, self._arm_max_step)
+            max_step_vec = np.maximum(self._arm_max_step_per_env, 0.0)
+            action_delta = np.clip(action_delta, -max_step_vec[:, None], max_step_vec[:, None])
 
         if self._arm_use_acc_limit:
-            prev_delta = info.get("arm_prev_delta", np.zeros_like(action_delta))
-            if not isinstance(prev_delta, np.ndarray) or prev_delta.shape != action_delta.shape:
-                prev_delta = np.zeros_like(action_delta)
-            max_delta_change = info.get("arm_max_acc_step")
-            if isinstance(max_delta_change, np.ndarray) and max_delta_change.shape == (action_delta.shape[0],):
-                max_delta_change_vec = np.maximum(max_delta_change.astype(np.float32, copy=False), 0.0)
-                delta_change = np.clip(
-                    action_delta - prev_delta,
-                    -max_delta_change_vec[:, None],
-                    max_delta_change_vec[:, None],
-                )
-                action_delta = prev_delta + delta_change
-            else:
-                max_delta_change_scalar = float(self._arm_max_acc_step)
-                if max_delta_change_scalar > 0.0:
-                    delta_change = np.clip(
-                        action_delta - prev_delta,
-                        -max_delta_change_scalar,
-                        max_delta_change_scalar,
-                    )
-                    action_delta = prev_delta + delta_change
-                else:
-                    action_delta = prev_delta
+            prev_delta = self._arm_prev_delta
+            max_delta_change_vec = np.maximum(self._arm_max_acc_step_per_env, 0.0)
+            delta_change = np.clip(
+                action_delta - prev_delta,
+                -max_delta_change_vec[:, None],
+                max_delta_change_vec[:, None],
+            )
+            action_delta = prev_delta + delta_change
 
-        info["arm_prev_delta"] = action_delta
+        self._arm_prev_delta[:] = action_delta
         target_joint_pos = old_joint_pos + action_delta
         if smoothing_active:
-            info["arm_target_smooth"] = target_joint_pos
+            self._arm_target_smooth[:] = target_joint_pos
 
-        lag_alpha = info.get("arm_actuator_lag_alpha", self._arm_actuator_lag_alpha)
-        if isinstance(lag_alpha, np.ndarray) and lag_alpha.shape == (target_joint_pos.shape[0],):
-            lag_alpha_vec = np.clip(lag_alpha.astype(np.float32, copy=False), 0.0, 1.0)
-        else:
-            lag_alpha_vec = np.full((target_joint_pos.shape[0],), float(self._arm_actuator_lag_alpha), dtype=np.float32)
+        lag_alpha_vec = np.clip(self._arm_actuator_lag_alpha_per_env, 0.0, 1.0)
         if np.any(lag_alpha_vec > 0.0):
-            prev_cmd = info.get("arm_actuator_target", old_joint_pos)
-            if not isinstance(prev_cmd, np.ndarray) or prev_cmd.shape != target_joint_pos.shape:
-                prev_cmd = old_joint_pos
+            prev_cmd = self._arm_actuator_target
             target_joint_pos = (1.0 - lag_alpha_vec[:, None]) * prev_cmd + (lag_alpha_vec[:, None] * target_joint_pos)
 
         target_joint_pos = target_joint_pos.astype(np.float32, copy=False)
-        info["arm_actuator_target"] = target_joint_pos
+        self._arm_actuator_target[:] = target_joint_pos
         return target_joint_pos
 
-    def _apply_gripper_action(self, gripper_action: np.ndarray, info: dict) -> np.ndarray:
+    def _apply_gripper_action(self, gripper_action: np.ndarray) -> np.ndarray:
         close_ratio = raw_action_to_close_ratio(gripper_action, use_sigmoid=self._gripper_use_sigmoid)
         gripper_closed_cmd = None
         if self._gripper_action_mode == "binary":
-            prev_closed = info.get("gripper_binary_closed")
-            if not isinstance(prev_closed, np.ndarray) or prev_closed.shape != close_ratio.shape:
-                prev_closed = close_ratio > self._gripper_close_on_threshold
-            steps_since_switch = info.get("gripper_steps_since_switch")
-            if not isinstance(steps_since_switch, np.ndarray) or steps_since_switch.shape != close_ratio.shape:
-                steps_since_switch = np.full(
-                    close_ratio.shape,
-                    self._gripper_min_switch_interval_steps,
-                    dtype=np.int32,
-                )
             gripper_closed_cmd, switched = binary_hysteresis_step(
                 close_ratio=close_ratio,
-                prev_closed=prev_closed,
-                steps_since_switch=steps_since_switch,
+                prev_closed=self._gripper_binary_closed,
+                steps_since_switch=self._gripper_steps_since_switch,
                 close_on_threshold=self._gripper_close_on_threshold,
                 open_off_threshold=self._gripper_open_off_threshold,
                 min_switch_interval_steps=self._gripper_min_switch_interval_steps,
             )
-            steps_since_switch = np.where(switched, 0, steps_since_switch + 1).astype(np.int32)
-            info["gripper_binary_closed"] = gripper_closed_cmd
-            info["gripper_steps_since_switch"] = steps_since_switch
+            self._gripper_binary_closed[:] = gripper_closed_cmd
+            self._gripper_steps_since_switch[:] = np.where(switched, 0, self._gripper_steps_since_switch + 1)
             gripper_pos = np.where(gripper_closed_cmd, self.gripper_closed_pos, self.gripper_open_pos)
         elif self._gripper_action_mode == "continuous":
             gripper_pos = self.gripper_open_pos + (self.gripper_closed_pos - self.gripper_open_pos) * close_ratio
@@ -456,9 +428,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         else:
             raise ValueError(f"Unsupported gripper action mode: {self._gripper_action_mode}")
 
-        prev_gripper = info.get("gripper_target_smooth", gripper_pos)
-        if not isinstance(prev_gripper, np.ndarray) or prev_gripper.shape != gripper_pos.shape:
-            prev_gripper = gripper_pos
+        prev_gripper = self._gripper_target_smooth
         if self._gripper_use_speed_limit and self._gripper_max_step > 0.0:
             delta = np.clip(gripper_pos - prev_gripper, -self._gripper_max_step, self._gripper_max_step)
             gripper_pos = prev_gripper + delta
@@ -468,25 +438,25 @@ class RM65OpenCabinetEnv(DirectEnv):
             )
 
         gripper_pos = gripper_pos.astype(np.float32, copy=False)
-        info["gripper_target_smooth"] = gripper_pos
+        self._gripper_target_smooth[:] = gripper_pos
         if gripper_closed_cmd is not None:
-            info["gripper_closed_cmd"] = np.asarray(gripper_closed_cmd, dtype=bool)
-        info["gripper_close_ratio"] = np.asarray(close_ratio, dtype=np.float32)
-        info["current_gripper_action"] = gripper_pos
+            self._gripper_closed_cmd[:] = gripper_closed_cmd
+        self._gripper_close_ratio[:] = close_ratio
+        self._current_gripper_action[:] = gripper_pos
         return gripper_pos[:, None]
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState):
         assert not np.isnan(actions).any(), "actions contain nan"
 
         raw_actions = np.array(actions, copy=True)
-        delayed_actions = self._apply_action_delay(actions, state.episode_steps, state.info)
-        self._update_action_history(raw_actions, delayed_actions, state.episode_steps, state.info)
-        state.info["last_actions"] = state.info["current_actions"]
-        state.info["current_actions"] = delayed_actions
+        delayed_actions = self._apply_action_delay(actions)
+        self._update_action_history(raw_actions)
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = delayed_actions
 
         old_joint_pos = self.get_robot_joint_pos(slice(None))[:, : self._arm_action_dim]
-        target_joint_pos = self._apply_arm_action(delayed_actions[:, : self._arm_action_dim], old_joint_pos, state.info)
-        gripper_action_cmd = self._apply_gripper_action(delayed_actions[:, -1], state.info)
+        target_joint_pos = self._apply_arm_action(delayed_actions[:, : self._arm_action_dim], old_joint_pos)
+        gripper_action_cmd = self._apply_gripper_action(delayed_actions[:, -1])
 
         new_pos = np.concatenate([target_joint_pos, gripper_action_cmd], axis=-1)
 
@@ -507,10 +477,9 @@ class RM65OpenCabinetEnv(DirectEnv):
 
         Reads only the cache left by the last read-program execution in the
         transition or reset; never performs reads itself and never touches
-        reward, termination, or info. Observation-only state (finite-difference
+        reward, termination, or reward terms. Observation-only state (finite-difference
         velocities, noise caches) lives in env-owned buffers.
         """
-        info = state.info
         episode_steps = state.episode_steps
         num_envs = self.num_envs
         obs_noise_cfg = self._obs_noise_cfg
@@ -549,7 +518,7 @@ class RM65OpenCabinetEnv(DirectEnv):
 
         # relative pose: position delta + relative quaternion (target * current.inverse)
         robot_grasp_pose = self._grasp_pose(slice(None))
-        drawer_grasp_pose = self._resolve_handle_pose(slice(None), info)
+        drawer_grasp_pose = self._handle_pose(slice(None))
         if obs_noise_cfg.enabled and obs_noise_cfg.handle_pose_noise_enabled:
             drawer_grasp_pose = self._get_noisy_handle_pose(drawer_grasp_pose)
         pos_delta = drawer_grasp_pose[:, :3] - robot_grasp_pose[:, :3]
@@ -565,13 +534,7 @@ class RM65OpenCabinetEnv(DirectEnv):
 
         obs = np.concatenate([dof_pos_scaled, dof_vel_rel, to_target], axis=-1)
         if self._action_history_len > 0:
-            history = info.get("action_history")
-            expected_shape = (num_envs, self._action_history_len, self._action_dim)
-            if history is None or history.shape != expected_shape:
-                history = np.zeros(expected_shape, dtype=np.float32)
-            else:
-                history = history.astype(np.float32, copy=False)
-            obs = np.concatenate([obs, history.reshape(num_envs, -1)], axis=-1)
+            obs = np.concatenate([obs, self._action_history.reshape(num_envs, -1)], axis=-1)
 
         assert obs.shape == (num_envs, self._obs_dim)
         assert not np.isnan(obs).any(), "obs contain nan"
@@ -588,7 +551,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         Observations are built separately by :meth:`compute_observation`.
         """
         self.sim_data.execute()
-        self._enforce_drawer_grasp_constraint(state)
+        self._enforce_drawer_grasp_constraint()
         # compute truncated
         truncated = self._check_termination(state)
 
@@ -602,14 +565,14 @@ class RM65OpenCabinetEnv(DirectEnv):
 
         return state
 
-    def _enforce_drawer_grasp_constraint(self, state: ArrayEnvState):
+    def _enforce_drawer_grasp_constraint(self):
         reward_cfg = self._cfg.reward
         robot_grasp_pose = self._grasp_pose(slice(None))
         drawer_grasp_pose = self._handle_pose(slice(None))
         gripper_drawer_dist = np.linalg.norm(drawer_grasp_pose[:, :3] - robot_grasp_pose[:, :3], axis=-1)
         gripper_range = max(abs(self.gripper_open_pos - self.gripper_closed_pos), 1e-6)
         close_ratio = np.clip(
-            (self.gripper_open_pos - state.info["current_gripper_action"]) / gripper_range,
+            (self.gripper_open_pos - self._current_gripper_action) / gripper_range,
             0.0,
             1.0,
         )
@@ -622,20 +585,14 @@ class RM65OpenCabinetEnv(DirectEnv):
         )
         grasp_candidate = np.logical_and(grasp_candidate, align_mask)
 
-        hold_steps = state.info.get("grasp_hold_steps")
-        if not isinstance(hold_steps, np.ndarray) or hold_steps.shape != grasp_candidate.shape:
-            hold_steps = np.zeros_like(grasp_candidate, dtype=np.int32)
-        hold_steps = np.where(grasp_candidate, hold_steps + 1, 0)
+        hold_steps = np.where(grasp_candidate, self._grasp_hold_steps + 1, 0)
         required_steps = max(int(getattr(reward_cfg, "grasp_hold_steps", 1)), 1)
+        self._grasp_hold_steps[:] = hold_steps
         grasped = hold_steps >= required_steps
+        self._grasped[:] = grasped
+        self._phase2_mask |= grasped
 
-        state.info["grasp_hold_steps"] = hold_steps
-        state.info["grasped"] = grasped
-        phase2_mask = state.info.get("phase2_mask", grasped)
-        phase2_mask = np.logical_or(phase2_mask, grasped)
-        state.info["phase2_mask"] = phase2_mask
-
-    def reset(self, env_ids):
+    def reset(self, env_ids) -> None:
         num_reset = len(env_ids)
         row_ids = np.asarray(env_ids, dtype=np.int64)
 
@@ -666,7 +623,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         bias_quat = self._sample_quat_bias(num_reset, obs_noise_cfg.target_rot_bias_std)
         handle_pose = self._handle_pose(row_ids).astype(np.float32)
         # Seed the env-owned observation caches for the rows being reset; the
-        # observation pipeline owns them afterwards (never state.info).
+        # observation pipeline owns them afterwards (never per-step state).
         self._obs_handle_bias_pos[row_ids] = bias_pos
         self._obs_handle_bias_quat[row_ids] = bias_quat
         self._obs_handle_pose_last[row_ids] = handle_pose
@@ -674,75 +631,34 @@ class RM65OpenCabinetEnv(DirectEnv):
             self._obs_handle_pose_buffer[row_ids] = np.repeat(
                 handle_pose[:, None, :], self._obs_handle_pose_buffer.shape[1], axis=1
             )
-        info = {
-            "current_actions": hold_action.copy(),
-            "last_actions": hold_action.copy(),
-            "phase2_mask": np.zeros(num_reset, dtype=bool),  # 1D array
-            "grasped": np.zeros(num_reset, dtype=bool),
-            "grasp_hold_steps": np.zeros(num_reset, dtype=np.int32),
-            "current_gripper_action": np.full(num_reset, self.gripper_open_pos, dtype=np.float32),  # 1D array
-            "handle_pose_override": np.zeros((num_reset, handle_pose.shape[1]), dtype=np.float32),
-            "handle_pose_override_mask": np.zeros(num_reset, dtype=bool),
-            "arm_action_delay_steps": arm_delay_steps,
-            "arm_actuator_lag_alpha": arm_lag_alpha,
-            "arm_max_step": arm_max_step,
-            "arm_max_acc_step": arm_max_acc_step,
-            "arm_target_smooth": dof_pos[:, : self._arm_action_dim],
-            "arm_prev_delta": np.zeros((num_reset, self._arm_action_dim), dtype=np.float32),
-            "arm_actuator_target": dof_pos[:, : self._arm_action_dim],
-            "gripper_target_smooth": gripper_left.copy(),
-            "gripper_binary_closed": init_binary_closed.astype(bool, copy=False),
-            "gripper_closed_cmd": init_binary_closed.astype(bool, copy=False),
-            "gripper_steps_since_switch": np.full(
-                num_reset,
-                self._gripper_min_switch_interval_steps,
-                dtype=np.int32,
-            ),
-            "gripper_close_ratio": init_close_ratio.copy(),
-            "prev_gripper_closed_cmd": init_binary_closed.astype(bool, copy=True),
-            "prev_open_dist": np.zeros(num_reset, dtype=np.float32),
-            "open_bonus_progress": np.zeros(num_reset, dtype=np.int32),
-            "Reward": {
-                "dist": np.zeros(num_reset, dtype=np.float32),
-                "quat": np.zeros(num_reset, dtype=np.float32),
-                "close_gripper": np.zeros(num_reset, dtype=np.float32),
-                "open_reward": np.zeros(num_reset, dtype=np.float32),
-                "open_delta_reward": np.zeros(num_reset, dtype=np.float32),
-                "slip_penalty": np.zeros(num_reset, dtype=np.float32),
-                "finger_penalty": np.zeros(num_reset, dtype=np.float32),
-                "action_penalty": np.zeros(num_reset, dtype=np.float32),
-                "joint_vel_penalty": np.zeros(num_reset, dtype=np.float32),
-                "gripper_switch_penalty": np.zeros(num_reset, dtype=np.float32),
-                "truncation_penalty": np.zeros(num_reset, dtype=np.float32),
-            },
-        }
-        buffer_len = max(int(self._arm_action_delay_buffer_len), 1)
-        info["action_delay_buffer"] = np.repeat(hold_action[:, None, :], buffer_len, axis=1)
+        # Seed the env-owned episode state buffers for the rows being reset;
+        # the action/reward pipeline owns them afterwards (never per-step state).
+        self._current_actions[row_ids] = hold_action
+        self._last_actions[row_ids] = hold_action
+        self._action_delay_buffer[row_ids] = np.repeat(
+            hold_action[:, None, :], self._action_delay_buffer.shape[1], axis=1
+        )
         if self._action_history_len > 0:
-            info["action_history"] = np.repeat(hold_action[:, None, :], self._action_history_len, axis=1)
-        return info
-
-    def _resolve_handle_pose(self, rows, info: dict):
-        handle_pose = self._handle_pose(rows)
-        override = info.get("handle_pose_override")
-        if override is not None:
-            override_pose = np.asarray(override, dtype=np.float32)
-            if override_pose.ndim == 1 and override_pose.shape[0] == handle_pose.shape[1]:
-                override_pose = np.tile(override_pose, (handle_pose.shape[0], 1))
-            if override_pose.shape != handle_pose.shape:
-                return handle_pose
-            override_mask = info.get("handle_pose_override_mask")
-            if override_mask is not None:
-                mask = np.asarray(override_mask, dtype=bool)
-                if mask.shape != (handle_pose.shape[0],):
-                    return handle_pose
-                if np.any(mask):
-                    return np.where(mask[:, None], override_pose, handle_pose)
-                if np.any(override_pose):
-                    return override_pose
-                return handle_pose
-            return override_pose
-        return handle_pose
+            self._action_history[row_ids] = np.repeat(hold_action[:, None, :], self._action_history_len, axis=1)
+        self._arm_action_delay_steps_per_env[row_ids] = arm_delay_steps
+        self._arm_actuator_lag_alpha_per_env[row_ids] = arm_lag_alpha
+        self._arm_max_step_per_env[row_ids] = arm_max_step
+        self._arm_max_acc_step_per_env[row_ids] = arm_max_acc_step
+        self._arm_target_smooth[row_ids] = dof_pos[:, : self._arm_action_dim]
+        self._arm_prev_delta[row_ids] = 0.0
+        self._arm_actuator_target[row_ids] = dof_pos[:, : self._arm_action_dim]
+        self._gripper_target_smooth[row_ids] = gripper_left
+        self._gripper_binary_closed[row_ids] = init_binary_closed
+        self._gripper_closed_cmd[row_ids] = init_binary_closed
+        self._prev_gripper_closed_cmd[row_ids] = init_binary_closed
+        self._gripper_steps_since_switch[row_ids] = self._gripper_min_switch_interval_steps
+        self._gripper_close_ratio[row_ids] = init_close_ratio
+        self._current_gripper_action[row_ids] = self.gripper_open_pos
+        self._grasp_hold_steps[row_ids] = 0
+        self._grasped[row_ids] = False
+        self._phase2_mask[row_ids] = False
+        self._prev_open_dist[row_ids] = 0.0
+        self._open_bonus_progress[row_ids] = 0
 
     def _sample_quat_bias(self, num_envs: int, rot_std: float):
         identity = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
@@ -835,7 +751,6 @@ class RM65OpenCabinetEnv(DirectEnv):
 
     def _compute_distance_alignment_terms(
         self,
-        state: ArrayEnvState,
         reward_cfg,
         robot_grasp_pose: np.ndarray,
         drawer_grasp_pose: np.ndarray,
@@ -854,7 +769,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         align_mask = np.logical_and(lfinger_dist >= 0.0, rfinger_dist >= 0.0)
 
         gripper_range = max(abs(self.gripper_open_pos - self.gripper_closed_pos), 1e-6)
-        close_amount_raw = self.gripper_open_pos - state.info["current_gripper_action"]
+        close_amount_raw = self.gripper_open_pos - self._current_gripper_action
         close_amount_raw = np.clip(close_amount_raw, 0.0, gripper_range)
         close_ratio = close_amount_raw / gripper_range
         close_amount = close_amount_raw * (0.04 / gripper_range)
@@ -880,10 +795,8 @@ class RM65OpenCabinetEnv(DirectEnv):
 
     def _compute_open_reward_terms(
         self,
-        state: ArrayEnvState,
         reward_cfg,
         gripper_drawer_dist: np.ndarray,
-        align_mask: np.ndarray,
     ) -> dict[str, np.ndarray]:
         open_dist = self.sim_data["drawer_pos"][:, 0]
         open_dist = np.asarray(open_dist).reshape(-1)
@@ -896,12 +809,8 @@ class RM65OpenCabinetEnv(DirectEnv):
             wrong_open = np.zeros_like(open_dist, dtype=bool)
         open_reward = np.where(np.logical_not(wrong_open), open_reward, 0.0)
 
-        grasped = state.info.get("grasped")
-        if grasped is None:
-            grasped = align_mask
-        phase2_mask = state.info.get("phase2_mask")
-        if not isinstance(phase2_mask, np.ndarray) or phase2_mask.shape != grasped.shape:
-            phase2_mask = grasped
+        grasped = self._grasped
+        phase2_mask = self._phase2_mask
 
         strict_open_gate = np.logical_or(grasped, phase2_mask)
         strict_open_dist = float(getattr(reward_cfg, "open_reward_strict_dist", 0.0))
@@ -913,15 +822,12 @@ class RM65OpenCabinetEnv(DirectEnv):
         open_gate = np.logical_and(strict_open_gate, near_mask)
         open_reward = np.where(open_gate, open_reward, 0.0)
 
-        prev_open_dist = state.info.get("prev_open_dist")
-        if not isinstance(prev_open_dist, np.ndarray) or prev_open_dist.shape != open_dist.shape:
-            prev_open_dist = np.zeros_like(open_dist, dtype=np.float32)
-        open_delta = np.clip(open_dist - prev_open_dist, 0.0, None)
+        open_delta = np.clip(open_dist - self._prev_open_dist, 0.0, None)
         open_delta_reward = open_delta * reward_cfg.open_delta_reward_scale
         open_delta_reward = np.where(open_gate, open_delta_reward, 0.0)
         open_delta_reward = np.where(np.logical_not(wrong_open), open_delta_reward, 0.0)
 
-        state.info["prev_open_dist"] = open_dist.astype(np.float32, copy=True)
+        self._prev_open_dist[:] = open_dist
 
         return {
             "open_dist": open_dist,
@@ -934,7 +840,6 @@ class RM65OpenCabinetEnv(DirectEnv):
 
     def _compute_progress_reward_terms(
         self,
-        state: ArrayEnvState,
         reward_cfg,
         open_dist: np.ndarray,
         grasped: np.ndarray,
@@ -944,9 +849,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         grasp_hold_open_scale = float(getattr(reward_cfg, "grasp_hold_open_scale", 0.0))
         grasp_hold_reward = np.where(grasped, grasp_hold_reward_scale + grasp_hold_open_scale * open_dist, 0.0)
 
-        prev_open_bonus = state.info.get("open_bonus_progress")
-        if not isinstance(prev_open_bonus, np.ndarray) or prev_open_bonus.shape != open_dist.shape:
-            prev_open_bonus = np.zeros_like(open_dist, dtype=np.int32)
+        prev_open_bonus = self._open_bonus_progress
 
         bonus1_dist = float(getattr(reward_cfg, "open_bonus_dist_1", 0.0))
         bonus1_reward = float(getattr(reward_cfg, "open_bonus_reward_1", 0.0))
@@ -961,7 +864,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         open_bonus_reward = np.where(grasped, open_bonus_reward, 0.0)
         bonus_progress = np.where(pass_bonus1, 1, bonus_progress)
         bonus_progress = np.where(pass_bonus2, 2, bonus_progress)
-        state.info["open_bonus_progress"] = bonus_progress.astype(np.int32)
+        self._open_bonus_progress[:] = bonus_progress
 
         slip_open_dist_thresh = float(np.clip(reward_cfg.slip_open_dist_thresh, 0.0, 1.0))
         slipped = np.logical_and(
@@ -983,7 +886,6 @@ class RM65OpenCabinetEnv(DirectEnv):
 
     def _compute_penalty_terms(
         self,
-        state: ArrayEnvState,
         reward_cfg,
         gripper_drawer_dist: np.ndarray,
         lfinger_dist: np.ndarray,
@@ -993,7 +895,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         close_ratio: np.ndarray,
         open_dist: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        action_penalty = np.sum(np.square(state.info["current_actions"] - state.info["last_actions"]), axis=-1)
+        action_penalty = np.sum(np.square(self._current_actions - self._last_actions), axis=-1)
         joint_vel_penalty = np.sum(np.square(self.sim_data["robot_joint_vel"][:, : self._action_dim]), axis=-1)
 
         finger_penalty = np.zeros_like(lfinger_dist)
@@ -1010,16 +912,8 @@ class RM65OpenCabinetEnv(DirectEnv):
             0.0,
         )
 
-        gripper_closed_cmd = state.info.get("gripper_closed_cmd")
-        if not isinstance(gripper_closed_cmd, np.ndarray) or gripper_closed_cmd.shape != close_ratio.shape:
-            gripper_closed_cmd = close_ratio > self._gripper_close_threshold
-        gripper_closed_cmd = np.asarray(gripper_closed_cmd, dtype=bool)
-        prev_gripper_closed_cmd = state.info.get("prev_gripper_closed_cmd")
-        if not isinstance(prev_gripper_closed_cmd, np.ndarray) or (
-            prev_gripper_closed_cmd.shape != gripper_closed_cmd.shape
-        ):
-            prev_gripper_closed_cmd = gripper_closed_cmd.copy()
-        switch_mask = gripper_closed_cmd != prev_gripper_closed_cmd
+        gripper_closed_cmd = self._gripper_closed_cmd
+        switch_mask = gripper_closed_cmd != self._prev_gripper_closed_cmd
         switch_penalty_dist = float(getattr(reward_cfg, "gripper_switch_penalty_dist", 0.0))
         if switch_penalty_dist > 0.0:
             switch_gate = gripper_drawer_dist < switch_penalty_dist
@@ -1031,7 +925,7 @@ class RM65OpenCabinetEnv(DirectEnv):
             -gripper_switch_penalty_scale,
             0.0,
         ).astype(np.float32)
-        state.info["prev_gripper_closed_cmd"] = gripper_closed_cmd.copy()
+        self._prev_gripper_closed_cmd[:] = gripper_closed_cmd
 
         if self.count < reward_cfg.action_penalty_switch_step:
             action_penalty_rate = reward_cfg.action_penalty_rate_early
@@ -1054,7 +948,7 @@ class RM65OpenCabinetEnv(DirectEnv):
             "joint_vel_penalty_rate": np.full_like(open_dist, joint_vel_penalty_rate, dtype=np.float32),
         }
 
-    def _update_reward_info(
+    def _update_reward_terms(
         self,
         state: ArrayEnvState,
         *,
@@ -1067,7 +961,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         truncation_penalty: np.ndarray,
     ) -> None:
         grasped = open_terms["grasped"]
-        state.info["Reward"] = {
+        state.reward_terms = {
             "dist": alignment_terms["dist_reward"],
             "quat": alignment_terms["quat_reward"],
             "close_gripper": alignment_terms["close_gripper"],
@@ -1106,27 +1000,22 @@ class RM65OpenCabinetEnv(DirectEnv):
         gripper_drawer_dist = np.linalg.norm(drawer_grasp_pose[:, :3] - robot_grasp_pose[:, :3], axis=-1)
         reward_cfg = self._cfg.reward
         alignment_terms = self._compute_distance_alignment_terms(
-            state,
             reward_cfg,
             robot_grasp_pose,
             drawer_grasp_pose,
             gripper_drawer_dist,
         )
         open_terms = self._compute_open_reward_terms(
-            state,
             reward_cfg,
             gripper_drawer_dist,
-            alignment_terms["align_mask"],
         )
         progress_terms = self._compute_progress_reward_terms(
-            state,
             reward_cfg,
             open_terms["open_dist"],
             open_terms["grasped"],
             open_terms["phase2_mask"],
         )
         penalty_terms = self._compute_penalty_terms(
-            state,
             reward_cfg,
             gripper_drawer_dist,
             alignment_terms["lfinger_dist"],
@@ -1154,7 +1043,7 @@ class RM65OpenCabinetEnv(DirectEnv):
         truncation_penalty = np.where(truncated, -reward_cfg.truncation_penalty, 0.0)
         reward = reward + truncation_penalty
 
-        self._update_reward_info(
+        self._update_reward_terms(
             state,
             reward_cfg=reward_cfg,
             alignment_terms=alignment_terms,

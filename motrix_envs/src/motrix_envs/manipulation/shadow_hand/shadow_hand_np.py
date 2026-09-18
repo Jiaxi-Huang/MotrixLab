@@ -129,6 +129,14 @@ class ShadowHandReposeEnv(DirectEnv):
         # Initial cube position (in hand)
         self._in_hand_pos = np.array(cfg.cube_initial_pos, dtype=np.float32)
 
+        # Episode-scoped task state: full-batch buffers, reset writes the done
+        # rows in place.
+        num_envs = self._num_envs
+        self._goal_pos = np.tile(self._in_hand_pos, (num_envs, 1))
+        self._goal_rot = np.zeros((num_envs, 4), dtype=np.float32)
+        self._prev_actions = np.zeros((num_envs, self._num_actuators), dtype=np.float32)
+        self._successes = np.zeros(num_envs, dtype=np.int32)
+
     @property
     def observation_space(self):
         return self._observation_space
@@ -170,7 +178,7 @@ class ShadowHandReposeEnv(DirectEnv):
 
         # Apply action moving average for smoothness
         if cfg.act_moving_average < 1.0:
-            targets = cfg.act_moving_average * targets + (1.0 - cfg.act_moving_average) * state.info["prev_actions"]
+            targets = cfg.act_moving_average * targets + (1.0 - cfg.act_moving_average) * self._prev_actions
 
         # Clamp to control limits
         targets = np.clip(targets, self._actuator_ctrl_lower, self._actuator_ctrl_upper)
@@ -179,7 +187,7 @@ class ShadowHandReposeEnv(DirectEnv):
         ctrl = self._ctrl_writes.buffer("ctrl")
         ctrl[:] = np.asarray(targets, dtype=np.float32)
         self._ctrl_writes.execute()
-        state.info["prev_actions"] = targets.copy()
+        self._prev_actions[:] = targets
 
         return state
 
@@ -187,11 +195,10 @@ class ShadowHandReposeEnv(DirectEnv):
         """Build the full 157-dim observation batch from cached simulator data.
 
         Reads only the cache left by the last read-program execution in the
-        transition; never performs reads itself and never touches reward,
-        termination, or info.
+        transition; never performs reads itself and never touches reward or
+        termination.
         """
         cfg = self._cfg
-        info = state.info
         rows = slice(None)
 
         # Get hand DOF states
@@ -218,7 +225,7 @@ class ShadowHandReposeEnv(DirectEnv):
         )  # Total: 65
 
         # Compute relative quaternion
-        relative_quat = quaternion.mul(cube_quat, quaternion.conjugate(info["goal_rot"]))
+        relative_quat = quaternion.mul(cube_quat, quaternion.conjugate(self._goal_rot))
         scaled_hand_pos = utils.unscale(hand_dof_pos, self._hand_dof_lower_limits, self._hand_dof_upper_limits)
 
         # Build observation (157 dims)
@@ -230,11 +237,11 @@ class ShadowHandReposeEnv(DirectEnv):
                 cube_quat,  # 4
                 cube_linvel,  # 3
                 cfg.vel_obs_scale * cube_angvel,  # 3
-                info["goal_pos"],  # 3
-                info["goal_rot"],  # 4
+                self._goal_pos,  # 3
+                self._goal_rot,  # 4
                 relative_quat,  # 4
                 fingertip_state,  # 65
-                info["prev_actions"],  # 20
+                self._prev_actions,  # 20
             ],
             axis=-1,
         )
@@ -252,23 +259,22 @@ class ShadowHandReposeEnv(DirectEnv):
         method never touches the observation field.
         """
         self.sim_data.execute()
-        info = state.info
 
         # Compute reward and termination from the refreshed simulator cache
-        reward, terminated, goal_reached = self._compute_reward(info)
+        reward, terminated, goal_reached = self._compute_reward()
         if np.any(goal_reached):
             reset_goal_indices = np.where(goal_reached)[0]
-            self._reset_goal_pose(info, reset_goal_indices)
+            self._reset_goal_pose(reset_goal_indices)
         # Update the goal mocap body so viewers track the current goal pose
         # (a write program, not an observation read).
-        self._update_target_visualization(info)
+        self._update_target_visualization()
 
         state.reward = reward
         state.terminated = terminated
 
         return state
 
-    def _compute_reward(self, info: dict):
+    def _compute_reward(self):
         """
         Reward components (3 core items):
         1. Position distance penalty
@@ -287,15 +293,15 @@ class ShadowHandReposeEnv(DirectEnv):
         cube_pos, cube_quat, _ = self._extract_cube_states(slice(None))
 
         # Distance from cube to goal position
-        goal_dist = np.linalg.norm(cube_pos - info["goal_pos"], axis=-1)
+        goal_dist = np.linalg.norm(cube_pos - self._goal_pos, axis=-1)
 
         # Rotation distance
-        rot_dist = quaternion.rotation_distance(cube_quat, info["goal_rot"])
+        rot_dist = quaternion.rotation_distance(cube_quat, self._goal_rot)
 
         # Core reward components
         dist_rew = goal_dist * cfg.dist_reward_scale
         rot_rew = 1.0 / (np.abs(rot_dist) + cfg.rot_eps) * cfg.rot_reward_scale
-        action_penalty = np.sum(info["prev_actions"] ** 2, axis=-1) * cfg.action_penalty_scale
+        action_penalty = np.sum(self._prev_actions**2, axis=-1) * cfg.action_penalty_scale
 
         # Base reward
         reward = dist_rew + rot_rew + action_penalty
@@ -304,7 +310,7 @@ class ShadowHandReposeEnv(DirectEnv):
         goal_reached = np.abs(rot_dist) <= cfg.success_tolerance
 
         # Update success counter
-        info["successes"] += goal_reached * 1
+        self._successes += goal_reached * 1
 
         # Success bonus
         reward = np.where(goal_reached, reward + cfg.reach_goal_bonus, reward)
@@ -323,8 +329,8 @@ class ShadowHandReposeEnv(DirectEnv):
         new_pos = np.zeros(num_envs, dtype=bool)
         if cfg.max_consecutive_successes > 0:
             # Reset progress on goal reached when max consecutive successes reached
-            new_pos = info["successes"] >= cfg.max_consecutive_successes
-            info["successes"] *= 1 - new_pos
+            new_pos = self._successes >= cfg.max_consecutive_successes
+            self._successes *= 1 - new_pos
 
         # 3. NaN protection
         terminated = np.logical_or(terminated, np.isnan(rot_dist))
@@ -332,22 +338,22 @@ class ShadowHandReposeEnv(DirectEnv):
 
         return reward, terminated, new_pos
 
-    def _update_target_visualization(self, info: dict):
+    def _update_target_visualization(self):
         """Update the target mocap body to visualize the goal pose."""
         cfg = self._cfg
 
         # Compute visualization position (offset from goal position)
-        viz_pos = info["goal_pos"] + np.array(cfg.viz_target_offset, dtype=np.float32)
+        viz_pos = self._goal_pos + np.array(cfg.viz_target_offset, dtype=np.float32)
 
         # Combine into pose array: [x, y, z, qx, qy, qz, qw]
-        viz_pose = np.concatenate([viz_pos, info["goal_rot"]], axis=-1)
+        viz_pose = np.concatenate([viz_pos, self._goal_rot], axis=-1)
 
         # Update mocap body pose
         all_ids = np.arange(self._num_envs, dtype=np.int64)
         self._target_writes.buffer("target")[all_ids, 0] = np.asarray(viz_pose, dtype=np.float32)
         self._target_writes.execute(all_ids)
 
-    def reset(self, env_ids: np.ndarray):
+    def reset(self, env_ids: np.ndarray) -> None:
         """Reset environments."""
         cfg = self._cfg
 
@@ -392,22 +398,18 @@ class ShadowHandReposeEnv(DirectEnv):
         self._reset_program.execute(row_ids)
         self.sim_data.execute(row_ids)
 
-        # Reset goal pose
-        # Note: goal_pos and goal_rot are indexed by original env indices
-        info = {
-            "goal_pos": np.tile(self._in_hand_pos, num_resets).reshape(num_resets, 3),
-            "goal_rot": quaternion.generate_random_shoemake(num_resets),
-            "prev_actions": np.zeros((num_resets, self._num_actuators), dtype=np.float32),
-            "successes": np.zeros((num_resets), dtype=np.int32),
-        }
+        # Reset episode-scoped task state for the reset rows. The goal position
+        # is fixed; the goal orientation is sampled uniformly on SO(3).
+        self._goal_pos[row_ids] = self._in_hand_pos
+        self._goal_rot[row_ids] = quaternion.generate_random_shoemake(num_resets)
+        self._prev_actions[row_ids] = 0.0
+        self._successes[row_ids] = 0
 
-        return info
-
-    def _reset_goal_pose(self, info, env_ids):
+    def _reset_goal_pose(self, env_ids):
         """Reset goal pose to random orientation with fixed position."""
         num_resets = len(env_ids)
 
         # Goal position is fixed
 
         # Randomize goal orientation using Shoemake method for uniform SO(3) sampling
-        info["goal_rot"][env_ids] = quaternion.generate_random_shoemake(num_resets)
+        self._goal_rot[env_ids] = quaternion.generate_random_shoemake(num_resets)

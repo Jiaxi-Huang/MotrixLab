@@ -139,7 +139,7 @@ python scripts/train.py task=g1-wbt-dance1-subject1/motrix.fastsac \
 ```
 
 Check for missing motion, joint, or body names; systematic NaNs, joint-limit violations, or immediate bad-tracking after
-reset; and verify that `info["Reward"]` and `info["metrics"]` reach the logs. Then start the default training run:
+reset; and verify that `state.reward_terms` and `state.metrics` reach the logs. Then start the default training run:
 
 ```bash
 python scripts/train.py task=g1-wbt-dance1-subject1/motrix.fastsac algo.asynchronous=true

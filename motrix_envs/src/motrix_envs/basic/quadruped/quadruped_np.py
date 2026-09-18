@@ -235,6 +235,11 @@ class QuadrupedEnv(DirectEnv):
             ctrl_ranges[:, 0], ctrl_ranges[:, 1], (self.num_actuators,), dtype=np.float32
         )
 
+        # Episode-scoped action history: full-batch buffers, reset writes the
+        # done rows in place.
+        self._actions = np.zeros((self._num_envs, self.num_actuators), dtype=np.float32)
+        self._last_actions = np.zeros((self._num_envs, self.num_actuators), dtype=np.float32)
+
     @property
     def observation_space(self) -> gym.spaces.Box:
         return self._observation_space
@@ -247,12 +252,8 @@ class QuadrupedEnv(DirectEnv):
         if self._cfg.clip_env_actions:
             actions = np.clip(actions, self._action_space.low, self._action_space.high)
         actions = actions.astype(np.float32)
-        if "actions" not in state.info:
-            state.info["actions"] = np.zeros_like(actions, dtype=np.float32)
-        if "last_actions" not in state.info:
-            state.info["last_actions"] = np.zeros_like(actions, dtype=np.float32)
-        state.info["last_actions"] = state.info["actions"]
-        state.info["actions"] = actions
+        self._last_actions[:] = self._actions
+        self._actions[:] = actions
         ctrl = self._ctrl_writes.buffer("ctrl")
         ctrl[:] = np.asarray(actions, dtype=np.float32)
         self._ctrl_writes.execute()
@@ -497,11 +498,7 @@ class QuadrupedEnv(DirectEnv):
         )
 
     def _smooth_reward(self, state: ArrayEnvState) -> np.ndarray:
-        smooth_reward = np.zeros((self._num_envs,), dtype=np.float32)
-        if "actions" not in state.info or "last_actions" not in state.info:
-            return smooth_reward
-
-        delta = state.info["actions"] - state.info["last_actions"]
+        delta = self._actions - self._last_actions
         delta_norm = np.linalg.norm(delta, axis=-1)
         return reward.tolerance(
             delta_norm,
@@ -597,50 +594,6 @@ class QuadrupedEnv(DirectEnv):
 
         return state.replace(obs=np.concatenate(parts, axis=-1).astype(np.float32))
 
-    def _locomotion_reward_info(self, num_envs: int) -> dict:
-        return {
-            "upright": np.zeros((num_envs,), dtype=np.float32),
-            "move": np.zeros((num_envs,), dtype=np.float32),
-            "backward": np.zeros((num_envs,), dtype=np.float32),
-            "height": np.zeros((num_envs,), dtype=np.float32),
-            "lateral": np.zeros((num_envs,), dtype=np.float32),
-            "heading": np.zeros((num_envs,), dtype=np.float32),
-            "smooth": np.zeros((num_envs,), dtype=np.float32),
-            "lin_vel_z": np.zeros((num_envs,), dtype=np.float32),
-            "ang_vel_xy": np.zeros((num_envs,), dtype=np.float32),
-            "similar_to_default": np.zeros((num_envs,), dtype=np.float32),
-            "total": np.zeros((num_envs,), dtype=np.float32),
-        }
-
-    def _escape_reward_info(self, num_envs: int) -> dict:
-        info = self._locomotion_reward_info(num_envs)
-        info.update(
-            {
-                "escape": np.zeros((num_envs,), dtype=np.float32),
-                "radial": np.zeros((num_envs,), dtype=np.float32),
-            }
-        )
-        return info
-
-    def _fetch_reward_info(self, num_envs: int) -> dict:
-        return {
-            "upright": np.zeros((num_envs,), dtype=np.float32),
-            "stage_move": np.zeros((num_envs,), dtype=np.float32),
-            "stage_reach": np.zeros((num_envs,), dtype=np.float32),
-            "stability": np.zeros((num_envs,), dtype=np.float32),
-            "behind_align": np.zeros((num_envs,), dtype=np.float32),
-            "face_ball": np.zeros((num_envs,), dtype=np.float32),
-            "near_ball": np.zeros((num_envs,), dtype=np.float32),
-            "ready": np.zeros((num_envs,), dtype=np.float32),
-            "ready_gate": np.zeros((num_envs,), dtype=np.float32),
-            "fetch": np.zeros((num_envs,), dtype=np.float32),
-            "push": np.zeros((num_envs,), dtype=np.float32),
-            "away": np.zeros((num_envs,), dtype=np.float32),
-            "leg_ball": np.zeros((num_envs,), dtype=np.float32),
-            "backward": np.zeros((num_envs,), dtype=np.float32),
-            "total": np.zeros((num_envs,), dtype=np.float32),
-        }
-
     def _base_locomotion_components(self, state: ArrayEnvState) -> dict[str, np.ndarray]:
         torso_vel = self._torso_velocity(slice(None))
         return {
@@ -669,13 +622,6 @@ class QuadrupedEnv(DirectEnv):
             components["similar_to_default"],
         )
         return self._sum_scaled_rewards(reward_terms, self._locomotion_reward_scales())
-
-    def _build_reset_info(self, num_envs: int) -> dict:
-        return {
-            "Reward": self._init_reward_info(num_envs),
-            "actions": np.zeros((num_envs, self.num_actuators), dtype=np.float32),
-            "last_actions": np.zeros((num_envs, self.num_actuators), dtype=np.float32),
-        }
 
     def _random_quaternion(self, num: int) -> np.ndarray:
         q = np.random.randn(num, 4).astype(np.float32)
@@ -720,23 +666,20 @@ class QuadrupedEnv(DirectEnv):
             z[pending] += 0.01
         return dof_pos
 
-    def _finish_reset(self, env_ids: np.ndarray, dof_pos: np.ndarray, dof_vel: np.ndarray) -> dict:
+    def _finish_reset(self, env_ids: np.ndarray, dof_pos: np.ndarray, dof_vel: np.ndarray) -> None:
         dof_pos = self._lift_non_contacting(env_ids, dof_pos, dof_vel)
         self._execute_reset(
             env_ids, np.ascontiguousarray(dof_pos, dtype=np.float32), np.ascontiguousarray(dof_vel, dtype=np.float32)
         )
         self.sim_data.execute(np.asarray(env_ids, dtype=np.int64))
 
-        info = self._build_reset_info(len(env_ids))
-        return info
+        self._actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0
 
 
 @registry.env("dm-quadruped-walk")
 @registry.env("dm-quadruped-run")
 class QuadrupedLocomotionEnv(QuadrupedEnv):
-    def _init_reward_info(self, num_envs: int) -> dict:
-        return self._locomotion_reward_info(num_envs)
-
     def compute_transition(self, state: ArrayEnvState) -> ArrayEnvState:
         self.sim_data.execute()
         inputs = self.sim_data
@@ -751,11 +694,11 @@ class QuadrupedLocomotionEnv(QuadrupedEnv):
 
         terminated = np.isnan(inputs["dof_pos"]).any(axis=-1) | np.isnan(inputs["dof_vel"]).any(axis=-1)
         rwd = np.where(terminated, 0.0, rwd).astype(np.float32)
-        state.info["Reward"] = reward_components
+        state.reward_terms = reward_components
 
         return state.replace(reward=rwd, terminated=terminated)
 
-    def reset(self, env_ids: np.ndarray):
+    def reset(self, env_ids: np.ndarray) -> None:
         num = len(env_ids)
         dof_pos = np.tile(self._init_dof_pos, (num, 1))
         dof_vel = np.zeros((num, self.num_dof_vel), dtype=np.float32)
@@ -765,14 +708,11 @@ class QuadrupedLocomotionEnv(QuadrupedEnv):
         else:
             dof_pos[:, 3:7] = self._random_quaternion(num)
 
-        return self._finish_reset(env_ids, dof_pos, dof_vel)
+        self._finish_reset(env_ids, dof_pos, dof_vel)
 
 
 @registry.env("dm-quadruped-escape")
 class QuadrupedEscapeEnv(QuadrupedLocomotionEnv):
-    def _init_reward_info(self, num_envs: int) -> dict:
-        return self._escape_reward_info(num_envs)
-
     def compute_transition(self, state: ArrayEnvState) -> ArrayEnvState:
         self.sim_data.execute()
         inputs = self.sim_data
@@ -811,16 +751,13 @@ class QuadrupedEscapeEnv(QuadrupedLocomotionEnv):
 
         terminated = np.isnan(inputs["dof_pos"]).any(axis=-1) | np.isnan(inputs["dof_vel"]).any(axis=-1)
         rwd = np.where(terminated, 0.0, rwd).astype(np.float32)
-        state.info["Reward"] = reward_components
+        state.reward_terms = reward_components
 
         return state.replace(reward=rwd, terminated=terminated)
 
 
 @registry.env("dm-quadruped-fetch")
 class QuadrupedFetchEnv(QuadrupedEnv):
-    def _init_reward_info(self, num_envs: int) -> dict:
-        return self._fetch_reward_info(num_envs)
-
     def compute_transition(self, state: ArrayEnvState) -> ArrayEnvState:
         self.sim_data.execute()
         inputs = self.sim_data
@@ -980,11 +917,11 @@ class QuadrupedFetchEnv(QuadrupedEnv):
         rwd = np.where(terminated, 0.0, rwd).astype(np.float32)
         for key, value in reward_components.items():
             reward_components[key] = np.where(terminated, 0.0, value).astype(np.float32)
-        state.info["Reward"] = reward_components
+        state.reward_terms = reward_components
 
         return state.replace(reward=rwd, terminated=terminated)
 
-    def reset(self, env_ids: np.ndarray):
+    def reset(self, env_ids: np.ndarray) -> None:
         num = len(env_ids)
         dof_pos = np.tile(self._init_dof_pos, (num, 1))
         dof_vel = np.zeros((num, self.num_dof_vel), dtype=np.float32)
@@ -1009,4 +946,4 @@ class QuadrupedFetchEnv(QuadrupedEnv):
         ball_qvel = self._ball_vel_slice
         dof_vel[:, ball_qvel.start : ball_qvel.stop] = 0.0
 
-        return self._finish_reset(env_ids, dof_pos, dof_vel)
+        self._finish_reset(env_ids, dof_pos, dof_vel)

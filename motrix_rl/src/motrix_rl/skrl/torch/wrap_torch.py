@@ -30,7 +30,7 @@ class SkrlTorchWrapper(SkrlWrapper):
 
     def reset(self) -> tuple[torch.Tensor, Any]:
         state = self._env.init_state()
-        return self._to_train_device(state.obs.policy, torch.float32), state.info
+        return self._to_train_device(state.obs.policy, torch.float32), env_infos(state)
 
     def step(
         self, actions: torch.Tensor

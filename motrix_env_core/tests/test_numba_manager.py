@@ -608,7 +608,7 @@ def test_step_perf_records_standard_and_numba_manager_phases() -> None:
     env = _ManagerEnv()
     state = env.init_state()
     assert state.episode_steps.shape == (env.num_envs,)
-    assert "steps" not in state.info
+    assert set(state.reward_terms) == {"source"}
     actions = np.zeros((env.num_envs, 1), dtype=np.float32)
 
     env.step(actions)
@@ -686,7 +686,7 @@ def test_manager_context_is_injected_once_and_reused_across_all_term_kinds() -> 
     np.testing.assert_allclose(env.metrics["source_at_termination"][:, 0], [0.25, 0.75])
     np.testing.assert_array_equal(state.metrics["limit"], [False, True])
     np.testing.assert_allclose(np.ravel(state.metrics["double"]), [0.5, 1.5])
-    np.testing.assert_allclose(state.info["Reward"]["source"], [0.005, 0.015])
+    np.testing.assert_allclose(state.reward_terms["source"], [0.005, 0.015])
     np.testing.assert_array_equal(state.metrics["limit"], [False, True])
     assert env._compiled_manager_program is not None
     assert sum(source.count("ctx =") for source in env._compiled_manager_program.sources) == 3

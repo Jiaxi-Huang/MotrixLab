@@ -114,6 +114,15 @@ class AnymalCEnv(DirectEnv):
 
         self._init_joint_position = self.default_angles.copy()
 
+        # Episode-scoped navigation state: full-batch buffers, reset writes the
+        # done rows in place.
+        num_envs = self._num_envs
+        self._pose_commands = np.zeros((num_envs, 3), dtype=np.float32)
+        self._last_actions = np.zeros((num_envs, self._num_action), dtype=np.float32)
+        self._current_actions = np.zeros((num_envs, self._num_action), dtype=np.float32)
+        self._ever_reached = np.zeros(num_envs, dtype=bool)
+        self._min_distance = np.zeros(num_envs, dtype=np.float32)
+
     def _init_contact_geometry(self):
         """Initialize geometry name pairs required for contact detection"""
         cfg = self._cfg
@@ -180,10 +189,8 @@ class AnymalCEnv(DirectEnv):
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState):
         # Save current action for incremental control
-        if "current_action" not in state.info:
-            state.info["current_actions"] = np.zeros_like(actions)
-        state.info["last_actions"] = state.info["current_actions"]
-        state.info["current_actions"] = actions
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = actions
 
         # Position control mode: directly input target angles
         actions_scaled = actions * self._cfg.control_config.action_scale
@@ -192,7 +199,7 @@ class AnymalCEnv(DirectEnv):
         self._ctrl_writes.execute()
         return state
 
-    def _navigation_state(self, info: dict):
+    def _navigation_state(self, pose_commands: np.ndarray):
         """Derive navigation commands from cached sim reads and pose commands.
 
         Pure physics-derived quantities shared by ``compute_transition``
@@ -201,7 +208,6 @@ class AnymalCEnv(DirectEnv):
         """
         root_pos = self.sim_data["root_pos"]
         root_quat = self.sim_data["root_quat"]
-        pose_commands = info["pose_commands"]
 
         robot_position = root_pos[:, :2]
         robot_heading = quaternion.get_yaw(root_quat)
@@ -232,7 +238,7 @@ class AnymalCEnv(DirectEnv):
         return position_error, heading_diff, distance_to_target, reached_all, desired_vel_xy, velocity_commands
 
     def compute_observation(self, state: ArrayEnvState) -> ArrayEnvState:
-        """Build the full observation from cached sim reads and info."""
+        """Build the full observation from cached sim reads and episode state."""
         inputs = self.sim_data
         gyro = inputs["base_gyro"]
         projected_gravity = self._compute_projected_gravity(inputs["root_quat"])
@@ -240,7 +246,7 @@ class AnymalCEnv(DirectEnv):
         # Navigation quantities recomputed from the same cached reads, so
         # freshly reset rows observe their post-reset command state.
         (position_error, heading_diff, distance_to_target, reached_all, _, velocity_commands) = self._navigation_state(
-            state.info
+            self._pose_commands
         )
 
         # Normalize observations
@@ -249,7 +255,7 @@ class AnymalCEnv(DirectEnv):
         noisy_joint_angle = (inputs["robot_joint_pos"] - self.default_angles) * self._cfg.normalization.dof_pos
         noisy_joint_vel = inputs["robot_joint_vel"] * self._cfg.normalization.dof_vel
         command_normalized = velocity_commands * self.commands_scale
-        last_actions = state.info["current_actions"]
+        last_actions = self._current_actions
 
         # Calculate task-related observations
         position_error_normalized = position_error / 5.0  # Normalize to reasonable range
@@ -289,18 +295,17 @@ class AnymalCEnv(DirectEnv):
         base_lin_vel = self.sim_data["base_linvel"][:, :3]
 
         # Navigation quantities derived directly from the cached reads
-        (_, _, _, _, desired_vel_xy, velocity_commands) = self._navigation_state(state.info)
-        state.info["desired_vel_xy"] = desired_vel_xy
+        (_, _, _, _, desired_vel_xy, velocity_commands) = self._navigation_state(self._pose_commands)
 
         # Update target position marker
         num_envs = self._num_envs
-        self._update_target_marker(np.arange(num_envs, dtype=np.int64), state.info["pose_commands"])
+        self._update_target_marker(np.arange(num_envs, dtype=np.int64), self._pose_commands)
         # Update arrow visualization (no physical effect)
         base_lin_vel_xy = base_lin_vel[:, :2]
         self._update_heading_arrows(np.arange(num_envs, dtype=np.int64), root_pos, desired_vel_xy, base_lin_vel_xy)
 
         # Calculate reward
-        state.reward = self._compute_reward(state.info, velocity_commands)
+        state.reward = self._compute_reward(velocity_commands)
 
         # Calculate termination conditions
         state = self._compute_terminated(state)
@@ -340,7 +345,7 @@ class AnymalCEnv(DirectEnv):
         # Both heading markers go to the backend in one crossing.
         self._heading_writes.execute(env_ids)
 
-    def _compute_reward(self, info: dict, velocity_commands: np.ndarray) -> np.ndarray:
+    def _compute_reward(self, velocity_commands: np.ndarray) -> np.ndarray:
         """
         Velocity tracking reward mechanism
         velocity_commands: [num_envs, 3] - (vx, vy, vyaw)
@@ -382,20 +387,17 @@ class AnymalCEnv(DirectEnv):
 
         # Get robot position and heading for arrival determination, derived
         # directly from the cached reads and pose commands
-        (_, _, distance_to_target, reached_all, _, _) = self._navigation_state(info)
+        (_, _, distance_to_target, reached_all, _, _) = self._navigation_state(self._pose_commands)
 
         # One-time reward for first time reaching position
-        info["ever_reached"] = info.get("ever_reached", np.zeros(num_envs, dtype=bool))
-        first_time_reach = np.logical_and(reached_all, ~info["ever_reached"])
-        info["ever_reached"] = np.logical_or(info["ever_reached"], reached_all)
+        first_time_reach = np.logical_and(reached_all, ~self._ever_reached)
+        self._ever_reached |= reached_all
         arrival_bonus = np.where(first_time_reach, 10.0, 0.0)
 
         # Distance approach reward: incentivize getting closer to target
         # Use historical minimum distance to calculate progress
-        if "min_distance" not in info:
-            info["min_distance"] = distance_to_target.copy()
-        distance_improvement = info["min_distance"] - distance_to_target
-        info["min_distance"] = np.minimum(info["min_distance"], distance_to_target)
+        distance_improvement = self._min_distance - distance_to_target
+        np.minimum(self._min_distance, distance_to_target, out=self._min_distance)
         approach_reward = np.clip(distance_improvement * 4.0, -1.0, 1.0)  # Reward 5 points for every 1 meter closer
 
         # 3. Orientation stability reward (penalize deviation from normal standing posture)
@@ -428,7 +430,7 @@ class AnymalCEnv(DirectEnv):
         dof_vel_penalty = np.sum(np.square(joint_vel), axis=1)
 
         # 8. Action change penalty
-        action_diff = info["current_actions"] - info["last_actions"]
+        action_diff = self._current_actions - self._last_actions
         action_rate_penalty = np.sum(np.square(action_diff), axis=1)
 
         # Combined reward
@@ -506,7 +508,7 @@ class AnymalCEnv(DirectEnv):
 
         return state.replace(terminated=terminated)
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         cfg: AnymalCEnvCfg = self._cfg
         num_envs = len(env_ids)
 
@@ -606,15 +608,12 @@ class AnymalCEnv(DirectEnv):
         if desired_yaw_rate.ndim > 1:
             desired_yaw_rate = desired_yaw_rate.flatten()
 
-        info = {
-            "pose_commands": pose_commands,
-            "last_actions": np.zeros((num_envs, self._num_action), dtype=np.float32),
-            "current_actions": np.zeros((num_envs, self._num_action), dtype=np.float32),
-            "ever_reached": np.zeros(num_envs, dtype=bool),
-            "min_distance": distance_to_target.copy(),  # Initialize minimum distance
-        }
-
-        return info
+        # Write episode-scoped state for the reset rows
+        self._pose_commands[rows] = pose_commands
+        self._last_actions[rows] = 0.0
+        self._current_actions[rows] = 0.0
+        self._ever_reached[rows] = False
+        self._min_distance[rows] = distance_to_target
 
     def _compute_projected_gravity(self, quat: np.ndarray) -> np.ndarray:
         gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)

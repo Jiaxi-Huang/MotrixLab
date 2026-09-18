@@ -102,9 +102,8 @@ class RslrlNpEnvWrap(VecEnv):
         obs = self._to_tensordict(state.obs)
 
         # Build extras dict (RSLRL calls it "extras" not "infos")
-        extras = {}
-        if "time_outs" in state.info:
-            extras["time_outs"] = torch.from_numpy(state.info["time_outs"]).to(self._device)
+        # time_outs: rows truncated without failing, for value bootstrapping.
+        extras = {"time_outs": torch.from_numpy(state.truncated & ~state.terminated).to(self._device)}
 
         return obs, rewards, dones, extras
 

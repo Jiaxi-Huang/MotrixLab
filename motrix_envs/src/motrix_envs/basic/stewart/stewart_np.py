@@ -165,6 +165,39 @@ class StewartEnv(DirectEnv):
         self._top_connect_offsets = np.asarray(top_connect_offsets, dtype=np.float32)
         self._leg_length_init = np.asarray(leg_length_init, dtype=np.float32)
 
+        # Episode-scoped task state: full-batch buffers, reset writes the done
+        # rows in place.
+        num_envs = self._num_envs
+        self._target_pos = np.zeros((num_envs, 3), dtype=np.float32)
+        self._target_quat = _identity_quat((num_envs,))
+        self._target_tilt_cmd = np.zeros((num_envs, 2), dtype=np.float32)
+        self._prev_rel = np.zeros((num_envs, 3), dtype=np.float32)
+        self._filtered_rel_vel = np.zeros((num_envs, 3), dtype=np.float32)
+        self._last_rel_vel = np.zeros((num_envs, 3), dtype=np.float32)
+        self._prev_top_quat = _identity_quat((num_envs,))
+        self._filtered_top_ang_vel = np.zeros((num_envs, 3), dtype=np.float32)
+        self._last_top_ang_vel = np.zeros((num_envs, 3), dtype=np.float32)
+        self._initial_rel_xy = np.zeros(num_envs, dtype=np.float32)
+        self._prev_zero_vel_rel_xy = np.zeros(num_envs, dtype=np.float32)
+        self._still_steps = np.zeros(num_envs, dtype=np.int32)
+        self._still_window_active = np.zeros(num_envs, dtype=bool)
+        self._policy_action = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+        self._prev_action_exec = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+        self._action_exec = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+        self._disturb_time = np.zeros(num_envs, dtype=np.float32)
+        self._disturb_pos = np.zeros((num_envs, 3), dtype=np.float32)
+        self._disturb_lin_vel = np.zeros((num_envs, 3), dtype=np.float32)
+        self._disturb_rot_deg = np.zeros((num_envs, 2), dtype=np.float32)
+        self._disturb_ang_vel_deg = np.zeros((num_envs, 2), dtype=np.float32)
+        self._disturb_pos_alpha = np.ones((num_envs, 3), dtype=np.float32)
+        self._disturb_pos_limit_scale = np.ones((num_envs, 3), dtype=np.float32)
+        self._disturb_pos_noise_scale = np.zeros((num_envs, 3), dtype=np.float32)
+        self._disturb_pos_jitter_scale = np.zeros((num_envs, 3), dtype=np.float32)
+        self._disturb_rot_alpha = np.ones((num_envs, 2), dtype=np.float32)
+        self._disturb_rot_limit_scale = np.ones((num_envs, 2), dtype=np.float32)
+        self._disturb_rot_noise_scale = np.zeros((num_envs, 2), dtype=np.float32)
+        self._disturb_rot_jitter_scale = np.zeros((num_envs, 2), dtype=np.float32)
+
     @property
     def observation_space(self) -> gym.spaces.Box:
         return self._observation_space
@@ -174,18 +207,14 @@ class StewartEnv(DirectEnv):
         return self._action_space
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState) -> ArrayEnvState:
-        state.info["policy_action"] = _normalize_actions(actions, self._num_envs, self._action_dim)
+        self._policy_action[:] = _normalize_actions(actions, self._num_envs, self._action_dim)
         return state
 
-    def _smooth_actions(self, raw_actions: np.ndarray, info: dict) -> tuple[np.ndarray, np.ndarray]:
-        prev_action = info["prev_action_exec"].astype(np.float32)
+    def _smooth_actions(self, raw_actions: np.ndarray) -> None:
         alpha = float(self._cfg.action_smooth)
-        action_exec = alpha * raw_actions + (1.0 - alpha) * prev_action
-        action_delta = action_exec - prev_action
-        info["prev_action_exec"] = action_exec.astype(np.float32)
-        info["action_exec"] = action_exec.astype(np.float32)
-        info["action_delta"] = action_delta.astype(np.float32)
-        return info["action_exec"], info["action_delta"]
+        action_exec = (alpha * raw_actions + (1.0 - alpha) * self._prev_action_exec).astype(np.float32)
+        self._prev_action_exec[:] = action_exec
+        self._action_exec[:] = action_exec
 
     def _write_body_state(
         self,
@@ -234,7 +263,7 @@ class StewartEnv(DirectEnv):
         ctrl[:] = ctrls
         self._ctrl_writes.execute()
 
-    def _apply_pose_delta(self, info: dict, actions: np.ndarray) -> None:
+    def _apply_pose_delta(self, actions: np.ndarray) -> None:
         rel_xy_now = self._compute_rel_xy(slice(None))
         if self._cfg.center_control_radius > 0.0 and self._cfg.center_control_min_gain < 1.0:
             ratio = np.clip(rel_xy_now / max(self._cfg.center_control_radius, 1e-6), 0.0, 1.0)
@@ -253,39 +282,38 @@ class StewartEnv(DirectEnv):
             target_euler_rad[..., 0], target_euler_rad[..., 1], target_euler_rad[..., 2]
         ).astype(np.float32)
 
-        info["target_pos"] = target_pos
-        info["target_quat"] = target_quat.astype(np.float32)
-        info["target_tilt_cmd"] = target_tilt_cmd
+        self._target_pos[:] = target_pos
+        self._target_quat[:] = target_quat
+        self._target_tilt_cmd[:] = target_tilt_cmd
 
-    def _clear_disturbance_state(self, info: dict) -> None:
-        num = info["target_pos"].shape[0]
-        info["disturb_time"] = np.zeros((num,), dtype=np.float32)
-        info["disturb_pos"] = np.zeros((num, 3), dtype=np.float32)
-        info["disturb_lin_vel"] = np.zeros((num, 3), dtype=np.float32)
-        info["disturb_rot_deg"] = np.zeros((num, 2), dtype=np.float32)
-        info["disturb_ang_vel_deg"] = np.zeros((num, 2), dtype=np.float32)
-        info["_disturb_pos_alpha"] = np.ones((num, 3), dtype=np.float32)
-        info["_disturb_pos_limit_scale"] = np.ones((num, 3), dtype=np.float32)
-        info["_disturb_pos_noise_scale"] = np.zeros((num, 3), dtype=np.float32)
-        info["_disturb_pos_jitter_scale"] = np.zeros((num, 3), dtype=np.float32)
-        info["_disturb_rot_alpha"] = np.ones((num, 2), dtype=np.float32)
-        info["_disturb_rot_limit_scale"] = np.ones((num, 2), dtype=np.float32)
-        info["_disturb_rot_noise_scale"] = np.zeros((num, 2), dtype=np.float32)
-        info["_disturb_rot_jitter_scale"] = np.zeros((num, 2), dtype=np.float32)
+    def _clear_disturbance_state(self, env_ids: np.ndarray) -> None:
+        self._disturb_time[env_ids] = 0.0
+        self._disturb_pos[env_ids] = 0.0
+        self._disturb_lin_vel[env_ids] = 0.0
+        self._disturb_rot_deg[env_ids] = 0.0
+        self._disturb_ang_vel_deg[env_ids] = 0.0
+        self._disturb_pos_alpha[env_ids] = 1.0
+        self._disturb_pos_limit_scale[env_ids] = 1.0
+        self._disturb_pos_noise_scale[env_ids] = 0.0
+        self._disturb_pos_jitter_scale[env_ids] = 0.0
+        self._disturb_rot_alpha[env_ids] = 1.0
+        self._disturb_rot_limit_scale[env_ids] = 1.0
+        self._disturb_rot_noise_scale[env_ids] = 0.0
+        self._disturb_rot_jitter_scale[env_ids] = 0.0
 
-    def _reset_episode_disturbance(self, info: dict) -> None:
-        self._clear_disturbance_state(info)
+    def _reset_episode_disturbance(self, env_ids: np.ndarray) -> None:
+        self._clear_disturbance_state(env_ids)
         if (not self._cfg.disturbance_enabled) or self._cfg.disturbance_scale <= 0.0:
             return
 
-        num = info["target_pos"].shape[0]
+        num = len(env_ids)
         freq_min = max(1e-4, float(self._cfg.disturb_freq_min_hz))
         freq_max = max(freq_min, float(self._cfg.disturb_freq_max_hz))
 
         pos_freq = np.random.uniform(freq_min, freq_max, size=(num, 3)).astype(np.float32)
         rot_freq = np.random.uniform(freq_min, freq_max, size=(num, 2)).astype(np.float32)
-        info["_disturb_pos_alpha"] = np.exp(-2.0 * np.pi * pos_freq * self._cfg.ctrl_dt).astype(np.float32)
-        info["_disturb_rot_alpha"] = np.exp(-2.0 * np.pi * rot_freq * self._cfg.ctrl_dt).astype(np.float32)
+        self._disturb_pos_alpha[env_ids] = np.exp(-2.0 * np.pi * pos_freq * self._cfg.ctrl_dt).astype(np.float32)
+        self._disturb_rot_alpha[env_ids] = np.exp(-2.0 * np.pi * rot_freq * self._cfg.ctrl_dt).astype(np.float32)
         pos_limit_scale = np.ones((num, 3), dtype=np.float32)
         if self._cfg.disturb_pos_xy_max > 0.0:
             xy_min_ratio = np.clip(
@@ -296,27 +324,27 @@ class StewartEnv(DirectEnv):
             pos_limit_scale[:, :2] = np.random.uniform(xy_min_ratio, 1.00, size=(num, 2)).astype(np.float32)
         if self._cfg.disturb_pos_z_max > 0.0:
             pos_limit_scale[:, 2] = np.random.uniform(0.75, 1.00, size=(num,)).astype(np.float32)
-        info["_disturb_pos_limit_scale"] = pos_limit_scale
-        info["_disturb_rot_limit_scale"] = np.random.uniform(0.75, 1.00, size=(num, 2)).astype(np.float32)
-        info["_disturb_pos_noise_scale"] = np.random.uniform(0.35, 0.60, size=(num, 3)).astype(np.float32)
-        info["_disturb_rot_noise_scale"] = np.random.uniform(0.35, 0.60, size=(num, 2)).astype(np.float32)
-        info["_disturb_pos_jitter_scale"] = np.random.uniform(0.02, 0.06, size=(num, 3)).astype(np.float32)
-        info["_disturb_rot_jitter_scale"] = np.random.uniform(0.03, 0.08, size=(num, 2)).astype(np.float32)
+        self._disturb_pos_limit_scale[env_ids] = pos_limit_scale
+        self._disturb_rot_limit_scale[env_ids] = np.random.uniform(0.75, 1.00, size=(num, 2)).astype(np.float32)
+        self._disturb_pos_noise_scale[env_ids] = np.random.uniform(0.35, 0.60, size=(num, 3)).astype(np.float32)
+        self._disturb_rot_noise_scale[env_ids] = np.random.uniform(0.35, 0.60, size=(num, 2)).astype(np.float32)
+        self._disturb_pos_jitter_scale[env_ids] = np.random.uniform(0.02, 0.06, size=(num, 3)).astype(np.float32)
+        self._disturb_rot_jitter_scale[env_ids] = np.random.uniform(0.03, 0.08, size=(num, 2)).astype(np.float32)
 
-    def _update_disturbance_state(self, info: dict, advance: bool) -> None:
-        num = info["target_pos"].shape[0]
+    def _update_disturbance_state(self, advance: bool) -> None:
+        num = self._num_envs
         if advance:
-            info["disturb_time"] = info["disturb_time"] + self._cfg.ctrl_dt
+            self._disturb_time += self._cfg.ctrl_dt
         if (not self._cfg.disturbance_enabled) or self._cfg.disturbance_scale <= 0.0:
-            info["disturb_pos"] = np.zeros((num, 3), dtype=np.float32)
-            info["disturb_lin_vel"] = np.zeros((num, 3), dtype=np.float32)
-            info["disturb_rot_deg"] = np.zeros((num, 2), dtype=np.float32)
-            info["disturb_ang_vel_deg"] = np.zeros((num, 2), dtype=np.float32)
+            self._disturb_pos[:] = 0.0
+            self._disturb_lin_vel[:] = 0.0
+            self._disturb_rot_deg[:] = 0.0
+            self._disturb_ang_vel_deg[:] = 0.0
             return
 
         ramp = np.ones((num,), dtype=np.float32)
         if self._cfg.disturb_ramp_seconds > 1e-8:
-            ramp = np.clip(info["disturb_time"] / self._cfg.disturb_ramp_seconds, 0.0, 1.0).astype(np.float32)
+            ramp = np.clip(self._disturb_time / self._cfg.disturb_ramp_seconds, 0.0, 1.0).astype(np.float32)
 
         base_pos_limit = self._cfg.disturbance_scale * np.array(
             [self._cfg.disturb_pos_xy_max, self._cfg.disturb_pos_xy_max, self._cfg.disturb_pos_z_max],
@@ -326,39 +354,40 @@ class StewartEnv(DirectEnv):
             [self._cfg.disturb_rot_max_deg, self._cfg.disturb_rot_max_deg],
             dtype=np.float32,
         )
-        pos_limit = ramp[:, None] * base_pos_limit[None, :] * info["_disturb_pos_limit_scale"]
-        rot_limit = ramp[:, None] * base_rot_limit[None, :] * info["_disturb_rot_limit_scale"]
-        pos_noise_std = ramp[:, None] * base_pos_limit[None, :] * info["_disturb_pos_noise_scale"]
-        rot_noise_std = ramp[:, None] * base_rot_limit[None, :] * info["_disturb_rot_noise_scale"]
-        pos_jitter_std = ramp[:, None] * base_pos_limit[None, :] * info["_disturb_pos_jitter_scale"]
-        rot_jitter_std = ramp[:, None] * base_rot_limit[None, :] * info["_disturb_rot_jitter_scale"]
+        pos_limit = ramp[:, None] * base_pos_limit[None, :] * self._disturb_pos_limit_scale
+        rot_limit = ramp[:, None] * base_rot_limit[None, :] * self._disturb_rot_limit_scale
+        pos_noise_std = ramp[:, None] * base_pos_limit[None, :] * self._disturb_pos_noise_scale
+        rot_noise_std = ramp[:, None] * base_rot_limit[None, :] * self._disturb_rot_noise_scale
+        pos_jitter_std = ramp[:, None] * base_pos_limit[None, :] * self._disturb_pos_jitter_scale
+        rot_jitter_std = ramp[:, None] * base_rot_limit[None, :] * self._disturb_rot_jitter_scale
 
-        prev_pos = info["disturb_pos"].copy()
-        prev_rot = info["disturb_rot_deg"].copy()
+        prev_pos = self._disturb_pos.copy()
+        prev_rot = self._disturb_rot_deg.copy()
         pos_noise = np.random.standard_normal((num, 3)).astype(np.float32)
         rot_noise = np.random.standard_normal((num, 2)).astype(np.float32)
         pos_jitter = np.random.standard_normal((num, 3)).astype(np.float32)
         rot_jitter = np.random.standard_normal((num, 2)).astype(np.float32)
-        pos_blend = np.sqrt(np.maximum(1.0 - info["_disturb_pos_alpha"] ** 2, 0.0)).astype(np.float32)
-        rot_blend = np.sqrt(np.maximum(1.0 - info["_disturb_rot_alpha"] ** 2, 0.0)).astype(np.float32)
+        pos_blend = np.sqrt(np.maximum(1.0 - self._disturb_pos_alpha**2, 0.0)).astype(np.float32)
+        rot_blend = np.sqrt(np.maximum(1.0 - self._disturb_rot_alpha**2, 0.0)).astype(np.float32)
 
         disturb_pos = (
-            info["_disturb_pos_alpha"] * prev_pos + pos_blend * pos_noise_std * pos_noise + pos_jitter_std * pos_jitter
+            self._disturb_pos_alpha * prev_pos + pos_blend * pos_noise_std * pos_noise + pos_jitter_std * pos_jitter
         )
         disturb_rot_deg = (
-            info["_disturb_rot_alpha"] * prev_rot + rot_blend * rot_noise_std * rot_noise + rot_jitter_std * rot_jitter
+            self._disturb_rot_alpha * prev_rot + rot_blend * rot_noise_std * rot_noise + rot_jitter_std * rot_jitter
         )
         disturb_pos = np.clip(disturb_pos, -pos_limit, pos_limit)
         disturb_rot_deg = np.clip(disturb_rot_deg, -rot_limit, rot_limit)
 
-        info["disturb_pos"] = disturb_pos.astype(np.float32)
-        info["disturb_rot_deg"] = disturb_rot_deg.astype(np.float32)
-        info["disturb_lin_vel"] = ((disturb_pos - prev_pos) / max(self._cfg.ctrl_dt, 1e-8)).astype(np.float32)
-        info["disturb_ang_vel_deg"] = ((disturb_rot_deg - prev_rot) / max(self._cfg.ctrl_dt, 1e-8)).astype(np.float32)
+        self._disturb_pos[:] = disturb_pos.astype(np.float32)
+        self._disturb_rot_deg[:] = disturb_rot_deg.astype(np.float32)
+        self._disturb_lin_vel[:] = ((disturb_pos - prev_pos) / max(self._cfg.ctrl_dt, 1e-8)).astype(np.float32)
+        self._disturb_ang_vel_deg[:] = ((disturb_rot_deg - prev_rot) / max(self._cfg.ctrl_dt, 1e-8)).astype(np.float32)
 
-    def _apply_disturbance_to_stage(self, env_ids: np.ndarray, info: dict) -> None:
+    def _apply_disturbance_to_stage(self, env_ids: np.ndarray) -> None:
+        num = len(env_ids)
         disturb_rot_deg = np.concatenate(
-            [info["disturb_rot_deg"], np.zeros((info["target_pos"].shape[0], 1), dtype=np.float32)],
+            [self._disturb_rot_deg[env_ids], np.zeros((num, 1), dtype=np.float32)],
             axis=-1,
         )
         disturb_rot_rad = np.deg2rad(disturb_rot_deg).astype(np.float32)
@@ -379,10 +408,10 @@ class StewartEnv(DirectEnv):
         stage_quat = quaternion.from_euler(
             stage_euler_rad[..., 0], stage_euler_rad[..., 1], stage_euler_rad[..., 2]
         ).astype(np.float32)
-        stage_pos = self._stage_pos_init[None, :] + info["disturb_pos"]
+        stage_pos = self._stage_pos_init[None, :] + self._disturb_pos[env_ids]
         stage_ang_vel = np.deg2rad(
             np.concatenate(
-                [info["disturb_ang_vel_deg"], np.zeros((info["target_pos"].shape[0], 1), dtype=np.float32)],
+                [self._disturb_ang_vel_deg[env_ids], np.zeros((num, 1), dtype=np.float32)],
                 axis=-1,
             )
         ).astype(np.float32)
@@ -391,32 +420,32 @@ class StewartEnv(DirectEnv):
             env_ids,
             stage_pos,
             stage_quat,
-            info["disturb_lin_vel"],
+            self._disturb_lin_vel[env_ids],
             stage_ang_vel,
         )
 
-    def _get_disturbance_obs(self, info: dict) -> np.ndarray | None:
+    def _get_disturbance_obs(self) -> np.ndarray | None:
         if not (self._cfg.disturbance_enabled and self._cfg.disturbance_include_obs):
             return None
         rot_obs_scale = max(float(self._cfg.disturb_rot_limit_deg), 1e-6)
         ang_vel_obs_scale = max(float(self._cfg.disturb_ang_vel_obs_scale_deg_per_s), 1e-6)
         return np.concatenate(
             [
-                info["disturb_pos"],
-                info["disturb_lin_vel"],
-                info["disturb_rot_deg"] / rot_obs_scale,
-                info["disturb_ang_vel_deg"] / ang_vel_obs_scale,
+                self._disturb_pos,
+                self._disturb_lin_vel,
+                self._disturb_rot_deg / rot_obs_scale,
+                self._disturb_ang_vel_deg / ang_vel_obs_scale,
             ],
             axis=-1,
         ).astype(np.float32)
 
-    def _update_ball_kinematics(self, info: dict) -> dict[str, np.ndarray]:
+    def _update_ball_kinematics(self) -> dict[str, np.ndarray]:
         """Advance the ball-on-platform state estimates for the full batch.
 
         Reads fresh simulator quantities (already refreshed by the
         ``sim_data.execute()`` at the top of ``compute_transition``), updates
-        the filtered velocity estimates tracked in ``info``, and returns the
-        physical quantities shared by reward and termination.
+        the filtered velocity estimates tracked on the instance, and returns
+        the physical quantities shared by reward and termination.
         """
         inputs = self.sim_data
         top_pos = inputs["top_pos"]
@@ -425,20 +454,20 @@ class StewartEnv(DirectEnv):
 
         quat_flat, rel_flat, rel_shape = _broadcast_quat_vec(top_quat, ball_pos - top_pos)
         rel = quaternion.rotate_inverse(quat_flat, rel_flat).reshape(*rel_shape, 3).astype(np.float32)
-        rel_vel = (rel - info["prev_rel"]) / self._cfg.ctrl_dt
-        info["prev_rel"] = rel.copy()
-        filtered_rel_vel = self._cfg.vel_smooth * rel_vel + (1.0 - self._cfg.vel_smooth) * info["filtered_rel_vel"]
-        info["filtered_rel_vel"] = filtered_rel_vel.astype(np.float32)
-        info["last_rel_vel"] = filtered_rel_vel.astype(np.float32)
+        rel_vel = (rel - self._prev_rel) / self._cfg.ctrl_dt
+        self._prev_rel[:] = rel
+        filtered_rel_vel = self._cfg.vel_smooth * rel_vel + (1.0 - self._cfg.vel_smooth) * self._filtered_rel_vel
+        self._filtered_rel_vel[:] = filtered_rel_vel.astype(np.float32)
+        self._last_rel_vel[:] = filtered_rel_vel.astype(np.float32)
 
-        quat_delta = quaternion.mul(top_quat, quaternion.conjugate(info["prev_top_quat"])).astype(np.float32)
+        quat_delta = quaternion.mul(top_quat, quaternion.conjugate(self._prev_top_quat)).astype(np.float32)
         top_ang_vel = _quat_to_rotvec(quat_delta) / self._cfg.ctrl_dt
         filtered_top_ang_vel = (
-            self._cfg.vel_smooth * top_ang_vel + (1.0 - self._cfg.vel_smooth) * info["filtered_top_ang_vel"]
+            self._cfg.vel_smooth * top_ang_vel + (1.0 - self._cfg.vel_smooth) * self._filtered_top_ang_vel
         )
-        info["filtered_top_ang_vel"] = filtered_top_ang_vel.astype(np.float32)
-        info["last_top_ang_vel"] = filtered_top_ang_vel.astype(np.float32)
-        info["prev_top_quat"] = top_quat.astype(np.float32)
+        self._filtered_top_ang_vel[:] = filtered_top_ang_vel.astype(np.float32)
+        self._last_top_ang_vel[:] = filtered_top_ang_vel.astype(np.float32)
+        self._prev_top_quat[:] = top_quat.astype(np.float32)
 
         roll_rad, pitch_rad, _ = quaternion.get_euler_xyz(top_quat)
         roll_deg = np.rad2deg(roll_rad).astype(np.float32)
@@ -450,42 +479,40 @@ class StewartEnv(DirectEnv):
             "tilt_deg": np.maximum(np.abs(roll_deg), np.abs(pitch_deg)).astype(np.float32),
         }
 
-    def _prepare_control_step(self, info: dict) -> None:
-        raw_action = np.asarray(info["policy_action"], dtype=np.float32)
-        action_exec, _ = self._smooth_actions(raw_action, info)
-        self._apply_pose_delta(info, action_exec)
-        self._update_disturbance_state(info, advance=True)
+    def _prepare_control_step(self) -> None:
+        self._smooth_actions(self._policy_action)
+        self._apply_pose_delta(self._action_exec)
+        self._update_disturbance_state(advance=True)
         all_ids = np.arange(self._num_envs, dtype=np.int64)
-        self._apply_disturbance_to_stage(all_ids, info)
+        self._apply_disturbance_to_stage(all_ids)
         self.sim_data.execute(all_ids)
         ctrl = self._ctrl_writes.buffer("ctrl")
-        ctrl[:] = self._compute_leg_ctrls(slice(None), info["target_pos"], info["target_quat"])
+        ctrl[:] = self._compute_leg_ctrls(slice(None), self._target_pos, self._target_quat)
         self._ctrl_writes.execute()
 
-    def _simulate_control_step(self, info: dict) -> None:
+    def _simulate_control_step(self) -> None:
         all_ids = np.arange(self._num_envs, dtype=np.int64)
         for _ in range(self._cfg.sim_substeps):
-            self._apply_disturbance_to_stage(all_ids, info)
+            self._apply_disturbance_to_stage(all_ids)
             self.sim.step(1)
 
-        self._apply_disturbance_to_stage(all_ids, info)
+        self._apply_disturbance_to_stage(all_ids)
 
     def physics_step(self) -> None:
         # Stewart interleaves floating-base disturbance writes with per-substep
         # physics and FK-refreshed leg reads, so it owns the whole control step;
         # the post-step simulator refresh happens in compute_transition.
-        info = self._state.info
-        self._prepare_control_step(info)
-        self._simulate_control_step(info)
+        self._prepare_control_step()
+        self._simulate_control_step()
 
-    def _update_stillness(self, info: dict, rel_xy: np.ndarray, vel_xy: np.ndarray) -> np.ndarray:
+    def _update_stillness(self, rel_xy: np.ndarray, vel_xy: np.ndarray) -> np.ndarray:
         still_xy_enter = float(self._cfg.still_xy)
         still_vel_enter = float(self._cfg.still_vel)
         still_xy_exit = float(self._cfg.still_xy * self._cfg.still_xy_hysteresis)
         still_vel_exit = float(self._cfg.still_vel * self._cfg.still_vel_hysteresis)
 
-        still_window_active = info["still_window_active"].copy()
-        still_steps = info["still_steps"].copy()
+        still_window_active = self._still_window_active
+        still_steps = self._still_steps
 
         keep_mask = still_window_active & (rel_xy <= still_xy_exit) & (vel_xy <= still_vel_exit)
         break_mask = still_window_active & ~keep_mask
@@ -499,27 +526,22 @@ class StewartEnv(DirectEnv):
         still_steps[enter_mask] = 1
         still_steps[idle_mask] = 0
 
-        info["still_window_active"] = still_window_active
-        info["still_steps"] = still_steps
         return still_steps
 
     def compute_observation(self, state: ArrayEnvState) -> ArrayEnvState:
-        info = state.info
         inputs = self.sim_data
         top_quat = _normalize_quat(inputs["top_quat"])
 
         roll_rad, pitch_rad, _ = quaternion.get_euler_xyz(top_quat)
         roll_deg = np.rad2deg(roll_rad).astype(np.float32)
         pitch_deg = np.rad2deg(pitch_rad).astype(np.float32)
-        quat_flat, ang_vel_flat, ang_vel_shape = _broadcast_quat_vec(
-            top_quat, info["filtered_top_ang_vel"].astype(np.float32)
-        )
+        quat_flat, ang_vel_flat, ang_vel_shape = _broadcast_quat_vec(top_quat, self._filtered_top_ang_vel)
         top_ang_vel_local = (
             quaternion.rotate_inverse(quat_flat, ang_vel_flat).reshape(*ang_vel_shape, 3).astype(np.float32)
         )
         obs_parts = [
-            info["prev_rel"].astype(np.float32),
-            info["filtered_rel_vel"].astype(np.float32),
+            self._prev_rel,
+            self._filtered_rel_vel,
             np.stack(
                 [
                     roll_deg / self._cfg.target_rotation_limit_deg,
@@ -528,26 +550,25 @@ class StewartEnv(DirectEnv):
                 axis=-1,
             ).astype(np.float32),
             top_ang_vel_local.astype(np.float32),
-            (info["target_tilt_cmd"] / max(self._cfg.target_rotation_limit_deg, 1e-6)).astype(np.float32),
-            info["action_exec"].astype(np.float32),
+            (self._target_tilt_cmd / max(self._cfg.target_rotation_limit_deg, 1e-6)).astype(np.float32),
+            self._action_exec,
         ]
-        disturb_obs = self._get_disturbance_obs(info)
+        disturb_obs = self._get_disturbance_obs()
         if disturb_obs is not None:
             obs_parts.append(disturb_obs)
         return state.replace(obs=np.concatenate(obs_parts, axis=-1).astype(np.float32))
 
     def compute_transition(self, state: ArrayEnvState) -> ArrayEnvState:
         self.sim_data.execute()
-        info = state.info
-        state_cache = self._update_ball_kinematics(info)
+        state_cache = self._update_ball_kinematics()
 
         top_pos = state_cache["top_pos"]
         ball_pos = state_cache["ball_pos"]
         rel_xy = state_cache["rel_xy"]
         tilt_deg = state_cache["tilt_deg"]
 
-        rel_vel = info["last_rel_vel"].astype(np.float32)
-        top_ang_vel = info["last_top_ang_vel"].astype(np.float32)
+        rel_vel = self._last_rel_vel
+        top_ang_vel = self._last_top_ang_vel
         vel_xy = np.linalg.norm(rel_vel[:, :2], axis=-1).astype(np.float32)
         top_ang_mag = np.linalg.norm(top_ang_vel, axis=-1).astype(np.float32)
 
@@ -557,9 +578,8 @@ class StewartEnv(DirectEnv):
         center_score = np.clip(1.0 - rel_xy / max(self._cfg.platform_radius, 1e-6), 0.0, 1.0).astype(np.float32)
         term_center = (self._cfg.k_center * center_score).astype(np.float32)
 
-        prev_zero_vel_rel_xy = info["prev_zero_vel_rel_xy"].astype(np.float32)
-        initial_rel_xy = info["initial_rel_xy"].astype(np.float32)
-        zero_reference = np.where(np.isfinite(prev_zero_vel_rel_xy), prev_zero_vel_rel_xy, initial_rel_xy)
+        prev_zero_vel_rel_xy = self._prev_zero_vel_rel_xy
+        zero_reference = np.where(np.isfinite(prev_zero_vel_rel_xy), prev_zero_vel_rel_xy, self._initial_rel_xy)
         zero_event = vel_xy <= self._cfg.zero_vel_thresh
         zero_closer_mask = zero_event & (rel_xy < zero_reference)
         zero_improve = np.maximum(zero_reference - rel_xy, 0.0)
@@ -568,11 +588,9 @@ class StewartEnv(DirectEnv):
             np.float32
         )
 
-        next_prev_zero = prev_zero_vel_rel_xy.copy()
-        next_prev_zero[zero_event] = rel_xy[zero_event]
-        info["prev_zero_vel_rel_xy"] = next_prev_zero.astype(np.float32)
+        self._prev_zero_vel_rel_xy[zero_event] = rel_xy[zero_event]
 
-        still_steps = self._update_stillness(info, rel_xy, vel_xy)
+        still_steps = self._update_stillness(rel_xy, vel_xy)
         success = still_steps >= self._cfg.still_steps_needed
         term_still_bonus = np.where(success, self._cfg.k_still, 0.0).astype(np.float32)
 
@@ -582,11 +600,12 @@ class StewartEnv(DirectEnv):
         reward = np.where(fallen, self._cfg.fall_penalty, reward).astype(np.float32)
         term_terminal[fallen] = self._cfg.fall_penalty
 
+        # Timeout flag for logging only; the framework owns truncation via its
+        # terminated/truncated bookkeeping.
         timeout = np.zeros((self._num_envs,), dtype=bool)
         if self._cfg.max_episode_steps is not None and self._cfg.max_episode_steps > 0:
             timeout = (state.episode_steps + 1) >= self._cfg.max_episode_steps
             timeout &= ~(fallen | success)
-        state.info["time_outs"] = timeout.astype(np.float32)
 
         terminated = (fallen | success).astype(bool)
 
@@ -599,10 +618,10 @@ class StewartEnv(DirectEnv):
             "success": success.astype(np.float32),
             "fallen": fallen.astype(np.float32),
             "timeout": timeout.astype(np.float32),
-            "disturb_pos_norm": np.linalg.norm(info["disturb_pos"], axis=-1).astype(np.float32),
-            "disturb_rot_norm_deg": np.linalg.norm(info["disturb_rot_deg"], axis=-1).astype(np.float32),
+            "disturb_pos_norm": np.linalg.norm(self._disturb_pos, axis=-1).astype(np.float32),
+            "disturb_rot_norm_deg": np.linalg.norm(self._disturb_rot_deg, axis=-1).astype(np.float32),
         }
-        state.info["Reward"] = {
+        state.reward_terms = {
             "center": term_center.astype(np.float32),
             "zero_vel_reference": zero_reference.astype(np.float32),
             "zero_vel_improve": zero_improve.astype(np.float32),
@@ -613,10 +632,9 @@ class StewartEnv(DirectEnv):
 
         return state.replace(reward=reward, terminated=terminated)
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num = len(env_ids)
         row_ids = np.asarray(env_ids, dtype=np.int64)
-        zeros2 = np.zeros((num, 2), dtype=np.float32)
         zeros3 = np.zeros((num, 3), dtype=np.float32)
 
         roll_deg = np.random.uniform(self._cfg.min_init_tilt_deg, self._cfg.init_tilt_deg, size=(num,)).astype(
@@ -637,27 +655,20 @@ class StewartEnv(DirectEnv):
             target_euler_rad[..., 0], target_euler_rad[..., 1], target_euler_rad[..., 2]
         ).astype(np.float32)
 
-        info = {
-            "target_pos": target_pos.copy(),
-            "target_quat": target_quat.copy(),
-            "target_tilt_cmd": np.stack([roll_deg, pitch_deg], axis=-1).astype(np.float32),
-            "prev_rel": np.zeros((num, 3), dtype=np.float32),
-            "filtered_rel_vel": np.zeros((num, 3), dtype=np.float32),
-            "last_rel_vel": np.zeros((num, 3), dtype=np.float32),
-            "prev_top_quat": _identity_quat((num,)),
-            "filtered_top_ang_vel": np.zeros((num, 3), dtype=np.float32),
-            "last_top_ang_vel": np.zeros((num, 3), dtype=np.float32),
-            "initial_rel_xy": np.zeros((num,), dtype=np.float32),
-            "prev_zero_vel_rel_xy": np.zeros((num,), dtype=np.float32),
-            "still_steps": np.zeros((num,), dtype=np.int32),
-            "still_window_active": np.zeros((num,), dtype=bool),
-            "policy_action": zeros2.copy(),
-            "prev_action_exec": zeros2.copy(),
-            "action_exec": zeros2.copy(),
-            "action_delta": zeros2.copy(),
-            "time_outs": np.zeros((num,), dtype=np.float32),
-        }
-        self._clear_disturbance_state(info)
+        # Write episode-scoped state for the reset rows
+        self._target_pos[env_ids] = target_pos
+        self._target_quat[env_ids] = target_quat
+        self._target_tilt_cmd[env_ids] = np.stack([roll_deg, pitch_deg], axis=-1)
+        self._prev_rel[env_ids] = 0.0
+        self._filtered_rel_vel[env_ids] = 0.0
+        self._last_rel_vel[env_ids] = 0.0
+        self._filtered_top_ang_vel[env_ids] = 0.0
+        self._last_top_ang_vel[env_ids] = 0.0
+        self._still_steps[env_ids] = 0
+        self._still_window_active[env_ids] = False
+        self._policy_action[env_ids] = 0.0
+        self._prev_action_exec[env_ids] = 0.0
+        self._action_exec[env_ids] = 0.0
 
         stage_pose = np.concatenate(
             [np.tile(self._stage_pos_init, (num, 1)), _normalize_quat(np.tile(self._stage_quat_init, (num, 1)))],
@@ -681,7 +692,7 @@ class StewartEnv(DirectEnv):
         # lengths follow analytically from the refreshed geometry — reset
         # never advances physics.
         self.sim_data.execute(row_ids)
-        leg_lengths = self._compute_leg_ctrls(env_ids, info["target_pos"], info["target_quat"])
+        leg_lengths = self._compute_leg_ctrls(env_ids, target_pos, target_quat)
         self._reset_program.buffer("legs_position")[env_ids] = leg_lengths
         self._reset_program.execute(env_ids)
 
@@ -709,15 +720,15 @@ class StewartEnv(DirectEnv):
 
         ball_pos = self.sim_data["ball_pos"][env_ids]
         top_pos = self.sim_data["top_pos"][env_ids]
-        info["prev_top_quat"] = _normalize_quat(self.sim_data["top_quat"][env_ids])
-        quat_flat, rel_flat, rel_shape = _broadcast_quat_vec(info["prev_top_quat"], ball_pos - top_pos)
-        info["prev_rel"] = quaternion.rotate_inverse(quat_flat, rel_flat).reshape(*rel_shape, 3).astype(np.float32)
+        self._prev_top_quat[env_ids] = _normalize_quat(self.sim_data["top_quat"][env_ids])
+        quat_flat, rel_flat, rel_shape = _broadcast_quat_vec(self._prev_top_quat[env_ids], ball_pos - top_pos)
+        self._prev_rel[env_ids] = (
+            quaternion.rotate_inverse(quat_flat, rel_flat).reshape(*rel_shape, 3).astype(np.float32)
+        )
         initial_rel_xy = self._compute_rel_xy(env_ids)
-        info["initial_rel_xy"] = initial_rel_xy.astype(np.float32)
-        info["prev_zero_vel_rel_xy"] = initial_rel_xy.astype(np.float32)
+        self._initial_rel_xy[env_ids] = initial_rel_xy
+        self._prev_zero_vel_rel_xy[env_ids] = initial_rel_xy
 
-        self._reset_episode_disturbance(info)
-        self._apply_disturbance_to_stage(env_ids, info)
+        self._reset_episode_disturbance(env_ids)
+        self._apply_disturbance_to_stage(env_ids)
         self.sim_data.execute(row_ids)
-
-        return info

@@ -149,7 +149,7 @@ class PointMassEnv(DirectEnv):
         state.terminated = terminated
         return state
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         num_reset = len(env_ids)
 
         # Random initial position within a range for the point mass (only x, y)
@@ -176,4 +176,3 @@ class PointMassEnv(DirectEnv):
         self._in_target_steps[env_ids] = 0
 
         self.sim_data.execute(np.asarray(env_ids, np.int64))
-        return {}

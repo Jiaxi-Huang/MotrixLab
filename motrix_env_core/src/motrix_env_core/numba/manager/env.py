@@ -685,10 +685,9 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             with self.perf.scope("select_done"):
                 np.putmask(state.episode_steps, done, 0)
         with self.perf.scope("reset_envs"):
-            info1 = self.reset(env_ids, sim_reset_ids)
-        self._merge_reset_info(state, info1, done)
+            self.reset(env_ids, sim_reset_ids)
 
-    def reset(self, env_ids: np.ndarray, sim_reset_ids: np.ndarray | None = None) -> dict[str, Any]:
+    def reset(self, env_ids: np.ndarray, sim_reset_ids: np.ndarray | None = None) -> None:
         """Reset episode lanes fully and sim-reset the rest in one pass.
 
         Episode lanes (``env_ids``) run the host lifecycle resets (command
@@ -717,7 +716,6 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             env_ids = np.concatenate([env_ids, sim_reset_ids])
         if env_ids.size:
             self._reset_sim_rows(env_ids, self._kernel_inputs)
-        return {}
 
     def _make_metrics_view(self) -> dict[str, Any]:
         """Assemble the persistent live metrics view for the current state.
@@ -815,7 +813,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         reward_terms = np.empty((self.num_envs, len(layout.rewards)), dtype=np.float32)
         weighted_reward_terms = np.empty_like(reward_terms)
         termination_masks = np.empty((self.num_envs, len(layout.terminations)), dtype=bool)
-        state.info["Reward"] = {term.name: weighted_reward_terms[:, term.index] for term in layout.rewards}
+        state.reward_terms = {term.name: weighted_reward_terms[:, term.index] for term in layout.rewards}
         buffers = (
             reward_terms,
             weighted_reward_terms,

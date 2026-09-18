@@ -77,10 +77,28 @@ class PegInsertEnv(DirectEnv):
         self.gripper_closed = self._cfg.action_config.gripper_closed
         self.gripper_open = self._cfg.action_config.gripper_open
 
+        # Episode-scoped task state: full-batch buffers, reset writes the done
+        # rows in place.
+        self._current_actions = np.zeros((num_envs, self._action_dim), dtype=np.float32)
+        self._last_actions = np.zeros_like(self._current_actions)
+        self._socket_pos = np.zeros((num_envs, 3), dtype=np.float32)
+        self._initial_peg_pos = np.zeros((num_envs, 3), dtype=np.float32)
+        self._current_gripper_action = np.zeros(num_envs, dtype=np.float32)
+        self._gripper_is_closed = np.zeros(num_envs, dtype=bool)
         self._grasp_success = np.zeros(num_envs, dtype=bool)
+        self._phase = np.zeros(num_envs, dtype=np.int32)
         self._prev_hand_to_peg_dist = np.zeros(num_envs, dtype=np.float32)
         self._prev_peg_to_socket_dist = np.zeros(num_envs, dtype=np.float32)
+        self._prev_gripper_closure = np.zeros(num_envs, dtype=np.float32)
+        self._prev_midpoint_xy_dist = np.zeros(num_envs, dtype=np.float32)
+        self._prev_pregrasp_height_error = np.zeros(num_envs, dtype=np.float32)
+        self._prev_peg_height = np.zeros(num_envs, dtype=np.float32)
+        self._prev_socket_xy_dist = np.zeros(num_envs, dtype=np.float32)
+        self._prev_insert_depth = np.zeros(num_envs, dtype=np.float32)
+        self._prev_socket_entry_gap = np.full(num_envs, 0.2, dtype=np.float32)
+        self._consecutive_capture_steps = np.zeros(num_envs, dtype=np.int32)
         self._consecutive_grasp_steps = np.zeros(num_envs, dtype=np.int32)
+        self._consecutive_pregrasp_open_steps = np.zeros(num_envs, dtype=np.int32)
 
     def _sample_peg_xy(self, socket_xy: np.ndarray) -> np.ndarray:
         peg_init = self._cfg.peg_init_config
@@ -133,8 +151,8 @@ class PegInsertEnv(DirectEnv):
         return self._action_space
 
     def apply_action(self, actions: np.ndarray, state: ArrayEnvState):
-        state.info["last_actions"] = state.info["current_actions"]
-        state.info["current_actions"] = actions.copy()
+        self._last_actions[:] = self._current_actions
+        self._current_actions[:] = actions
 
         old_joint_pos = self.get_dof_pos(slice(None))[:, : self._action_dim - 1]
 
@@ -181,13 +199,7 @@ class PegInsertEnv(DirectEnv):
 
         close_request = gripper_raw > 0.2
 
-        grasp_locked = state.info.get(
-            "grasp_success",
-            np.zeros(
-                actions.shape[0],
-                dtype=bool,
-            ),
-        )
+        grasp_locked = self._grasp_success
 
         gripper_is_closed = np.where(
             grasp_locked,
@@ -201,9 +213,8 @@ class PegInsertEnv(DirectEnv):
             self.gripper_open,
         ).astype(np.float32)
 
-        state.info["gripper_is_closed"] = gripper_is_closed.copy()
-
-        state.info["current_gripper_action"] = gripper_action.copy()
+        self._gripper_is_closed[:] = gripper_is_closed
+        self._current_gripper_action[:] = gripper_action
 
         new_pos = np.concatenate(
             [
@@ -229,11 +240,10 @@ class PegInsertEnv(DirectEnv):
         """Build the full observation batch from cached simulator data.
 
         Reads only the cache left by the last read-program execution in the
-        transition; never performs reads itself and never touches reward,
-        termination, or info.
+        transition; never performs reads itself and never touches reward or
+        termination.
         """
         rows = slice(None)
-        info = state.info
 
         dof_pos = self.get_dof_pos(rows)
         dof_vel = self.get_dof_vel(rows)
@@ -244,7 +254,7 @@ class PegInsertEnv(DirectEnv):
         peg_pos = inputs["peg_pos"][rows]
         peg_axis = quaternion.rotate_vector(inputs["peg_quat"][rows], np.array([0.0, 0.0, 1.0], dtype=np.float32))
 
-        socket_pos = info["socket_pos"]
+        socket_pos = self._socket_pos
 
         hand_pos = inputs["hand_pos"][rows]
         left_finger_pos = inputs["left_finger_pos"][rows]
@@ -270,8 +280,8 @@ class PegInsertEnv(DirectEnv):
         peg_to_socket_dist = np.linalg.norm(peg_to_socket, axis=-1, keepdims=True)
         peg_to_socket_dir = peg_to_socket / (peg_to_socket_dist + 1e-6)
 
-        gripper_state = info.get("current_gripper_action", np.zeros(peg_pos.shape[0], dtype=np.float32))
-        grasp_success = info.get("grasp_success", np.zeros(peg_pos.shape[0], dtype=bool)).astype(np.float32)
+        gripper_state = self._current_gripper_action
+        grasp_success = self._grasp_success.astype(np.float32)
         peg_to_socket_dir = peg_to_socket_dir * grasp_success[:, None]
         peg_to_socket_dist = peg_to_socket_dist * grasp_success[:, None]
 
@@ -326,7 +336,7 @@ class PegInsertEnv(DirectEnv):
 
         return state
 
-    def reset(self, env_ids):
+    def reset(self, env_ids) -> None:
         num_reset = len(env_ids)
         row_ids = np.asarray(env_ids, dtype=np.int64)
 
@@ -400,31 +410,28 @@ class PegInsertEnv(DirectEnv):
         gripper_closure = np.clip(-gripper_joint_pos / max(abs(self.gripper_closed), 1e-6), 0.0, 1.0)
         socket_xy_dist = np.linalg.norm(peg_pos[:, :2] - socket_pos[:, :2], axis=-1)
 
-        info = {
-            "current_actions": np.zeros((num_reset, self._action_dim), dtype=np.float32),
-            "last_actions": np.zeros((num_reset, self._action_dim), dtype=np.float32),
-            "socket_pos": socket_pos,
-            "initial_peg_pos": peg_pos.copy(),
-            "current_gripper_action": np.zeros(num_reset, dtype=np.float32),
-            "success": np.zeros(num_reset, dtype=bool),
-            "grasp_success": np.zeros(num_reset, dtype=bool),
-            "phase": np.zeros(num_reset, dtype=np.int32),
-            "prev_hand_to_peg_dist": np.linalg.norm(peg_pos - hand_pos, axis=-1),
-            "prev_peg_to_socket_dist": np.linalg.norm(peg_pos - socket_pos, axis=-1),
-            "prev_midpoint_xy_dist": midpoint_to_peg_xy_dist,
-            "prev_pregrasp_height_error": pregrasp_height_error,
-            "prev_peg_height": peg_pos[:, 2].copy(),
-            "prev_gripper_closure": gripper_closure.copy(),
-            "prev_socket_xy_dist": socket_xy_dist,
-            "prev_insert_depth": np.zeros(num_reset, dtype=np.float32),
-            "prev_socket_entry_gap": np.full(num_reset, 0.2, dtype=np.float32),
-            "consecutive_capture_steps": np.zeros(num_reset, dtype=np.int32),
-            "consecutive_grasp_steps": np.zeros(num_reset, dtype=np.int32),
-            "consecutive_pregrasp_open_steps": np.zeros(num_reset, dtype=np.int32),
-            "gripper_is_closed": np.zeros(num_reset, dtype=bool),
-        }
-
-        return info
+        # Seed the episode-scoped state buffers for the rows being reset; the
+        # step pipeline owns them afterwards (never per-step state).
+        self._current_actions[row_ids] = 0.0
+        self._last_actions[row_ids] = 0.0
+        self._socket_pos[row_ids] = socket_pos
+        self._initial_peg_pos[row_ids] = peg_pos
+        self._current_gripper_action[row_ids] = 0.0
+        self._gripper_is_closed[row_ids] = False
+        self._grasp_success[row_ids] = False
+        self._phase[row_ids] = 0
+        self._prev_hand_to_peg_dist[row_ids] = np.linalg.norm(peg_pos - hand_pos, axis=-1)
+        self._prev_peg_to_socket_dist[row_ids] = np.linalg.norm(peg_pos - socket_pos, axis=-1)
+        self._prev_gripper_closure[row_ids] = gripper_closure
+        self._prev_midpoint_xy_dist[row_ids] = midpoint_to_peg_xy_dist
+        self._prev_pregrasp_height_error[row_ids] = pregrasp_height_error
+        self._prev_peg_height[row_ids] = peg_pos[:, 2]
+        self._prev_socket_xy_dist[row_ids] = socket_xy_dist
+        self._prev_insert_depth[row_ids] = 0.0
+        self._prev_socket_entry_gap[row_ids] = 0.2
+        self._consecutive_capture_steps[row_ids] = 0
+        self._consecutive_grasp_steps[row_ids] = 0
+        self._consecutive_pregrasp_open_steps[row_ids] = 0
 
     def _check_termination(self, state: ArrayEnvState):
         inputs = self.sim_data
@@ -432,7 +439,7 @@ class PegInsertEnv(DirectEnv):
 
         terminated = peg_pos[:, 2] < -0.15
 
-        prev_grasp = state.info.get("grasp_success", np.zeros(inputs["dof_pos"].shape[0], dtype=bool))
+        prev_grasp = self._grasp_success
         if np.any(prev_grasp):
             hand_pos = inputs["hand_pos"]
             hand_to_peg_dist = np.linalg.norm(peg_pos - hand_pos, axis=-1)
@@ -447,12 +454,12 @@ class PegInsertEnv(DirectEnv):
 
         return terminated
 
-    def _collect_reward_features(self, state: ArrayEnvState) -> dict:
+    def _collect_reward_features(self) -> dict:
         """Collect the current geometry and gripper state shared by all reward terms."""
         inputs = self.sim_data
         peg_pos = inputs["peg_pos"]
         peg_quat = inputs["peg_quat"]
-        socket_pos = state.info["socket_pos"]
+        socket_pos = self._socket_pos
         hand_pos = inputs["hand_pos"]
         left_finger_pos = inputs["left_finger_pos"]
         right_finger_pos = inputs["right_finger_pos"]
@@ -495,7 +502,7 @@ class PegInsertEnv(DirectEnv):
         peg_bottom_z = peg_pos[:, 2] - self._cfg.peg_config.peg_length * 0.5
         raw_insert_depth = np.clip(socket_top_z - peg_bottom_z, 0.0, self._cfg.peg_config.socket_depth)
 
-        gripper_state = state.info.get("current_gripper_action", np.zeros(inputs["dof_pos"].shape[0], dtype=np.float32))
+        gripper_state = self._current_gripper_action
         is_gripper_command_closed = gripper_state < -0.5
         is_gripper_command_open = gripper_state > -0.3
         gripper_joint_pos = self.get_dof_pos(slice(None))[:, 6]
@@ -507,7 +514,7 @@ class PegInsertEnv(DirectEnv):
         )
         actual_gripper_narrow = (gripper_closure > 0.42) | (finger_gap < 0.065)
 
-        initial_peg_pos = state.info["initial_peg_pos"]
+        initial_peg_pos = self._initial_peg_pos
         lift_height = np.maximum(0.0, peg_pos[:, 2] - initial_peg_pos[:, 2])
         peg_xy_shift = np.linalg.norm(peg_pos[:, :2] - initial_peg_pos[:, :2], axis=-1)
         peg_drop_height = np.maximum(0.0, initial_peg_pos[:, 2] - peg_pos[:, 2])
@@ -548,36 +555,31 @@ class PegInsertEnv(DirectEnv):
             "peg_speed": peg_speed,
         }
 
-    def _update_reward_progress(self, state: ArrayEnvState, features: dict) -> dict:
+    def _update_reward_progress(self, features: dict) -> dict:
         """Update one-step progress signals that depend on the previous simulator state."""
-        num_envs = self._num_envs
-        info = state.info
+        # Snapshot the pre-step grasp state: _update_task_tracking overwrites
+        # the buffer in place, and downstream reads (first_grasp,
+        # pregrasp_open_active) must still see the prior values.
+        prev_grasp = self._grasp_success.copy()
 
-        prev_grasp = info.get("grasp_success", np.zeros(num_envs, dtype=bool))
+        gripper_closure_progress = features["gripper_closure"] - self._prev_gripper_closure
+        self._prev_gripper_closure[:] = features["gripper_closure"]
 
-        prev_gripper_closure = info.get("prev_gripper_closure", features["gripper_closure"])
-        gripper_closure_progress = features["gripper_closure"] - prev_gripper_closure
-        info["prev_gripper_closure"] = features["gripper_closure"].copy()
+        self._prev_hand_to_peg_dist[:] = features["hand_to_peg_dist"]
 
-        info["prev_hand_to_peg_dist"] = features["hand_to_peg_dist"].copy()
+        xy_progress = self._prev_midpoint_xy_dist - features["midpoint_xy_dist"]
+        self._prev_midpoint_xy_dist[:] = features["midpoint_xy_dist"]
 
-        prev_midpoint_xy_dist = info.get("prev_midpoint_xy_dist", features["midpoint_xy_dist"])
-        xy_progress = prev_midpoint_xy_dist - features["midpoint_xy_dist"]
-        info["prev_midpoint_xy_dist"] = features["midpoint_xy_dist"].copy()
+        height_progress = self._prev_pregrasp_height_error - features["pregrasp_height_error"]
+        self._prev_pregrasp_height_error[:] = features["pregrasp_height_error"]
 
-        prev_pregrasp_height_error = info.get("prev_pregrasp_height_error", features["pregrasp_height_error"])
-        height_progress = prev_pregrasp_height_error - features["pregrasp_height_error"]
-        info["prev_pregrasp_height_error"] = features["pregrasp_height_error"].copy()
+        peg_height_progress = features["peg_pos"][:, 2] - self._prev_peg_height
+        self._prev_peg_height[:] = features["peg_pos"][:, 2]
 
-        prev_peg_height = info.get("prev_peg_height", features["peg_pos"][:, 2])
-        peg_height_progress = features["peg_pos"][:, 2] - prev_peg_height
-        info["prev_peg_height"] = features["peg_pos"][:, 2].copy()
+        self._prev_peg_to_socket_dist[:] = features["peg_to_socket_dist"]
 
-        info["prev_peg_to_socket_dist"] = features["peg_to_socket_dist"].copy()
-
-        prev_socket_xy_dist = info.get("prev_socket_xy_dist", features["xy_dist"])
-        xy_socket_progress = prev_socket_xy_dist - features["xy_dist"]
-        info["prev_socket_xy_dist"] = features["xy_dist"].copy()
+        xy_socket_progress = self._prev_socket_xy_dist - features["xy_dist"]
+        self._prev_socket_xy_dist[:] = features["xy_dist"]
 
         return {
             "prev_grasp": prev_grasp,
@@ -588,15 +590,9 @@ class PegInsertEnv(DirectEnv):
             "xy_socket_progress": xy_socket_progress,
         }
 
-    def _update_task_tracking(self, state: ArrayEnvState, features: dict, progress: dict) -> dict:
+    def _update_task_tracking(self, features: dict, progress: dict) -> dict:
         """Update reward-related task phase state such as grasp, transport, and insertion."""
-        num_envs = self._num_envs
-        info = state.info
-
         prev_grasp = progress["prev_grasp"]
-        consecutive_capture = info.get("consecutive_capture_steps", np.zeros(num_envs, dtype=np.int32))
-        consecutive_grasp = info.get("consecutive_grasp_steps", np.zeros(num_envs, dtype=np.int32))
-        consecutive_pregrasp_open = info.get("consecutive_pregrasp_open_steps", np.zeros(num_envs, dtype=np.int32))
 
         pregrasp_ready = (
             (features["midpoint_xy_dist"] < 0.032)
@@ -619,8 +615,8 @@ class PegInsertEnv(DirectEnv):
             & (features["peg_uprightness"] > 0.9)
         )
 
-        consecutive_capture = np.where(grasp_candidate, consecutive_capture + 1, 0)
-        info["consecutive_capture_steps"] = consecutive_capture
+        consecutive_capture = np.where(grasp_candidate, self._consecutive_capture_steps + 1, 0)
+        self._consecutive_capture_steps[:] = consecutive_capture
 
         grasp_candidate = (
             features["is_gripper_command_closed"]
@@ -633,7 +629,7 @@ class PegInsertEnv(DirectEnv):
 
         ever_grasped = prev_grasp | confirmed_grasp
 
-        info["grasp_success"] = ever_grasped
+        self._grasp_success[:] = ever_grasped
 
         is_grasping = (
             ever_grasped
@@ -644,26 +640,24 @@ class PegInsertEnv(DirectEnv):
 
         consecutive_grasp = np.where(
             is_grasping,
-            consecutive_grasp + 1,
+            self._consecutive_grasp_steps + 1,
             0,
         )
 
-        info["consecutive_grasp_steps"] = consecutive_grasp
+        self._consecutive_grasp_steps[:] = consecutive_grasp
 
         pregrasp_open_active = pregrasp_ready & features["is_gripper_command_open"] & (~prev_grasp)
-        consecutive_pregrasp_open = np.where(pregrasp_open_active, consecutive_pregrasp_open + 1, 0)
-        info["consecutive_pregrasp_open_steps"] = consecutive_pregrasp_open
+        consecutive_pregrasp_open = np.where(pregrasp_open_active, self._consecutive_pregrasp_open_steps + 1, 0)
+        self._consecutive_pregrasp_open_steps[:] = consecutive_pregrasp_open
 
         insert_ready = ever_grasped & (features["xy_dist"] < 0.008) & (features["peg_uprightness"] > 0.97)
         insert_depth = np.where(insert_ready, features["raw_insert_depth"], 0.0)
-        prev_insert_depth = info.get("prev_insert_depth", insert_depth)
-        insert_depth_progress = insert_depth - prev_insert_depth
-        info["prev_insert_depth"] = insert_depth.copy()
+        insert_depth_progress = insert_depth - self._prev_insert_depth
+        self._prev_insert_depth[:] = insert_depth
 
         socket_entry_gap = np.maximum(0.0, features["peg_bottom_z"] - features["socket_top_z"])
-        prev_socket_entry_gap = info.get("prev_socket_entry_gap", socket_entry_gap)
-        socket_entry_gap_progress = prev_socket_entry_gap - socket_entry_gap
-        info["prev_socket_entry_gap"] = socket_entry_gap.copy()
+        socket_entry_gap_progress = self._prev_socket_entry_gap - socket_entry_gap
+        self._prev_socket_entry_gap[:] = socket_entry_gap
 
         touch_socket = (
             ever_grasped & (insert_depth > 0.008) & (features["xy_dist"] < 0.006) & (features["peg_uprightness"] > 0.97)
@@ -673,14 +667,13 @@ class PegInsertEnv(DirectEnv):
             & (features["xy_dist"] < self._cfg.peg_config.success_threshold)
             & (features["peg_uprightness"] > 0.98)
         )
-        info["success"] = success
 
-        phase = np.zeros(num_envs, dtype=np.int32)
+        phase = self._phase
+        phase[:] = 0
         phase[(~pregrasp_ready) & (~ever_grasped)] = 1
         phase[pregrasp_ready | grasp_channel_ready | ever_grasped] = 2
         phase[touch_socket] = 3
         phase[success] = 4
-        info["phase"] = phase
 
         return {
             "pregrasp_ready": pregrasp_ready,
@@ -1110,11 +1103,11 @@ class PegInsertEnv(DirectEnv):
     def _compute_reward(self, state: ArrayEnvState, terminated: np.ndarray):
         # 1) Gather geometry and actuation features shared across all reward terms.
         reward_cfg = self._cfg.reward_config
-        features = self._collect_reward_features(state)
+        features = self._collect_reward_features()
 
         # 2) Update history-dependent progress signals and the task phase tracker.
-        progress = self._update_reward_progress(state, features)
-        tracking = self._update_task_tracking(state, features, progress)
+        progress = self._update_reward_progress(features)
+        tracking = self._update_task_tracking(features, progress)
 
         # 3) Compute reward components by task stage. The final sum order below
         # intentionally mirrors the pre-refactor implementation for reproducibility.
@@ -1123,7 +1116,7 @@ class PegInsertEnv(DirectEnv):
         insert_rewards = self._compute_insert_rewards(reward_cfg, features, tracking)
         safety_penalties = self._compute_safety_penalties(reward_cfg, features, tracking)
 
-        action_diff_sq = np.sum(np.square(state.info["current_actions"] - state.info["last_actions"]), axis=-1)
+        action_diff_sq = np.sum(np.square(self._current_actions - self._last_actions), axis=-1)
         joint_vel_sq = np.sum(np.square(self.get_dof_vel(slice(None))[:, : self._num_dof_vel]), axis=1)
         peg_vel_sq = np.sum(np.square(features["peg_linear_vel"]), axis=-1)
 
@@ -1203,7 +1196,7 @@ class PegInsertEnv(DirectEnv):
 
         reward = np.clip(reward, -100.0, 3000.0)
         reward_details["total"] = reward.astype(np.float32)
-        state.info["Reward"] = reward_details
+        state.reward_terms = reward_details
 
         return reward.astype(np.float32)
 

@@ -134,6 +134,12 @@ class ManipulatorBase(DirectEnv):
         self._init_action_space()
         self._init_obs_space()
 
+        # Episode-scoped action history: full-batch buffers, reset writes the
+        # done rows in place.
+        self._actions = np.zeros((self._num_envs, self.num_actuators), dtype=np.float32)
+        self._last_actions = np.zeros((self._num_envs, self.num_actuators), dtype=np.float32)
+        self._prev_move_dist = np.zeros(self._num_envs, dtype=np.float32)
+
     def _init_action_space(self):
         ctrl_ranges = np.asarray([spec.ctrl_range for spec in self.model.actuators], dtype=np.float32)
         self._action_space = gym.spaces.Box(
@@ -156,8 +162,8 @@ class ManipulatorBase(DirectEnv):
         actions = np.asarray(actions, dtype=np.float32)
         # Enforce actuator control limits to avoid out-of-range impulses.
         actions = np.clip(actions, self._action_space.low, self._action_space.high).astype(np.float32)
-        state.info["last_actions"] = state.info["actions"]
-        state.info["actions"] = actions
+        self._last_actions[:] = self._actions
+        self._actions[:] = actions
         ctrl = self._ctrl_writes.buffer("ctrl")
         ctrl[:] = actions
         self._ctrl_writes.execute()
@@ -325,15 +331,13 @@ class ManipulatorBase(DirectEnv):
         self._set_target_mocap(env_ids, target_x, target_z, target_angle)
         self.sim_data.execute(row_ids)
 
-    def reset(self, env_ids: np.ndarray) -> dict:
-        num = len(env_ids)
+    def reset(self, env_ids: np.ndarray) -> None:
         self.initialize_episode(env_ids)
 
-        info = {
-            "actions": np.zeros((num, self.num_actuators), dtype=np.float32),
-            "last_actions": np.zeros((num, self.num_actuators), dtype=np.float32),
-        }
-        return info
+        # Write episode-scoped state for the reset rows
+        self._actions[env_ids] = 0.0
+        self._last_actions[env_ids] = 0.0
+        self._prev_move_dist[env_ids] = 0.0
 
 
 @registry.env("dm-manipulator-bring-ball")
@@ -438,8 +442,7 @@ class BringBall(ManipulatorBase):
         r_pause = (r_pause * post_grasp_scale).astype(np.float32)
 
         # R4: Close
-        default_actions = np.zeros((self._num_envs, self.num_actuators), dtype=np.float32)
-        grasp_action = state.info.get("actions", default_actions)[:, self._grasp_act_i].astype(np.float32)
+        grasp_action = self._actions[:, self._grasp_act_i].astype(np.float32)
         r_close_intent = _tolerance(
             grasp_action, bounds=(0.8, 1.0), margin=1.0, sigmoid="linear", value_at_margin=0.01
         ).astype(np.float32)
@@ -473,18 +476,13 @@ class BringBall(ManipulatorBase):
         lift_norm = max(lift_height_weight + transport_weight, 1e-6)
         r_lift = ((lift_height_weight * r_lift_height + transport_weight * r_transport) / lift_norm).astype(np.float32)
 
-        prev_move_dist = state.info.get("prev_move_dist")
-        if prev_move_dist is None:
-            prev_move_dist = move_dist
-        else:
-            prev_move_dist = np.asarray(prev_move_dist, dtype=np.float32)
         first_step = state.episode_steps == 0
-        prev_move_dist = np.where(first_step, move_dist, prev_move_dist)
+        prev_move_dist = np.where(first_step, move_dist, self._prev_move_dist)
         progress_clip = float(cfg.transport_progress_clip)
         progress = (prev_move_dist - move_dist) / max(progress_clip, 1e-6)
         progress = np.clip(progress, -1.0, 1.0).astype(np.float32)
         r_progress = (progress * float(cfg.transport_progress_scale) * grasp_mask).astype(np.float32)
-        state.info["prev_move_dist"] = move_dist.astype(np.float32)
+        self._prev_move_dist[:] = move_dist.astype(np.float32)
 
         # --- Penalties ---
         all_touch = self._touch_raw(slice(None))
@@ -521,7 +519,7 @@ class BringBall(ManipulatorBase):
 
         reward = np.where(terminated, 0.0, reward)
 
-        state.info["Reward"] = {
+        state.reward_terms = {
             "reach": r_reach,
             "orient": r_orient,
             "close": r_close,

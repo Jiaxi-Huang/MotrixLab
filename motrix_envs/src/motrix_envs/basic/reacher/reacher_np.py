@@ -102,11 +102,11 @@ class Reacher2DEnv(DirectEnv):
         )
         rwd[terminated] = 0.0
 
-        state.info["Reward"] = {"distance": dist, "tolerance": rwd.copy()}
+        state.reward_terms = {"distance": dist, "tolerance": rwd.copy()}
 
         return state.replace(reward=rwd, terminated=terminated)
 
-    def reset(self, env_ids: np.ndarray) -> dict:
+    def reset(self, env_ids: np.ndarray) -> None:
         """Reset environment with randomized target position in xy plane (z=0)."""
         num_reset = len(env_ids)
 
@@ -131,10 +131,3 @@ class Reacher2DEnv(DirectEnv):
         target_pose = self.sim_data["target_pos"][env_ids]
         self._target_xyz[env_ids] = target_pose
         self._target_xyz[env_ids, 2] = 0.0
-
-        rewards = {"distance": np.zeros((num_reset,)), "tolerance": np.zeros((num_reset,))}
-        info = {
-            "Reward": rewards,
-        }
-
-        return info

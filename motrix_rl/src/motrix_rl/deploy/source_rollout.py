@@ -35,7 +35,9 @@ def validate_motrixsim_source_rollout(
     env.cfg.noise_config.level = 0.0
     env.cfg.spawn_xy_range = 0.0
     state = env.init_state()
-    state.info["commands"][0] = command
+    # Walk-flavor tasks keep their velocity commands in the episode-scoped
+    # ``_commands`` buffer; pin row 0 so the rollout drives a fixed command.
+    env._commands[0] = command
     observation = np.asarray(state.obs.policy[0], dtype=np.float32)
     reset_observation = observation.tolist()
     first_outputs: list[list[float]] = []
@@ -55,7 +57,7 @@ def validate_motrixsim_source_rollout(
         if bool(state.terminated[0]):
             exit_reason = "terminated"
             break
-        state.info["commands"][0] = command
+        env._commands[0] = command
         observation = np.asarray(state.obs.policy[0], dtype=np.float32)
         if not np.isfinite(observation).all():
             exit_reason = "invalid_observation"
