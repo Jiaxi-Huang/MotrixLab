@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import gymnasium as gym
 import numpy as np
 import pytest
+from numba import njit
 
 import motrix_env_core.numba.manager.compiler.compiler as compiler_module
 import motrix_env_core.numba.manager.env as manager_env_module
@@ -467,6 +468,40 @@ def test_reset_descriptor_is_part_of_numba_kernel_cache_key(_isolated_numba_cach
     second.init_state()
 
     assert first.manager_layout.plan_key == second.manager_layout.plan_key
+
+
+@njit(inline="always")
+def _fingerprint_helper_first(x):
+    return x + 1.0
+
+
+@njit(inline="always")
+def _fingerprint_helper_second(x):
+    return x - 1.0
+
+
+@dispatch
+def _fingerprint_entry_first(ctx: ManagerContext) -> None:
+    _fingerprint_helper_first(1.0)
+
+
+@dispatch
+def _fingerprint_entry_second(ctx: ManagerContext) -> None:
+    _fingerprint_helper_second(1.0)
+
+
+def test_dispatch_fingerprint_tracks_inlined_helper_source() -> None:
+    """Editing a module-level njit helper must change the plan fingerprint (issue #54).
+
+    The fused kernel inlines ``@njit(inline="always")`` helpers called from dispatch
+    entries, so the fingerprint must cover those helpers' source, not only the entry's
+    own body.
+    """
+    fingerprint_first = NumbaKernelCompiler._function_fingerprint(_fingerprint_entry_first)
+    fingerprint_second = NumbaKernelCompiler._function_fingerprint(_fingerprint_entry_second)
+
+    assert fingerprint_first == NumbaKernelCompiler._function_fingerprint(_fingerprint_entry_first)
+    assert fingerprint_first != fingerprint_second
 
 
 def test_manager_cfg_accepts_dict_groups_and_empty_commands() -> None:
