@@ -9,7 +9,12 @@ from motrix_env_core.numba.manager.compiler.program import PreparedInvocation, R
 
 @dataclass(frozen=True)
 class KernelSourceGenerator:
-    """Generate schema-specialized manager kernels for one compilation plan."""
+    """Generate schema-specialized manager kernels for one compilation plan.
+
+    Each kernel is emitted as its own module source so every kernel gets an
+    independent plan key and on-disk cache: editing reward terms must not
+    recompile the observation or reset kernels.
+    """
 
     flat_input_count: int
 
@@ -24,7 +29,7 @@ class KernelSourceGenerator:
         command_advances: tuple[PreparedInvocation, ...],
         command_resets: tuple[PreparedInvocation, ...],
         reset: tuple[ResolvedSimReset, ...],
-    ) -> str:
+    ) -> tuple[str, str, str]:
         evaluate_lane_body, observe_lane_body = self._generate_lane_bodies(
             observations,
             observation_layout,
@@ -33,6 +38,12 @@ class KernelSourceGenerator:
             command_updates,
             command_advances,
         )
+        evaluate_source = self._evaluate_module(evaluate_lane_body, context)
+        observe_source = self._observe_module(observe_lane_body, context)
+        reset_source = self._reset_module(context, command_resets, reset)
+        return evaluate_source, observe_source, reset_source
+
+    def _evaluate_module(self, evaluate_lane_body: list[str], context: ResolvedManagerContext) -> str:
         lines = [
             "def generated_evaluate_kernel(inputs, reward_weights, buffers, outputs):",
         ]
@@ -71,13 +82,12 @@ class KernelSourceGenerator:
                 "        )",
             ]
         )
+        return "\n".join(lines) + "\n"
 
-        lines.extend(
-            [
-                "",
-                "def generated_observe_kernel(inputs, outputs):",
-            ]
-        )
+    def _observe_module(self, observe_lane_body: list[str], context: ResolvedManagerContext) -> str:
+        lines = [
+            "def generated_observe_kernel(inputs, outputs):",
+        ]
         lines.extend(f"    input_{index} = inputs[{index}]" for index in range(self.flat_input_count))
         lines.extend(
             [
@@ -88,13 +98,17 @@ class KernelSourceGenerator:
             ]
         )
         lines.extend(f"        {line}" for line in observe_lane_body)
+        return "\n".join(lines) + "\n"
 
-        lines.extend(
-            [
-                "",
-                "def generated_reset_kernel(inputs, env_ids, reset_buffers):",
-            ]
-        )
+    def _reset_module(
+        self,
+        context: ResolvedManagerContext,
+        command_resets: tuple[PreparedInvocation, ...],
+        reset: tuple[ResolvedSimReset, ...],
+    ) -> str:
+        lines = [
+            "def generated_reset_kernel(inputs, env_ids, reset_buffers):",
+        ]
         lines.extend(f"    input_{index} = inputs[{index}]" for index in range(self.flat_input_count))
         lines.extend(["    for row in numba.prange(env_ids.shape[0]):", "        env_id = env_ids[row]"])
         lines.append(f"        ctx = {context.expression}")
@@ -113,7 +127,6 @@ class KernelSourceGenerator:
                 f"sim_writes_{index}",
             )
             lines.append(f"        {call}")
-
         return "\n".join(lines) + "\n"
 
     @classmethod

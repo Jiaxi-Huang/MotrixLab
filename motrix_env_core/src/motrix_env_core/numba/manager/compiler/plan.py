@@ -65,11 +65,15 @@ class ManagerLayout:
     rewards: tuple[ScalarTermLayout, ...]
     terminations: tuple[ScalarTermLayout, ...]
     metrics: tuple[MetricFieldLayout, ...]
-    plan_key: str
-    generated_filename: str
+    plan_keys: tuple[str, str, str]
+    generated_filenames: tuple[str, str, str]
 
     def dump(self) -> str:
-        lines = [f"plan_key: {self.plan_key}", f"generated_filename: {self.generated_filename}", "inputs:"]
+        lines = [
+            f"plan_keys (evaluate, observe, reset): {', '.join(key[:12] for key in self.plan_keys)}",
+            f"generated_filenames: {', '.join(self.generated_filenames)}",
+            "inputs:",
+        ]
         lines.extend(f"  [{slot.index}] scope={slot.scope.value} source={slot.source}" for slot in self.inputs)
         lines.append("sim_inputs:")
         lines.extend(

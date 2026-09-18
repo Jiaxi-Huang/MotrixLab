@@ -276,11 +276,7 @@ class CompiledManagerProgram(abc.ABC):
     task: NumbaTaskProgram
     read_plan: ReadPlan
     layout: ManagerLayout
-    source: str
-
-    @abc.abstractmethod
-    def warmup_terms(self, env: ManagerEnv, state: ArrayEnvState, buffers: tuple[Any, ...]) -> None:
-        """Compile and validate each manager term independently."""
+    sources: tuple[str, str, str]
 
 
 @dataclass(frozen=True)
@@ -485,8 +481,10 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             logger.info("Manager env %r startup begin: num_envs=%d", env_name, self.num_envs)
             self._task_program = self._build_task_program()
             # Initialize the simulator arena before the base lifecycle resets
-            # rows through the reset kernel.
+            # rows through the reset kernel, and compile that kernel so the
+            # first reset does not pay its compilation as a hidden stall.
             self._refresh_sim_reads()
+            self._precompile_reset_kernel()
         state = super().init_state()
         self._kernel_buffers = self._make_kernel_buffers(state)
         state.metrics = self._make_metrics_view()
@@ -784,6 +782,11 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
 
         self._compiled_manager_program = NumbaKernelCompiler(self).build()
         return self._compiled_manager_program.task
+
+    def _precompile_reset_kernel(self) -> None:
+        from motrix_env_core.numba.manager.compiler import NumbaKernelCompiler
+
+        NumbaKernelCompiler(self).precompile_reset_kernel(self._kernel_inputs)
 
     def _compile_manager_specializations(self, inputs: tuple[Any, ...]) -> None:
         from motrix_env_core.numba.manager.compiler import NumbaKernelCompiler

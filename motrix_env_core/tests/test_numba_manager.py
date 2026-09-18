@@ -1,6 +1,7 @@
 # Copyright Motphys Technology Co., Ltd. 2025, 2026
 # SPDX-License-Identifier: Apache-2.0
 
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from pathlib import Path
@@ -467,41 +468,44 @@ def test_reset_descriptor_is_part_of_numba_kernel_cache_key(_isolated_numba_cach
     first.init_state()
     second.init_state()
 
-    assert first.manager_layout.plan_key == second.manager_layout.plan_key
+    assert first.manager_layout.plan_keys == second.manager_layout.plan_keys
 
 
 @njit(inline="always")
-def _fingerprint_helper_first(x):
+def _fingerprint_helper(x):
     return x + 1.0
 
 
-@njit(inline="always")
-def _fingerprint_helper_second(x):
-    return x - 1.0
-
-
 @dispatch
-def _fingerprint_entry_first(ctx: ManagerContext) -> None:
-    _fingerprint_helper_first(1.0)
-
-
-@dispatch
-def _fingerprint_entry_second(ctx: ManagerContext) -> None:
-    _fingerprint_helper_second(1.0)
+def _fingerprint_entry(ctx: ManagerContext) -> None:
+    _fingerprint_helper(1.0)
 
 
 def test_dispatch_fingerprint_tracks_inlined_helper_source() -> None:
     """Editing a module-level njit helper must change the plan fingerprint (issue #54).
 
     The fused kernel inlines ``@njit(inline="always")`` helpers called from dispatch
-    entries, so the fingerprint must cover those helpers' source, not only the entry's
-    own body.
+    entries, so the fingerprint must cover the helper's source, not only the entry's
+    own body. The entry body stays byte-identical here; only the global the entry
+    references is rebound, so a changed fingerprint proves the helper's source is
+    hashed (the old entry-only fingerprint would be unchanged).
     """
-    fingerprint_first = NumbaKernelCompiler._function_fingerprint(_fingerprint_entry_first)
-    fingerprint_second = NumbaKernelCompiler._function_fingerprint(_fingerprint_entry_second)
+    module = sys.modules[__name__]
+    original_helper = module._fingerprint_helper
+    before = NumbaKernelCompiler._function_fingerprint(_fingerprint_entry)
 
-    assert fingerprint_first == NumbaKernelCompiler._function_fingerprint(_fingerprint_entry_first)
-    assert fingerprint_first != fingerprint_second
+    @njit(inline="always")
+    def _other_helper(x):
+        return x - 1.0
+
+    try:
+        module._fingerprint_helper = _other_helper
+        rebound = NumbaKernelCompiler._function_fingerprint(_fingerprint_entry)
+    finally:
+        module._fingerprint_helper = original_helper
+
+    assert before != rebound
+    assert before == NumbaKernelCompiler._function_fingerprint(_fingerprint_entry)
 
 
 def test_manager_cfg_accepts_dict_groups_and_empty_commands() -> None:
@@ -685,12 +689,11 @@ def test_manager_context_is_injected_once_and_reused_across_all_term_kinds() -> 
     np.testing.assert_allclose(state.info["Reward"]["source"], [0.005, 0.015])
     np.testing.assert_array_equal(state.metrics["limit"], [False, True])
     assert env._compiled_manager_program is not None
-    assert env._compiled_manager_program.source.count("ctx =") == 3
-    assert "manager_value_0 =" not in env._compiled_manager_program.source
+    assert sum(source.count("ctx =") for source in env._compiled_manager_program.sources) == 3
+    assert all("manager_value_0 =" not in source for source in env._compiled_manager_program.sources)
 
     warmup = env.warmup()
     assert warmup.signatures
-    assert all(invocation.dispatcher.nopython_signatures for invocation in env._compiled_manager_program.invocations)
 
 
 def test_read_plan_uses_compile_time_flat_inputs_without_runtime_flattening(
@@ -760,7 +763,7 @@ def test_done_envs_reset_before_observation_and_preserve_transition_outputs() ->
     np.testing.assert_allclose(state.reward, [0.005, 0.015, 0.005])
     np.testing.assert_array_equal(state.terminated, [False, True, False])
     assert env._compiled_manager_program is not None
-    assert "generated_reset_observation_kernel" not in env._compiled_manager_program.source
+    assert all("generated_reset_observation_kernel" not in source for source in env._compiled_manager_program.sources)
 
 
 def test_truncated_envs_reset_before_observation() -> None:
@@ -818,18 +821,22 @@ def test_build_rematerializes_source_after_cache_invalidation(_isolated_numba_ca
     compiler = NumbaKernelCompiler(env)
     calls = []
 
-    def compile_kernels(source, filename):
-        calls.append((source, filename, Path(filename).exists()))
+    def compile_kernel(kind, source, filename):
+        del source
+        calls.append((kind, filename, Path(filename).exists()))
         if len(calls) == 1:
             raise ImportError("corrupt generated source")
-        return tuple(lambda *args: None for _ in range(3))
+        return object()
 
-    monkeypatch.setattr(compiler, "_compile_kernels", compile_kernels)
+    monkeypatch.setattr(compiler, "_compile_kernel", compile_kernel)
     compiled = compiler.build()
-    assert compiled.layout.generated_filename == calls[1][1]
-    assert calls[0][2] is True
-    assert calls[1][2] is True
-    compiler_module._KERNEL_CACHE.pop(compiled.layout.plan_key, None)
+    # The failing evaluate kernel is rematerialized and retried; observe and
+    # reset kernels compile once each.
+    assert [call[0] for call in calls] == ["evaluate", "evaluate", "observe", "reset"]
+    assert compiled.layout.generated_filenames == (calls[1][1], calls[2][1], calls[3][1])
+    assert all(call[2] is True for call in calls)
+    for plan_key in compiled.layout.plan_keys:
+        compiler_module._KERNEL_CACHE.pop(plan_key, None)
 
 
 def test_specialization_cache_failure_rebuilds_callable_dispatchers_before_retry(
@@ -853,19 +860,17 @@ def test_specialization_cache_failure_rebuilds_callable_dispatchers_before_retry
         def __init__(self, fail: bool = False):
             self.evaluate_kernel = FakeDispatcher(fail)
             self.observe_kernel = FakeDispatcher()
+            self.reset_kernel = FakeDispatcher()
             self.reward_weights = np.empty(0, dtype=np.float32)
 
     class FakeCompiled:
-        layout = SimpleNamespace(plan_key="plan")
-
-        def warmup_terms(self, env, state, buffers):
-            del env, state, buffers
+        layout = SimpleNamespace(plan_keys=("plan", "plan", "plan"))
 
     first_task = FakeTask(fail=True)
     rebuilt_task = FakeTask()
     env._task_program = first_task
     env._compiled_manager_program = FakeCompiled()
-    compiler_module._KERNEL_CACHE["plan"] = (object(), object(), object())
+    compiler_module._KERNEL_CACHE["plan"] = object()
     term_dispatcher = SimpleNamespace(_cache=SimpleNamespace(flush=lambda: None))
     compiler_module._TERM_CACHE[lambda: None] = term_dispatcher
 
@@ -883,7 +888,7 @@ def test_specialization_cache_failure_rebuilds_callable_dispatchers_before_retry
     env._state = SimpleNamespace()
     env._compile_manager_specializations(())
 
-    assert invalidated == ["plan"]
+    assert invalidated == ["plan", "plan", "plan"]
     assert env._task_program is rebuilt_task
     assert first_task.evaluate_kernel in {dispatcher for dispatcher, _ in compile_attempts}
     assert rebuilt_task.evaluate_kernel in {dispatcher for dispatcher, _ in compile_attempts}
@@ -897,7 +902,7 @@ def test_numeric_values_reuse_compiled_plan_and_remain_environment_local() -> No
     assert env._compiled_manager_program is not None
     compiled = _compile_manager(env)
 
-    assert compiled.layout.plan_key == env.manager_layout.plan_key
+    assert compiled.layout.plan_keys == env.manager_layout.plan_keys
     assert compiled.task.evaluate_kernel is env._compiled_manager_program.task.evaluate_kernel
     np.testing.assert_allclose(compiled.task.reward_weights, [2.0])
     action = env.action_terms["test"]
@@ -929,7 +934,7 @@ def test_scalar_term_args_and_ctrl_dt_share_one_compiled_plan() -> None:
     first.init_state()
     second.init_state()
 
-    assert first.manager_layout.plan_key == second.manager_layout.plan_key
+    assert first.manager_layout.plan_keys == second.manager_layout.plan_keys
 
     for env, scale, threshold in ((first, 3.0, 0.5), (second, 5.0, 0.1)):
         action = env.action_terms["test"]
@@ -946,7 +951,7 @@ def test_scalar_term_args_and_ctrl_dt_share_one_compiled_plan() -> None:
     third_cfg.ctrl_dt = 0.02
     third = ManagerEnv(third_cfg, num_envs=1)
     third.init_state()
-    assert third.manager_layout.plan_key == first.manager_layout.plan_key
+    assert third.manager_layout.plan_keys == first.manager_layout.plan_keys
     action = third.action_terms["test"]
     assert isinstance(action, _TestAction)
     action.source[:] = 0.5

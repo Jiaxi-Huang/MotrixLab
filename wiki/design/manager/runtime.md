@@ -60,7 +60,9 @@ Manager group 的顺序是行为契约的一部分：action slice、observation 
 3. 创建 action、command、observation、reward 和 termination terms；
 4. 为每个 term 执行一次 `canonicalize_kernel_data`；
 5. 构造 `ManagerContext` layout 和 fused kernels；
-6. warm up dispatchers，确认 nopython signature、dtype 和返回契约。
+6. 编译 fused kernels：term dispatch 以签名校验（`inspect` + 类型标注）后内联进 kernel，
+   nopython signature、dtype 与返回契约由 fused kernel 编译一次性确认；term 不再单独编译
+   dispatcher（避免逐 term 编译开销，issue #56）。
 
 ### Step
 

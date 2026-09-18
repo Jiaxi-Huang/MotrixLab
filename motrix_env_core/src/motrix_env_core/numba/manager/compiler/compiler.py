@@ -5,10 +5,8 @@ import hashlib
 import importlib.util
 import inspect
 import logging
-import os
 import pickle
 import sys
-import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,7 +33,21 @@ from motrix_env_core.numba.kernel_data import (
     proxy_symbol,
     proxy_types,
 )
+from motrix_env_core.numba.manager.compiler.cache import (
+    _KERNEL_CACHE,
+    _TERM_CACHE,
+    generated_source_path,
+    has_generated_kernel_cache,
+    invalidate_generated_cache,
+    invalidate_term_cache,
+    materialize_source,
+)
 from motrix_env_core.numba.manager.compiler.codegen import KernelSourceGenerator
+from motrix_env_core.numba.manager.compiler.fingerprint import (
+    function_fingerprint,
+    plan_key,
+    type_name,
+)
 from motrix_env_core.numba.manager.compiler.plan import (
     ActionTermLayout,
     InputSlotLayout,
@@ -67,19 +79,10 @@ from motrix_env_core.numba.manager.terminations import TerminationTerm
 from motrix_env_core.numba.program import NumbaTaskProgram
 from motrix_env_core.sim import PhysicsReadProgram, SimDataQuery
 
-_SCHEMA_VERSION = 33
-_KERNEL_CACHE: dict[str, tuple[Any, Any, Any]] = {}
+_SCHEMA_VERSION = 34
 logger = logging.getLogger(__name__)
-_TERM_CACHE: dict[Callable[..., Any], Any] = {}
 
-
-def _invalidate_term_cache() -> None:
-    for dispatcher in _TERM_CACHE.values():
-        try:
-            dispatcher._cache.flush()
-        except (AttributeError, OSError):
-            logger.debug("Unable to remove invalid manager term cache", exc_info=True)
-    _TERM_CACHE.clear()
+_KERNEL_KINDS = ("evaluate", "observe", "reset")
 
 
 @kernel_data
@@ -136,11 +139,18 @@ class NumbaKernelCompiler:
         self._prepared_terms: list[KernelInputSource] = []
         self._input_offsets: list[int] = []
         self._flat_input_count = 0
-        self._plan_parts: list[Any] = [_SCHEMA_VERSION, numba.__version__]
+        # Plan parts are partitioned per fused kernel so every kernel gets an
+        # independent plan key and disk cache: editing reward terms must not
+        # recompile the observation or reset kernels. Parts shared by all
+        # kernels (schema, context layout, sim inputs) live in _shared_parts.
+        self._shared_parts: list[Any] = [_SCHEMA_VERSION, numba.__version__]
+        self._evaluate_parts: list[Any] = []
+        self._observe_parts: list[Any] = []
+        self._reset_parts: list[Any] = []
         self._term_functions: dict[str, Any] = {}
         self._prepared_types: dict[str, type[tuple]] = {}
         self._kernel_data_lowering = KernelDataLowering()
-        self._plan_parts.append(("sim_inputs", sim_input_fingerprint))
+        self._shared_parts.append(("sim_inputs", sim_input_fingerprint))
 
     def build(self) -> CompiledManagerProgram:
         build_started = perf_counter()
@@ -167,14 +177,25 @@ class NumbaKernelCompiler:
         # happens inside the kernel via ctx.dt, so ctrl_dt does not need to
         # participate in the plan key.
         kernel_reward_weights = np.asarray(reward_weights, dtype=np.float32)
-        plan_key = hashlib.sha256(repr(tuple(self._plan_parts)).encode()).hexdigest()
+        # The kernel kind participates in the key: two kernels with identical
+        # term sets (e.g. both empty) still have different generated sources.
+        part_lists = {
+            "evaluate": self._evaluate_parts,
+            "observe": self._observe_parts,
+            "reset": self._reset_parts,
+        }
+        plan_keys = {
+            kind: plan_key([("kernel_kind", kind)] + self._shared_parts + part_lists[kind]) for kind in _KERNEL_KINDS
+        }
         logger.info(
-            "Manager startup %s: build plan finished in %.3fs (plan_key=%.12s)",
+            "Manager startup %s: build plan finished in %.3fs (evaluate=%.12s observe=%.12s reset=%.12s)",
             self._env_name(),
             perf_counter() - build_started,
-            plan_key,
+            plan_keys["evaluate"],
+            plan_keys["observe"],
+            plan_keys["reset"],
         )
-        source = KernelSourceGenerator(self._flat_input_count).generate(
+        sources = KernelSourceGenerator(self._flat_input_count).generate(
             observation_terms,
             observation_layout,
             reward_invocations,
@@ -185,45 +206,13 @@ class NumbaKernelCompiler:
             command_resets,
             reset_invocations,
         )
-        generated_filename = self._materialize_source(source, plan_key)
-        kernels = _KERNEL_CACHE.get(plan_key)
-        if kernels is not None:
-            logger.info(
-                "Manager startup %s: kernels reused (cache=in-process, plan_key=%.12s)",
-                self._env_name(),
-                plan_key,
-            )
-        else:
-            disk_cache = self._has_generated_kernel_cache(plan_key)
-            if disk_cache:
-                logger.info(
-                    "Manager startup %s: compiled kernel cache found, loading (cache=disk, plan_key=%.12s)",
-                    self._env_name(),
-                    plan_key,
-                )
-            else:
-                logger.info(
-                    "Manager startup %s: no cache for this plan, first compile may take a while "
-                    "(cache=miss, plan_key=%.12s)",
-                    self._env_name(),
-                    plan_key,
-                )
-            compile_started = perf_counter()
-            try:
-                kernels = self._compile_kernels(source, generated_filename)
-            except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
-                logger.warning("Manager kernel cache fallback: plan_key=%s error=%s", plan_key, error)
-                self._invalidate_generated_cache(plan_key)
-                generated_filename = self._materialize_source(source, plan_key)
-                kernels = self._compile_kernels(source, generated_filename)
-            _KERNEL_CACHE[plan_key] = kernels
-            logger.info(
-                "Manager startup %s: compile kernels finished in %.3fs (cache=%s)",
-                self._env_name(),
-                perf_counter() - compile_started,
-                "disk" if disk_cache else "miss",
-            )
-        evaluate_kernel, observe_kernel, reset_kernel = kernels
+        kernels: dict[str, Any] = {}
+        generated_filenames: dict[str, str] = {}
+        for kind, source in zip(_KERNEL_KINDS, sources):
+            kernels[kind], generated_filenames[kind] = self._load_kernel(kind, source, plan_keys[kind])
+        evaluate_kernel = kernels["evaluate"]
+        observe_kernel = kernels["observe"]
+        reset_kernel = kernels["reset"]
 
         layout = ManagerLayout(
             inputs=tuple(
@@ -250,8 +239,12 @@ class NumbaKernelCompiler:
             rewards=reward_layout,
             terminations=termination_layout,
             metrics=per_env_metric_layout,
-            plan_key=plan_key,
-            generated_filename=generated_filename,
+            plan_keys=(plan_keys["evaluate"], plan_keys["observe"], plan_keys["reset"]),
+            generated_filenames=(
+                generated_filenames["evaluate"],
+                generated_filenames["observe"],
+                generated_filenames["reset"],
+            ),
         )
         invocations = (
             command_updates
@@ -274,7 +267,7 @@ class NumbaKernelCompiler:
                 tuple(value for prepared in self._prepared_terms for value in prepared.values),
             ),
             layout=layout,
-            source=source,
+            sources=sources,
             invocations=invocations,
             prepared_terms=tuple(self._prepared_terms),
             input_offsets=tuple(self._input_offsets),
@@ -359,7 +352,7 @@ class NumbaKernelCompiler:
                 prepared_indices.append(prepared_index)
                 expressions.append(expression)
                 plan_expressions.append(plan_part)
-        self._plan_parts.append(
+        self._reset_parts.append(
             (
                 "sim_reset",
                 name,
@@ -400,7 +393,7 @@ class NumbaKernelCompiler:
     def _resolve_runtime_terms(self) -> None:
         for name, action_term in self._env.action_terms.items():
             _, tree_def = flatten_kernel_data(action_term)
-            self._plan_parts.append(
+            self._shared_parts.append(
                 (
                     "action",
                     name,
@@ -414,7 +407,7 @@ class NumbaKernelCompiler:
             )
         for name, command_term in self._env.command_terms.items():
             _, tree_def = flatten_kernel_data(command_term)
-            self._plan_parts.append(
+            self._shared_parts.append(
                 (
                     "command",
                     name,
@@ -448,8 +441,8 @@ class NumbaKernelCompiler:
             context="ManagerContext",
         )
         prepared_index, expression = self._register_prepared("manager_context", value, ManagerContext, layout)
-        self._plan_parts.append(("manager_context", layout.fingerprint))
-        self._plan_parts.append(
+        self._shared_parts.append(("manager_context", layout.fingerprint))
+        self._shared_parts.append(
             (
                 "metrics",
                 tuple((name, value.shape, value.dtype.str) for name, value in self._env.metrics.items()),
@@ -466,17 +459,6 @@ class NumbaKernelCompiler:
             if len(field.path) == 2 and field.path[0] == "sim"
         }
         return ResolvedManagerContext(prepared_index, expression)
-
-    def _resolve_command_hooks(self, function_name: str) -> tuple[PreparedInvocation, ...]:
-        hooks = []
-        for index, (name, command_term) in enumerate(self._env.command_terms.items()):
-            function = inspect.getattr_static(type(command_term), function_name)
-            hooks.append(
-                self._resolve_receiver_term(
-                    "command", name, command_term, function_name, index, 0, function=function, receiver_key=name
-                )
-            )
-        return tuple(hooks)
 
     def _resolve_command_hooks(self, function_name: str) -> tuple[PreparedInvocation, ...]:
         hooks = []
@@ -573,7 +555,7 @@ class NumbaKernelCompiler:
         dispatcher = self._compile_term(function)
         symbol = f"term_observation_{term_index}"
         self._term_functions[symbol] = self._generated_term(function, dispatcher)
-        self._plan_parts.append(
+        self._observe_parts.append(
             (group, name, "observation_dispatch", self._function_fingerprint(function), output_size, plan_expressions)
         )
         return PreparedInvocation(
@@ -682,7 +664,7 @@ class NumbaKernelCompiler:
         dispatcher = self._compile_term(function)
         symbol = f"term_{group}_{term_index}"
         self._term_functions[symbol] = self._generated_term(function, dispatcher)
-        self._plan_parts.append((group, name, "dispatch", self._function_fingerprint(function), plan_expressions))
+        self._evaluate_parts.append((group, name, "dispatch", self._function_fingerprint(function), plan_expressions))
         return PreparedInvocation(
             f"{group}.{name}",
             group,
@@ -742,7 +724,8 @@ class NumbaKernelCompiler:
         symbol = f"term_{kind}_{term_index}"
         dispatcher = self._compile_term(function)
         self._term_functions[symbol] = self._generated_term(function, dispatcher)
-        self._plan_parts.append(
+        parts = self._reset_parts if function_name == "reset_env" else self._evaluate_parts
+        parts.append(
             (
                 group,
                 name,
@@ -858,69 +841,14 @@ class NumbaKernelCompiler:
         elif self._env.has_value_observation:
             raise ValueError("Environment declares a value observation space but manager config has no 'value' group.")
 
-    @staticmethod
-    def _materialize_source(source: str, plan_key: str) -> str:
-        cache_dir = NumbaKernelCompiler._generated_cache_dir()
-        path = Path(cache_dir) / "generated" / f"{plan_key}.py"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists() or path.read_text(encoding="utf-8") != source:
-            temporary_name: str | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
-                ) as temporary:
-                    temporary.write(source)
-                    temporary_name = temporary.name
-                os.replace(temporary_name, path)
-            finally:
-                if temporary_name is not None:
-                    Path(temporary_name).unlink(missing_ok=True)
-        return str(path)
-
-    @staticmethod
-    def _generated_cache_dir() -> str:
-        cache_dir = os.environ.get("NUMBA_CACHE_DIR")
-        if not cache_dir:
-            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "motrixlab", "numba-manager")
-        return cache_dir
-
-    @staticmethod
-    def _generated_cache_paths(plan_key: str) -> tuple[Path, ...]:
-        """Return compiled-kernel cache files for one plan key.
-
-        Numba stores the cached specializations of the generated module next to
-        its cache locator: under ``generated_<hash>/`` when ``NUMBA_CACHE_DIR``
-        is set, and under ``generated/__pycache__/`` (beside the generated
-        source) when it is not. Both layouts are covered so probe and
-        invalidation agree with where the files actually live.
-        """
-        cache_dir = Path(NumbaKernelCompiler._generated_cache_dir())
-        paths: list[Path] = []
-        for pattern in (f"generated_*/*{plan_key}*", f"generated/__pycache__/*{plan_key}*"):
-            try:
-                paths.extend(cache_dir.glob(pattern))
-            except OSError:
-                logger.debug("Unable to scan generated kernel cache: %s", cache_dir, exc_info=True)
-        return tuple(paths)
-
-    @staticmethod
-    def _has_generated_kernel_cache(plan_key: str) -> bool:
-        """Return whether compiled-kernel cache files exist for one plan key."""
-        return any(path.suffix in {".nbi", ".nbc"} for path in NumbaKernelCompiler._generated_cache_paths(plan_key))
-
-    @staticmethod
-    def _invalidate_generated_cache(plan_key: str) -> None:
-        cache_dir = NumbaKernelCompiler._generated_cache_dir()
-        source_path = Path(cache_dir) / "generated" / f"{plan_key}.py"
-        try:
-            source_path.unlink(missing_ok=True)
-        except OSError:
-            logger.debug("Unable to remove invalid generated source: %s", source_path, exc_info=True)
-        for cache_path in NumbaKernelCompiler._generated_cache_paths(plan_key):
-            try:
-                cache_path.unlink(missing_ok=True)
-            except OSError:
-                logger.debug("Unable to remove invalid generated cache: %s", cache_path, exc_info=True)
+    # Cache and fingerprint helpers live in sibling modules; they stay bound as
+    # staticmethods so callers (and tests) can intercept them on the class.
+    _generated_source_path = staticmethod(generated_source_path)
+    _materialize_source = staticmethod(materialize_source)
+    _has_generated_kernel_cache = staticmethod(has_generated_kernel_cache)
+    _invalidate_generated_cache = staticmethod(invalidate_generated_cache)
+    _type_name = staticmethod(type_name)
+    _function_fingerprint = staticmethod(function_fingerprint)
 
     def compile_specializations(self, inputs: tuple[Any, ...]) -> None:
         """Compile all term and fused-kernel specializations for the environment."""
@@ -937,11 +865,12 @@ class NumbaKernelCompiler:
             pickle.UnpicklingError,
             ValueError,
         ) as error:
-            plan_key = self._env.manager_layout.plan_key
-            logger.warning("Manager specialization cache fallback: plan_key=%s error=%s", plan_key, error)
-            self._invalidate_generated_cache(plan_key)
-            _invalidate_term_cache()
-            _KERNEL_CACHE.pop(plan_key, None)
+            plan_keys = self._env.manager_layout.plan_keys
+            logger.warning("Manager specialization cache fallback: plan_keys=%s error=%s", plan_keys, error)
+            for plan_key in plan_keys:
+                self._invalidate_generated_cache(plan_key)
+                _KERNEL_CACHE.pop(plan_key, None)
+            invalidate_term_cache()
             self._env._task_program = self.build().task
             self._compile_specializations_once(inputs)
         logger.info(
@@ -950,17 +879,42 @@ class NumbaKernelCompiler:
             perf_counter() - started,
         )
 
+    def precompile_reset_kernel(self, inputs: tuple[Any, ...]) -> None:
+        """Compile the reset kernel before the first reset lifecycle call.
+
+        The base ``init_state`` lifecycle resets rows through the reset kernel
+        before term specializations run; without this precompile the reset
+        kernel compiles lazily inside that first reset. env_ids always come
+        from ``np.flatnonzero`` (int64). Cache errors are deferred to the
+        specialization phase, whose fallback invalidates and rebuilds.
+        """
+        task = self._env._task_program
+        if task is None:
+            return
+        reset_args = (clone_kernel_value(inputs), np.arange(2, dtype=np.int64), self._env._sim_reset_runtime.buffers)
+        try:
+            task.reset_kernel.compile(tuple(numba.typeof(arg) for arg in reset_args))
+        except (
+            AttributeError,
+            EOFError,
+            ImportError,
+            IndexError,
+            KeyError,
+            OSError,
+            pickle.UnpicklingError,
+            ValueError,
+        ):
+            logger.warning("Manager reset kernel precompile deferred to specializations", exc_info=True)
+
     def _env_name(self) -> str:
         return type(self._env).__name__
 
     def _compile_specializations_once(self, inputs: tuple[Any, ...]) -> None:
-        program = self._env._compiled_manager_program
         task = self._env._task_program
-        assert program is not None
         assert task is not None
-        assert self._env._kernel_buffers is not None
-        assert self._env._state is not None
-        program.warmup_terms(self._env, self._env._state, self._env._kernel_buffers)
+        # Terms are not compiled standalone: their dispatch bodies are inlined
+        # into the fused kernels below, which type-checks the whole plan in one
+        # compilation instead of paying a separate dispatcher compile per term.
         warmup_args = tuple(
             clone_kernel_value(value)
             for value in (inputs, task.reward_weights, self._env._kernel_buffers, self._env._kernel_outputs)
@@ -968,10 +922,59 @@ class NumbaKernelCompiler:
         task.evaluate_kernel.compile(tuple(numba.typeof(arg) for arg in warmup_args))
         observe_args = (clone_kernel_value(inputs), clone_kernel_value(self._env._kernel_outputs))
         task.observe_kernel.compile(tuple(numba.typeof(arg) for arg in observe_args))
+        # Precompile the reset kernel here instead of paying its compilation on
+        # the first reset; env_ids always come from np.flatnonzero (int64).
+        reset_args = (clone_kernel_value(inputs), np.arange(2, dtype=np.int64), self._env._sim_reset_runtime.buffers)
+        task.reset_kernel.compile(tuple(numba.typeof(arg) for arg in reset_args))
 
-    def _compile_kernels(self, source: str, filename: str) -> tuple[Any, Any, Any]:
+    def _load_kernel(self, kind: str, source: str, plan_key: str) -> tuple[Any, str]:
+        """Load one fused kernel from the in-process or disk cache, else compile it."""
+        cached = _KERNEL_CACHE.get(plan_key)
+        if cached is not None:
+            logger.info(
+                "Manager startup %s: %s kernel reused (cache=in-process, plan_key=%.12s)",
+                self._env_name(),
+                kind,
+                plan_key,
+            )
+            return cached, NumbaKernelCompiler._generated_source_path(plan_key)
+        disk_cache = self._has_generated_kernel_cache(plan_key)
+        if disk_cache:
+            logger.info(
+                "Manager startup %s: %s kernel cache found, loading (cache=disk, plan_key=%.12s)",
+                self._env_name(),
+                kind,
+                plan_key,
+            )
+        else:
+            logger.info(
+                "Manager startup %s: no cache for this %s kernel, first compile may take a while "
+                "(cache=miss, plan_key=%.12s)",
+                self._env_name(),
+                kind,
+                plan_key,
+            )
+        compile_started = perf_counter()
+        filename = self._materialize_source(source, plan_key)
+        try:
+            kernel = self._compile_kernel(kind, source, filename)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+            logger.warning("Manager kernel cache fallback: plan_key=%s error=%s", plan_key, error)
+            self._invalidate_generated_cache(plan_key)
+            filename = self._materialize_source(source, plan_key)
+            kernel = self._compile_kernel(kind, source, filename)
+        _KERNEL_CACHE[plan_key] = kernel
+        logger.info(
+            "Manager startup %s: %s kernel compile finished in %.3fs (cache=%s)",
+            self._env_name(),
+            kind,
+            perf_counter() - compile_started,
+            "disk" if disk_cache else "miss",
+        )
+        return kernel, filename
 
-        module_name = f"motrixlab_generated_{Path(filename).stem}"
+    def _compile_kernel(self, kind: str, source: str, filename: str) -> Any:
+        module_name = f"motrixlab_generated_{kind}_{Path(filename).stem}"
         spec = importlib.util.spec_from_file_location(module_name, filename)
         if spec is None or spec.loader is None:
             raise ImportError(f"Unable to load generated Manager module from {filename!r}.")
@@ -980,11 +983,7 @@ class NumbaKernelCompiler:
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         options = {"cache": True, "nogil": True, "parallel": True}
-        return (
-            numba.njit(**options)(module.generated_evaluate_kernel),
-            numba.njit(**options)(module.generated_observe_kernel),
-            numba.njit(**options)(module.generated_reset_kernel),
-        )
+        return numba.njit(**options)(getattr(module, f"generated_{kind}_kernel"))
 
     @staticmethod
     def _generated_term(function: Callable[..., Any], dispatcher: Any) -> Any:
@@ -1008,52 +1007,6 @@ class NumbaKernelCompiler:
             dispatcher = numba.njit(cache=cache, nogil=True, inline="always")(function)
             _TERM_CACHE[function] = dispatcher
         return dispatcher
-
-    @staticmethod
-    def _type_name(value_type: type[Any]) -> str:
-        return f"{value_type.__module__}.{value_type.__qualname__}"
-
-    @staticmethod
-    def _function_fingerprint(function: Callable[..., Any]) -> str:
-        """Fingerprint a dispatch entry and every function it transitively references.
-
-        The fused kernel inlines the dispatch body plus any ``@njit(inline="always")``
-        helpers it calls from its module globals. Hashing only the entry's own source
-        would leave helper edits invisible to the plan key, so stale compiled kernels
-        would be silently reused (issue #54). Referenced functions are resolved through
-        ``co_names`` and hashed recursively; module-level non-function constants are
-        hashed by value when cheaply representable.
-        """
-        hasher = hashlib.sha256()
-        seen: set[int] = set()
-        queue = [function]
-        while queue:
-            current = queue.pop()
-            if id(current) in seen:
-                continue
-            seen.add(id(current))
-            if isinstance(current, numba.core.dispatcher.Dispatcher):
-                current = current.py_func
-            if not inspect.isfunction(current):
-                continue
-            code = current.__code__
-            try:
-                source = inspect.getsource(current).encode()
-            except (OSError, TypeError):
-                source = code.co_code
-            hasher.update(f"{current.__module__}.{current.__qualname__}\0".encode())
-            hasher.update(source)
-            hasher.update(b"\0")
-            module_globals = getattr(current, "__globals__", {})
-            for name in code.co_names:
-                if name not in module_globals:
-                    continue
-                referenced = module_globals[name]
-                if isinstance(referenced, (numba.core.dispatcher.Dispatcher,)) or inspect.isfunction(referenced):
-                    queue.append(referenced)
-                elif isinstance(referenced, (int, float, bool, str, complex, np.generic)):
-                    hasher.update(f"{name}={referenced!r}\0".encode())
-        return hasher.hexdigest()
 
 
 __all__ = ["NumbaKernelCompiler"]
