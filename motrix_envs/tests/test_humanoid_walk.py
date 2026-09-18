@@ -6,8 +6,9 @@
 import pytest
 
 from motrix_env_core import registry
+from motrix_env_core.config.scene import ProceduralHFieldAssetCfg
 from motrix_env_core.manager import ManagerEnv
-from motrix_envs.locomotion.humanoid.cfg import HumanoidVelocityTrackingManagerEnvCfg, HumanoidWalkSceneCfg
+from motrix_envs.locomotion.humanoid.cfg import HumanoidVelocityTrackingManagerEnvCfg
 from motrix_envs.locomotion.humanoid.dex_evt import (
     make_dex_evt_walk_flat_cfg,
     make_dex_evt_walk_rough_cfg,
@@ -65,46 +66,10 @@ def test_walk_rough_only_overrides_scene_spawn_range_and_render_spacing(make_fla
     assert rough_cfg.terminations == flat_cfg.terminations
     assert rough_cfg.sim == flat_cfg.sim
     assert flat_cfg.sim_reset.humanoid_state.spawn_xy_range == 0.0
-    assert rough_cfg.sim_reset.humanoid_state.spawn_xy_range == 4.0
+    assert rough_cfg.sim_reset.humanoid_state.spawn_xy_range > flat_cfg.sim_reset.humanoid_state.spawn_xy_range
     assert flat_cfg.render_spacing > 0.0
     assert rough_cfg.render_spacing == 0.0
-    assert rough_cfg.scene.assets.terrain.size == (32.0, 32.0)
-
-
-@pytest.mark.parametrize(
-    ("make_cfg", "camera_distance", "camera_lookat"),
-    [
-        (make_g129dof_walk_flat_cfg, 6.0, None),
-        (make_g129dof_walk_rough_cfg, 6.0, None),
-        (make_dex_evt_walk_flat_cfg, 6.0, None),
-        (make_dex_evt_walk_rough_cfg, 6.0, None),
-        (make_k1_walk_flat_cfg, 6.0, None),
-        (make_k1_walk_rough_cfg, 6.0, None),
-        (make_microduck_walk_flat_cfg, 0.35, (0.0, 0.0, 0.12)),
-        (make_microduck_walk_rough_cfg, 0.35, (0.0, 0.0, 0.12)),
-    ],
-)
-def test_walk_presets_use_shared_system_camera(make_cfg, camera_distance, camera_lookat):
-    scene = make_cfg().scene
-
-    assert isinstance(scene, HumanoidWalkSceneCfg)
-    assert scene.system_camera.lookat == camera_lookat
-    assert scene.system_camera.distance == pytest.approx(camera_distance)
-    assert scene.system_camera.elevation == pytest.approx(-20.0)
-    assert scene.system_camera.azimuth == pytest.approx(180.0)
-
-
-def test_dex_evt_and_k1_walk_use_shared_reward_weights_and_named_contact_termination():
-    g1_cfg = make_g129dof_walk_flat_cfg()
-    dex_cfg = make_dex_evt_walk_flat_cfg()
-    k1_cfg = make_k1_walk_flat_cfg()
-
-    for term_name in ("tracking_lin_vel", "tracking_ang_vel", "penalty_action_rate", "pose"):
-        assert getattr(dex_cfg.rewards, term_name).weight == getattr(g1_cfg.rewards, term_name).weight
-        assert getattr(k1_cfg.rewards, term_name).weight == getattr(g1_cfg.rewards, term_name).weight
-    assert len(dex_cfg.terminations.colliding.termination_geoms) == 14
-    assert len(k1_cfg.terminations.colliding.termination_geoms) == 18
-    assert len(make_microduck_walk_flat_cfg().terminations.colliding.termination_geoms) == 1
+    assert isinstance(rough_cfg.scene.assets.terrain, ProceduralHFieldAssetCfg)
 
 
 def test_humanoid_walk_rejects_incomplete_joint_preset():

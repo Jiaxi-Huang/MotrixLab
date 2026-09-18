@@ -42,6 +42,49 @@ _G1_TERMINATION_GEOMS = (
 )
 
 
+# Differentiated pose weights carried over from the direct-env G1 preset:
+# the torso and arms are pinned hard (50.0) so the policy cannot lean or yaw
+# the upper body to compensate, hip_yaw and ankles are held moderately (5.0),
+# and hip_pitch/knee stay nearly free (0.01) for swinging legs.
+_G1_POSE_WEIGHTS = {
+    **{name: 0.01 for name in ("left_hip_pitch_joint", "right_hip_pitch_joint", "left_knee_joint", "right_knee_joint")},
+    **{name: 1.0 for name in ("left_hip_roll_joint", "right_hip_roll_joint")},
+    **{
+        name: 5.0
+        for name in (
+            "left_hip_yaw_joint",
+            "right_hip_yaw_joint",
+            "left_ankle_pitch_joint",
+            "right_ankle_pitch_joint",
+            "left_ankle_roll_joint",
+            "right_ankle_roll_joint",
+        )
+    },
+    **{
+        name: 50.0
+        for name in (
+            "waist_yaw_joint",
+            "waist_roll_joint",
+            "waist_pitch_joint",
+            "left_shoulder_pitch_joint",
+            "left_shoulder_roll_joint",
+            "left_shoulder_yaw_joint",
+            "left_elbow_joint",
+            "left_wrist_roll_joint",
+            "left_wrist_pitch_joint",
+            "left_wrist_yaw_joint",
+            "right_shoulder_pitch_joint",
+            "right_shoulder_roll_joint",
+            "right_shoulder_yaw_joint",
+            "right_elbow_joint",
+            "right_wrist_roll_joint",
+            "right_wrist_pitch_joint",
+            "right_wrist_yaw_joint",
+        )
+    },
+}
+
+
 def _make_g1_rewards(robot: UnitreeG129Dof) -> WalkRewardsCfg:
     return WalkRewardsCfg(
         tracking_lin_vel=TrackingLinVelXyRewardCfg(command_name="walk", sigma=0.25, weight=2.0),
@@ -53,7 +96,9 @@ def _make_g1_rewards(robot: UnitreeG129Dof) -> WalkRewardsCfg:
             weight=5.0,
         ),
         penalty_close_feet_xy=PenaltyCloseFeetXyRewardCfg(close_feet_threshold=0.15, weight=-10.0),
-        pose=PoseRewardCfg(pose_weights={name: 1.0 for name in robot.key_pose.joint_names}, weight=-0.5),
+        pose=PoseRewardCfg(
+            pose_weights={name: _G1_POSE_WEIGHTS[name] for name in robot.key_pose.joint_names}, weight=-0.5
+        ),
     )
 
 
@@ -76,7 +121,7 @@ def make_g129dof_walk_flat_cfg() -> HumanoidVelocityTrackingManagerEnvCfg:
                 ground_geom="floor",
             )
         ),
-        sim=SimCfg(dt=0.005, solver_iterations=3, solver_tolerance=1e-4),
+        sim=SimCfg(dt=0.01, solver_iterations=3, solver_tolerance=1e-4),
     )
 
 

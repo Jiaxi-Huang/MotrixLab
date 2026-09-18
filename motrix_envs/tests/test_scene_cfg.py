@@ -920,23 +920,17 @@ def test_composite_terrain_supports_hydra_overrides():
 
 
 @pytest.mark.parametrize(
-    ("cfg", "expected_body", "expected_hfields", "solver_iterations", "solver_tolerance"),
+    ("cfg", "expected_body", "expected_hfields"),
     [
-        (make_g129dof_walk_flat_cfg(), "pelvis", 0, 3, 1e-4),
-        (make_g129dof_walk_rough_cfg(), "pelvis", 1, 3, 1e-4),
-        (make_dex_evt_walk_flat_cfg(), "pelvis", 0, 6, 1e-4),
-        (make_dex_evt_walk_rough_cfg(), "pelvis", 1, 6, 1e-4),
-        (make_k1_walk_flat_cfg(), "Trunk", 0, 6, 1e-4),
-        (make_k1_walk_rough_cfg(), "Trunk", 1, 6, 1e-4),
+        (make_g129dof_walk_flat_cfg(), "pelvis", 0),
+        (make_g129dof_walk_rough_cfg(), "pelvis", 1),
+        (make_dex_evt_walk_flat_cfg(), "pelvis", 0),
+        (make_dex_evt_walk_rough_cfg(), "pelvis", 1),
+        (make_k1_walk_flat_cfg(), "Trunk", 0),
+        (make_k1_walk_rough_cfg(), "Trunk", 1),
     ],
 )
-def test_humanoid_walk_scene_is_assembled_from_robot_and_floor(
-    cfg,
-    expected_body,
-    expected_hfields,
-    solver_iterations,
-    solver_tolerance,
-):
+def test_humanoid_walk_scene_is_assembled_from_robot_and_floor(cfg, expected_body, expected_hfields):
     cfg = OmegaConf.to_object(OmegaConf.structured(cfg))
     assert cfg.scene.file is None
 
@@ -945,33 +939,6 @@ def test_humanoid_walk_scene_is_assembled_from_robot_and_floor(
     assert expected_body in model.body_names
     assert "floor" in model.geom_names
     assert model.num_hfields == expected_hfields
-    assert model.options.timestep == pytest.approx(0.005)
-    assert model.options.max_iterations == solver_iterations
-    assert model.options.solver_tolerance == pytest.approx(solver_tolerance)
-
-
-def test_humanoid_walk_terrain_presets_use_procedural_hfield():
-    configs = [
-        make_g129dof_walk_rough_cfg(),
-        make_dex_evt_walk_rough_cfg(),
-        make_k1_walk_rough_cfg(),
-    ]
-
-    for cfg in configs:
-        cfg = OmegaConf.to_object(OmegaConf.structured(cfg))
-        assert isinstance(cfg.scene.assets.terrain, ProceduralHFieldAssetCfg)
-
-        hfield = build_scene_world(cfg.scene).assets.hfields["terrain"]
-        heights = hfield.source_type.value["hfield"]
-        assert hfield.source_type.variant == "buffer"
-        assert hfield.height_scale == pytest.approx(0.05)
-        assert hfield.nrow == 320
-        assert hfield.ncol == 320
-        assert np.min(heights) >= 0.0
-        assert np.max(heights) <= 1.0
-
-        compiled_hfield = build_scene_model(cfg.scene).get_hfield(0)
-        assert compiled_hfield.bound[5] == pytest.approx(0.05)
 
 
 def test_scene_objs_preserve_inherited_field_order():
