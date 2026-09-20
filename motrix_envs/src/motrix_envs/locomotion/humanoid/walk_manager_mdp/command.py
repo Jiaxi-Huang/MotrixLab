@@ -62,6 +62,12 @@ class WalkCommand(CommandTerm):
     commands resample every ``resample_steps`` transitions, the phase advances
     by ``phase_dt`` per step from a per-env offset, and standing commands pin
     the phase to ``pi``.
+
+    With ``WalkCommandCfg.source`` declared, the host overwrites ``command``
+    with the device value at every read boundary (after the evaluate and reset
+    kernels), superseding kernel resampling; ``update`` recomputes the phase
+    clock from the injected command each transition, so a zero device command
+    still pins the phase.
     """
 
     vel_limit_low: SharedArray

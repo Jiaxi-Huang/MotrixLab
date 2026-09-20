@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from motrix_env_core.config import configclass
+from motrix_env_core.input.sources import CommandSourceCfg
 from motrix_env_core.numba.kernel_data import kernel_data
 from motrix_env_core.numba.manager.dispatch import dispatch
 
@@ -73,7 +74,19 @@ class CommandTerm(abc.ABC):
 
 @configclass(kw_only=True)
 class CommandCfg(abc.ABC):
-    """Configuration that creates one environment-local command term."""
+    """Configuration that creates one environment-local command term.
+
+    When ``source`` is set, the command term is device-driven: ``ManagerEnv``
+    resolves the binding at construction and owns the term's ``command``
+    buffer, overwriting it with ``binding.read_command`` at every read
+    boundary (after the evaluate and reset kernels). Kernel-internal
+    resampling still runs but is always superseded before any consumer reads
+    the buffer, so terms need no device-awareness of their own. The whole
+    batch shares one command. Leaving ``source`` unset keeps the
+    training-time random-sampling path unchanged.
+    """
+
+    source: CommandSourceCfg | None = None
 
     @abc.abstractmethod
     def __call__(self, env: ManagerEnv) -> CommandTerm:

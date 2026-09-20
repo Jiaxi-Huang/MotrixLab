@@ -12,6 +12,8 @@ queries (height-field grid, key-pose foot frames via FK) provide the static
 data those terms consume. No environment subclass is needed.
 """
 
+from dataclasses import replace
+
 from motrix_env_core.base import SimCfg
 from motrix_env_core.config import configclass
 from motrix_env_core.config.scene import (
@@ -53,6 +55,7 @@ from motrix_env_core.sim import (
     GeomSpecsQuery,
     HeightFieldDataQuery,
 )
+from motrix_env_motrixsim.input import RendererKeyboardPlanarVelocitySourceCfg
 from motrix_envs.config.scene import StandardSceneAssetsCfg, StandardSceneCfg
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.command import WalkCommandCfg
 from motrix_envs.locomotion.humanoid.walk_manager_mdp.observations import GaitPhaseObsCfg
@@ -219,3 +222,27 @@ class HumanoidVelocityTrackingManagerEnvCfg(ManagerBasedEnvCfg):
         self.rewards.feet_phase.ground_geom = ground_geom
         self.sim_reset.humanoid_state.ground_geom = ground_geom
         self.commands.walk.ctrl_dt = self.ctrl_dt
+
+    def for_play(self) -> "HumanoidVelocityTrackingManagerEnvCfg":
+        """Drive the velocity command from the renderer keyboard during play.
+
+        Teleop replaces random resampling; the keyboard command range mirrors
+        the training ``vel_limit`` scaled by 0.5 — low-speed commands track
+        best, so teleop stays in the well-trained range. Episodes have no
+        length cap; without a renderer the device stays neutral (zero
+        command).
+        """
+        return replace(
+            self,
+            max_episode_seconds=None,
+            commands=replace(
+                self.commands,
+                walk=replace(
+                    self.commands.walk,
+                    source=RendererKeyboardPlanarVelocitySourceCfg(
+                        command_lower=tuple(value * 0.5 for value in self.commands.walk.vel_limit[0]),
+                        command_upper=tuple(value * 0.5 for value in self.commands.walk.vel_limit[1]),
+                    ),
+                ),
+            ),
+        )

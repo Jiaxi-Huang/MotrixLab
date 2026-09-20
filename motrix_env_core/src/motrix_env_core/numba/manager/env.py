@@ -17,6 +17,7 @@ from motrix_env_core.array.env import ArrayEnv, ArrayEnvState, EnvCfgType, NpObs
 from motrix_env_core.base import EnvCfg, ObsSpace
 from motrix_env_core.config import configclass
 from motrix_env_core.config.sim_reset import ManagerResetCfg, ResetTermCfg
+from motrix_env_core.input.bindings import CommandBinding
 from motrix_env_core.numba.kernel import (
     ManagerWarmupResult,
     NumbaKernelOutputs,
@@ -398,6 +399,14 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             )
             for name, command_cfg in self._command_cfgs.items()
         }
+        # Device-driven commands: resolve each declared source once and poll
+        # it every transition (see compute_transition). The binding — not the
+        # kernel_data term — owns the device handle, so terms stay pure arrays.
+        self._command_sources: dict[str, CommandBinding] = {
+            name: command_cfg.source(self)
+            for name, command_cfg in self._command_cfgs.items()
+            if command_cfg.source is not None
+        }
         self._rand = canonicalize_kernel_data(_create_rand_value(self), context="Manager random state")
         self._action_space, self._action_slices = self._build_action_space()
         self._reward_terms = create_reward_terms(cfg.reward_cfgs(), self)
@@ -716,6 +725,23 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             env_ids = np.concatenate([env_ids, sim_reset_ids])
         if env_ids.size:
             self._reset_sim_rows(env_ids, self._kernel_inputs)
+        self._refresh_command_sources()
+
+    def _refresh_command_sources(self) -> None:
+        """Overwrite device-driven command buffers with fresh source reads.
+
+        Called at every read boundary — after the evaluate kernel in
+        :meth:`compute_transition` and after the reset kernel in
+        :meth:`reset` — so rewards, observations, and host consumers always
+        see the source command regardless of any kernel-internal resampling.
+        Each binding polls its device exactly once per call.
+        """
+        if not self._command_sources:
+            return
+        with self.perf.scope("command_sources"):
+            for name, binding in self._command_sources.items():
+                command = binding.read_command(batch_size=self.num_envs)
+                self._command_terms[name].command[:] = command.values
 
     def _make_metrics_view(self) -> dict[str, Any]:
         """Assemble the persistent live metrics view for the current state.
@@ -746,6 +772,11 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             self._refresh_sim_reads()
         with self.perf.scope("evaluate"):
             self._execute_evaluate_kernel(self._kernel_inputs)
+        # Device-driven commands are injected between the evaluate and observe
+        # kernels — the same visibility boundary as kernel-internal resampling
+        # in ``advance``: rewards this step consumed the previous command,
+        # observations and next step's rewards see the fresh one.
+        self._refresh_command_sources()
         with self.perf.scope("command_on_transition"):
             for command_term in self._command_terms.values():
                 command_term.on_transition()
@@ -768,6 +799,11 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
     @property
     def command_terms(self) -> dict[str, CommandTerm]:
         return self._command_terms
+
+    @property
+    def command_sources(self) -> dict[str, CommandBinding]:
+        """Device-driven command bindings keyed by their command term names."""
+        return self._command_sources
 
     @property
     def manager_layout(self) -> ManagerLayout:

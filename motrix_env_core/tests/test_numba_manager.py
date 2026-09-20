@@ -3,7 +3,7 @@
 
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +17,7 @@ import motrix_env_core.numba.manager.env as manager_env_module
 from motrix_env_core.base import EnvCfg  # noqa: E402
 from motrix_env_core.config import configclass  # noqa: E402
 from motrix_env_core.config.scene import SceneCfg  # noqa: E402
+from motrix_env_core.input import CommandBinding, CommandSourceCfg  # noqa: E402
 from motrix_env_core.manager import (  # noqa: E402
     ActionCfg,
     ActionTerm,
@@ -1112,3 +1113,98 @@ def test_termination_term_requires_dispatch_descriptor() -> None:
 
     with pytest.raises(TypeError, match="must be decorated with @dispatch"):
         TerminationManager({"undecorated": _UndecoratedTerminationCfg()}, env)
+
+
+@dataclass
+class _ScriptedCommand:
+    """Minimal command value object matching the binding ``values`` contract."""
+
+    values: np.ndarray
+
+
+class _ScriptedBinding(CommandBinding):
+    """Repeat one scripted row across the batch, once per read."""
+
+    def __init__(self, rows: tuple[tuple[float, ...], ...]) -> None:
+        self._rows = rows
+        self.reads = 0
+
+    def read_command(self, *, batch_size: int = 1) -> _ScriptedCommand:
+        row = np.asarray(self._rows[min(self.reads, len(self._rows) - 1)], dtype=np.float32)
+        self.reads += 1
+        return _ScriptedCommand(np.repeat(row[None, :], batch_size, axis=0))
+
+
+@configclass(kw_only=True)
+class _ScriptedSourceCfg(CommandSourceCfg):
+    rows: tuple[tuple[float, ...], ...]
+
+    def __call__(self, env: ManagerEnv) -> _ScriptedBinding:
+        del env
+        return _ScriptedBinding(self.rows)
+
+
+def _sourced_env(rows: tuple[tuple[float, ...], ...]) -> ManagerEnv:
+    cfg = _ManagerEnvCfg(commands=_ManagerCommandsCfg(counter=_CounterCommandCfg(source=_ScriptedSourceCfg(rows=rows))))
+    return ManagerEnv(cfg, num_envs=3)
+
+
+def test_command_source_is_absent_without_declaration() -> None:
+    env = _ManagerEnv(num_envs=2)
+
+    assert env.command_sources == {}
+
+
+def test_command_source_injects_binding_output_each_transition() -> None:
+    env = _sourced_env(((0.1,), (0.25,), (0.75,)))
+    state = env.init_state()
+    command = _counter_command(env)
+    binding = env.command_sources["counter"]
+    assert isinstance(binding, _ScriptedBinding)
+
+    # The initial reset pass is a read boundary too: the first scripted row is
+    # already visible before any transition runs.
+    np.testing.assert_allclose(command.command, [[0.1]] * 3)
+    assert binding.reads == 1
+
+    env.compute_transition(state)
+    np.testing.assert_array_equal(command.command, [[0.25]] * 3)
+    env.compute_transition(state)
+    np.testing.assert_array_equal(command.command, [[0.75]] * 3)
+    assert binding.reads == 3
+
+
+def test_command_source_supersedes_kernel_reset_writes() -> None:
+    env = _sourced_env(((0.5,),))
+    env.init_state()
+    command = _counter_command(env)
+    binding = env.command_sources["counter"]
+    assert isinstance(binding, _ScriptedBinding)
+    reads_before = binding.reads
+
+    # ``_CounterCommand.reset_env`` writes -1.0 into the command buffer inside
+    # the reset kernel; the source overwrite must supersede it before any
+    # consumer reads the buffer.
+    env.reset(np.array([0, 2]))
+
+    np.testing.assert_array_equal(command.command, [[0.5]] * 3)
+    assert binding.reads == reads_before + 1
+
+
+def test_command_source_is_polled_once_per_step() -> None:
+    env = _sourced_env(((0.5,),))
+    env.init_state()
+    binding = env.command_sources["counter"]
+    assert isinstance(binding, _ScriptedBinding)
+    reads_at_init = binding.reads
+
+    env.step(np.ones((env.num_envs, 1), dtype=np.float32))
+    reads_after_one_step = binding.reads
+
+    env.step(np.ones((env.num_envs, 1), dtype=np.float32))
+
+    # One source read per transition, plus one per reset pass: every step here
+    # terminates (termination threshold 0.5 < action 1.0), so each step reads
+    # exactly twice. The init reset pass accounts for the first read.
+    assert reads_after_one_step - reads_at_init == 2
+    assert binding.reads - reads_after_one_step == 2

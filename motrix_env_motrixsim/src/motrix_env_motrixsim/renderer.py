@@ -67,6 +67,11 @@ class MotrixSimRenderer(SimRenderer):
         self._sync_render_data = True
         self._render.system_camera.active = True
 
+    @property
+    def input(self) -> mtx.render.Input:
+        """The renderer window's input frame, refreshed at every ``render`` sync."""
+        return self._render.input
+
     def render(self) -> None:
         if self._headless:
             self._render.sync(data=self._data_source())

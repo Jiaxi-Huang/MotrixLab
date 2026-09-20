@@ -315,6 +315,9 @@ class MotrixSimBackend(SimBackend):
         self._num_envs = num_envs
         self._model_compiler = MotrixSimModelCompiler(self._model)
         self._write_compiler = MotrixSimWriteCompiler(self._model, self._data)
+        # Set by create_renderer; host-side consumers (the renderer keyboard
+        # device) reach the live window's input frame through it.
+        self._renderer: SimRenderer | None = None
 
     @property
     def model_compiler(self) -> SimModelCompiler:
@@ -343,7 +346,7 @@ class MotrixSimBackend(SimBackend):
         render_spacing: float,
         system_camera: SystemCameraCfg,
     ) -> SimRenderer:
-        return MotrixSimRenderer(
+        self._renderer = MotrixSimRenderer(
             self._model,
             lambda: self._data,
             config,
@@ -351,6 +354,12 @@ class MotrixSimBackend(SimBackend):
             render_spacing=render_spacing,
             system_camera=system_camera,
         )
+        return self._renderer
+
+    @property
+    def renderer(self) -> SimRenderer | None:
+        """The most recently created renderer, if any."""
+        return self._renderer
 
     def step(self, substeps: int) -> None:
         self._model.step_n(self._data, substeps)
