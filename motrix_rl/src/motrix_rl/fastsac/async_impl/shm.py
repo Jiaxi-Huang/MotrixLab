@@ -49,6 +49,7 @@ from __future__ import annotations
 import time
 
 import torch
+import torch.multiprocessing  # noqa: F401  registers CUDA-IPC reducers in every importing process
 from torch import nn
 
 
@@ -331,6 +332,42 @@ class WeightSnapshot:
         # lazily (only the publishing process ever reaches it) and keyed by size so
         # a checkpoint-resumed actor with different shapes re-allocates cleanly.
         self._staging_cache: tuple[int, torch.Tensor] | None = None
+        # CUDA-IPC fast path: when learner and collector share one GPU, the
+        # double-buffered weight slots live in device memory and the params/
+        # buffers never cross to the host. Allocated by the learner
+        # (init_gpu_slots) and bound by the collector (receive_gpu_slots);
+        # None/False keeps the host-shared-memory path above.
+        self._gpu_params: list[torch.Tensor] | None = None
+        self._gpu_buffers: list[torch.Tensor] | None = None
+        self._gpu_event: torch.cuda.Event | None = None
+        self._gpu_reader = False
+
+    def init_gpu_slots(self, device: torch.device, ipc_queue) -> None:
+        """Learner: allocate device-side double-buffer slots and ship IPC handles.
+
+        Must be called before the first :meth:`publish`. The CUDA tensors travel
+        to the collector through ``ipc_queue``; multiprocessing reduction turns
+        them into cudaIpcMemHandles, so both processes alias the same device
+        memory. The sender must keep the tensors alive for the process lifetime
+        (they stay referenced here).
+        """
+        if device.type != "cuda":
+            raise ValueError(f"GPU weight slots require a CUDA device, got {device}")
+        self._gpu_params = [torch.zeros(self.param_numel, device=device) for _ in range(2)]
+        self._gpu_buffers = (
+            [torch.zeros(self.buffer_numel, device=device) for _ in range(2)] if self.buffer_numel else None
+        )
+        self._gpu_event = torch.cuda.Event()
+        ipc_queue.put(("gpu_slots", self._gpu_params, self._gpu_buffers))
+
+    def receive_gpu_slots(self, ipc_queue, timeout: float = 60.0) -> None:
+        """Collector: bind the learner's device-side slots via the IPC handles."""
+        kind, params, buffers = ipc_queue.get(timeout=timeout)
+        if kind != "gpu_slots":
+            raise RuntimeError(f"unexpected ipc message {kind!r}; expected 'gpu_slots'")
+        self._gpu_params = params
+        self._gpu_buffers = buffers
+        self._gpu_reader = True
 
     def _publish_staging(self, device_flat: torch.Tensor) -> torch.Tensor:
         size = device_flat.numel()
@@ -353,15 +390,12 @@ class WeightSnapshot:
         # while these device-to-host copies finish. Params and buffers are
         # flattened on-device into one contiguous vector and cross to the host
         # in a single pinned transfer (one DMA instead of one sync per tensor).
+        # With CUDA-IPC slots the flattened vector stays on-device entirely and
+        # only the (tiny) normalizer stats take the host path.
         device_flat = flatten_params(actor)
         if self.buffer_numel:
             buffers = flatten_buffers(actor)
             device_flat = torch.cat((device_flat, buffers))
-        staging = self._publish_staging(device_flat)
-        staging.copy_(device_flat, non_blocking=True)
-        if device_flat.is_cuda:
-            torch.cuda.current_stream().synchronize()
-        params = staging[: self.param_numel]
         has_stats = all(hasattr(obs_normalizer, k) for k in _NORM_KEYS)
         if has_stats:
             mean = obs_normalizer._mean.detach().cpu()
@@ -379,9 +413,24 @@ class WeightSnapshot:
         #    even without the seqlock guard. The guard exists for the case
         #    of two publishes during one read.
         slot = ((prev // 2) + 1) % 2
-        self._params[slot].copy_(params)
-        if self.buffer_numel:
-            self._buffers[slot].copy_(staging[self.param_numel :])
+        if self._gpu_params is not None:
+            stream = torch.cuda.current_stream()
+            self._gpu_params[slot].copy_(device_flat[: self.param_numel])
+            if self._gpu_buffers is not None:
+                self._gpu_buffers[slot].copy_(device_flat[self.param_numel :])
+            # The seq-even bump below is a CPU store, but the slot writes are
+            # asynchronous GPU copies: complete (and thus device-globally
+            # visible) them before publishing the version.
+            self._gpu_event.record(stream)
+            self._gpu_event.synchronize()
+        else:
+            staging = self._publish_staging(device_flat)
+            staging.copy_(device_flat, non_blocking=True)
+            if device_flat.is_cuda:
+                torch.cuda.current_stream().synchronize()
+            self._params[slot].copy_(staging[: self.param_numel])
+            if self.buffer_numel:
+                self._buffers[slot].copy_(staging[self.param_numel :])
         if has_stats:
             self._mean[slot].copy_(mean)
             self._std[slot].copy_(std)
@@ -431,6 +480,34 @@ class WeightSnapshot:
             if version <= local_version:  # nothing new to load
                 return local_version, wait_writer_s, host_snapshot_s, 0.0
             slot = version % 2  # active slot at this seq
+            has_stats = all(hasattr(obs_normalizer, k) for k in _NORM_KEYS)
+            if self._gpu_reader:
+                # CUDA-IPC path: copy device-to-device straight into the bound
+                # flat params. The copy must COMPLETE before the seq re-check
+                # below (a republish during an in-flight copy would tear the
+                # read), so it is synchronized here rather than left async.
+                if flat_params is None:
+                    raise ValueError("the CUDA-IPC weight path requires bound flat_params")
+                actor_load_start = time.perf_counter()
+                flat_params.copy_(self._gpu_params[slot])
+                if self.buffer_numel:
+                    load_flat_buffers(actor, self._gpu_buffers[slot])
+                torch.cuda.current_stream().synchronize()
+                if has_stats:
+                    mean, std, var = normalizer_staging
+                    mean.copy_(self._mean[slot])
+                    std.copy_(self._std[slot])
+                    var.copy_(self._var[slot])
+                    count = int(self._count[slot][0])
+                    obs_normalizer._mean.copy_(mean, non_blocking=True)
+                    obs_normalizer._std.copy_(std, non_blocking=True)
+                    obs_normalizer._var.copy_(var, non_blocking=True)
+                    obs_normalizer.count.fill_(count)
+                actor_load_s = time.perf_counter() - actor_load_start
+                s2 = int(self._seq[0])
+                if s1 != s2:
+                    continue
+                return version, wait_writer_s, host_snapshot_s, actor_load_s
             # Snapshot the slot into local tensors first. We do not load
             # directly into the actor because load_flat_params performs
             # many small per-param copies that could each see a different
@@ -441,7 +518,6 @@ class WeightSnapshot:
                 if buffer_staging is None:
                     raise ValueError("buffer_staging is required for actor buffers")
                 buffer_staging.copy_(self._buffers[slot])
-            has_stats = all(hasattr(obs_normalizer, k) for k in _NORM_KEYS)
             if has_stats:
                 mean, std, var = normalizer_staging
                 mean.copy_(self._mean[slot])

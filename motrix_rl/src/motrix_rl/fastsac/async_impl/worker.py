@@ -253,6 +253,7 @@ def run_collector_process(
     logging_interval: int,
     is_resume: bool,
     seed,
+    ipc_queue=None,
 ) -> None:
     try:
         _configure_process_logging()
@@ -276,6 +277,10 @@ def run_collector_process(
             control,
             is_resume=is_resume,
         )
+        if ipc_queue is not None:
+            # Bind the learner's CUDA-IPC weight slots before the first
+            # sync_weights so every later load takes the device-side path.
+            weights.receive_gpu_slots(ipc_queue)
         collector.reset()
         collector.sync_weights()
         collector.warmup_inference()
@@ -320,6 +325,7 @@ def run_learner_process(
     checkpoint_format: str,
     resume_from: str | None,
     seed,
+    ipc_queue=None,
 ) -> None:
     _configure_process_logging()
     console, live = open_training_live()
@@ -342,6 +348,11 @@ def run_learner_process(
             ckpt = torch.load(resume_from, map_location=device, weights_only=False)
             agent.load_state_dict(ckpt, load_optimizers=True)
 
+        if ipc_queue is not None:
+            # Allocate the CUDA-IPC weight slots and ship the handles BEFORE the
+            # first publish so the collector (blocking in receive_gpu_slots)
+            # can bind them and take the device-side path from step one.
+            weights.init_gpu_slots(device, ipc_queue)
         learner = Learner(agent, cfg, ring, weights, control)
         learner.publish_weights()  # give the collector an initial policy before it warms up
 

@@ -154,6 +154,16 @@ class Trainer(TrainerBase):
         ctx = mp.get_context("spawn")
         stats_queue = ctx.Queue(maxsize=8)
         error_queue = ctx.Queue(maxsize=8)
+        # Learner -> collector handoff of the CUDA-IPC weight slots (one message).
+        # ``learner=`` without an index means "current device", which matches any
+        # explicit collector index, so only a conflicting explicit index disables
+        # the fast path. No CUDA call is made here (the parent stays GPU-free).
+        gpu_ipc = (
+            learner_device.type == "cuda"
+            and collector_device.type == "cuda"
+            and (learner_device.index is None or learner_device.index == collector_device.index)
+        )
+        ipc_queue = ctx.Queue(maxsize=1) if gpu_ipc else None
         reported_errors: set[tuple[str, str]] = set()
         seed = self._context.seed
 
@@ -206,6 +216,7 @@ class Trainer(TrainerBase):
                 self._context.checkpoint_format,
                 self._resume_from,
                 seed,
+                ipc_queue,
             ),
             name="fastsac-async-learner",
         )
@@ -227,6 +238,7 @@ class Trainer(TrainerBase):
                 logging_interval,
                 is_resume,
                 seed,
+                ipc_queue,
             ),
             name="fastsac-async-collector",
         )
