@@ -214,14 +214,22 @@ class SharedTransitionRing:
 
 # ---------------------------------------------------------------- weight snapshot
 def flatten_params(module: nn.Module) -> torch.Tensor:
-    """Flatten a module's parameters into a single CPU float vector (in order)."""
-    return torch.cat([p.detach().reshape(-1).float() for p in module.parameters()]).cpu()
+    """Flatten module parameters into one contiguous float vector on the module's device."""
+    return torch.cat([p.detach().reshape(-1).float() for p in module.parameters()])
 
 
 def flatten_buffers(module: nn.Module) -> torch.Tensor:
-    """Flatten persistent non-empty module buffers."""
-    values = [buffer.detach().reshape(-1).float().cpu() for buffer in module.buffers() if buffer.numel()]
-    return torch.cat(values) if values else torch.empty(0)
+    """Flatten persistent non-empty buffers into one vector on the module's device.
+
+    A single device-side ``cat`` keeps this to one kernel regardless of buffer
+    count; per-buffer host transfers would serialize on many small syncs (the
+    SONIC actor carries dozens of norm-stat buffers).
+    """
+    values = [buffer.detach().reshape(-1).float() for buffer in module.buffers() if buffer.numel()]
+    if not values:
+        first = next(module.parameters(), None)
+        return torch.empty(0, device=first.device if first is not None else None)
+    return torch.cat(values)
 
 
 def load_flat_params(module: nn.Module, flat: torch.Tensor) -> None:
@@ -319,6 +327,17 @@ class WeightSnapshot:
         # Public version = seq // 2; starts at 0 (matching the collector's
         # ``_local_version = 0`` initial state so the first publish is seen).
         self._seq = _shared((1,), torch.int64)
+        # Learner-private pinned staging for the fused publish transfer. Allocated
+        # lazily (only the publishing process ever reaches it) and keyed by size so
+        # a checkpoint-resumed actor with different shapes re-allocates cleanly.
+        self._staging_cache: tuple[int, torch.Tensor] | None = None
+
+    def _publish_staging(self, device_flat: torch.Tensor) -> torch.Tensor:
+        size = device_flat.numel()
+        if self._staging_cache is None or self._staging_cache[0] != size:
+            pinned = device_flat.is_cuda
+            self._staging_cache = (size, torch.empty(size, dtype=torch.float32, pin_memory=pinned))
+        return self._staging_cache[1]
 
     @property
     def version(self) -> int:
@@ -331,9 +350,18 @@ class WeightSnapshot:
         and flip the active pointer via the seqlock."""
         # Materialize the learner's CUDA state on CPU before making the seqlock
         # odd. Collector readers may keep using the previous complete version
-        # while these device-to-host copies finish.
-        params = flatten_params(actor)
-        buffers = flatten_buffers(actor)
+        # while these device-to-host copies finish. Params and buffers are
+        # flattened on-device into one contiguous vector and cross to the host
+        # in a single pinned transfer (one DMA instead of one sync per tensor).
+        device_flat = flatten_params(actor)
+        if self.buffer_numel:
+            buffers = flatten_buffers(actor)
+            device_flat = torch.cat((device_flat, buffers))
+        staging = self._publish_staging(device_flat)
+        staging.copy_(device_flat, non_blocking=True)
+        if device_flat.is_cuda:
+            torch.cuda.current_stream().synchronize()
+        params = staging[: self.param_numel]
         has_stats = all(hasattr(obs_normalizer, k) for k in _NORM_KEYS)
         if has_stats:
             mean = obs_normalizer._mean.detach().cpu()
@@ -353,7 +381,7 @@ class WeightSnapshot:
         slot = ((prev // 2) + 1) % 2
         self._params[slot].copy_(params)
         if self.buffer_numel:
-            self._buffers[slot].copy_(buffers)
+            self._buffers[slot].copy_(staging[self.param_numel :])
         if has_stats:
             self._mean[slot].copy_(mean)
             self._std[slot].copy_(std)
