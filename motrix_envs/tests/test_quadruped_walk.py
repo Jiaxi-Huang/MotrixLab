@@ -10,7 +10,7 @@ from motrix_env_core.config.scene import HFieldTerrainCfg, ProceduralHFieldAsset
 from motrix_env_core.sim.model import ActuatorType
 from motrix_envs.locomotion.quadruped.cfg import RewardScales
 from motrix_envs.locomotion.quadruped.velocity_command import RandomPlanarVelocityBinding
-from motrix_envs.locomotion.quadruped.walk_np import QuadrupedWalkTask
+from motrix_envs.locomotion.quadruped.walk_np import _FOOTPRINT, QuadrupedWalkTask
 
 
 def _read_param_overrides(env):
@@ -408,7 +408,8 @@ def test_walk_task_selects_named_robot_key_pose():
 
 def test_swing_height_reward_requires_feet_to_leave_ground(quadruped_env):
     reward_cfg = quadruped_env.cfg.reward_config
-    quadruped_env.feet_pos[:, :, 2] = reward_cfg.target_foot_height - reward_cfg.base_height_target
+    quadruped_env.feet_stance_world_z[:, :] = 0.0
+    quadruped_env.feet_world_pos[:, :, 2] = reward_cfg.target_foot_height
 
     reward = _swing_reward(
         quadruped_env,
@@ -420,13 +421,14 @@ def test_swing_height_reward_requires_feet_to_leave_ground(quadruped_env):
 
 def test_swing_height_reward_prefers_target_height(quadruped_env):
     reward_cfg = quadruped_env.cfg.reward_config
-    target_z = reward_cfg.target_foot_height - reward_cfg.base_height_target
+    quadruped_env.feet_stance_world_z[:, :] = 0.0
+    target_z = quadruped_env.feet_stance_world_z + reward_cfg.target_foot_height
     no_contacts = np.zeros((1, quadruped_env._num_feet), dtype=bool)
 
-    quadruped_env.feet_pos[:, :, 2] = target_z
+    quadruped_env.feet_world_pos[:, :, 2] = target_z
     target_reward = _swing_reward(quadruped_env, no_contacts)
 
-    quadruped_env.feet_pos[:, :, 2] = target_z - 2.0 * reward_cfg.swing_feet_height_sigma
+    quadruped_env.feet_world_pos[:, :, 2] = target_z - 2.0 * reward_cfg.swing_feet_height_sigma
     off_target_reward = _swing_reward(quadruped_env, no_contacts)
 
     np.testing.assert_allclose(target_reward, np.ones((1,), dtype=np.float32))
@@ -447,3 +449,31 @@ def test_swing_contact_penalty_detects_dragging_feet(quadruped_env):
 
     np.testing.assert_array_equal(no_drag, np.zeros((1,), dtype=np.float32))
     np.testing.assert_array_equal(all_drag, np.ones((1,), dtype=np.float32))
+
+
+@pytest.mark.parametrize("env_name", ["go1-walk-stairs", "go2-walk-stairs"])
+def test_quadruped_stairs_walk_resets_on_platform_slots(env_name):
+    cfg = registry.make_env_config(env_name)
+    assert isinstance(cfg.scene.assets.terrain, ProceduralHFieldAssetCfg)
+    assert isinstance(cfg.scene.objs.floor, HFieldTerrainCfg)
+
+    env = registry.make(env_name, num_envs=32, mode="train")
+    env.init_state()
+    base_pos = env.sim_data["base_pos"]
+    env_ids = np.arange(env.num_envs, dtype=np.int64)
+    footprint = env.sim.sample_terrain_height(
+        env.cfg.ground_geom_name, env_ids, base_pos[:, None, :2] + _FOOTPRINT[None, :, :]
+    )
+    ground = footprint.max(axis=1)
+
+    # Spawns land exactly on the stairs structures' centers, standing
+    # flat at the init height.
+    for x, y in base_pos[:, :2]:
+        assert any(abs(x - sx) < 1e-3 and abs(y - sy) < 1e-3 for sx, sy in env.cfg.spawn_points)
+    assert np.all(footprint.max(axis=1) - footprint[:, 4] < 0.05)
+
+    np.testing.assert_allclose(base_pos[:, 2] - ground, env.cfg.initial_base_position[2], atol=1e-4)
+
+    next_state = env.step(np.zeros((env.num_envs, *env.action_space.shape), dtype=np.float32))
+    assert not np.any(next_state.terminated)
+    assert np.all(np.isfinite(next_state.reward))

@@ -2,7 +2,7 @@
 
 `QuadrupedWalkEnvCfg` provides defaults for the shared velocity-tracking logic. A robot config usually subclasses this
 config and overrides only its robot, sensor mapping, action scale, reward targets, and terrain. Define one complete
-flat-ground config first and derive the rough-terrain config from it so that the two tasks differ only where intended.
+flat-ground config first and derive terrain variants from it so the tasks differ only where intended.
 
 ## 1. Define a config
 
@@ -156,7 +156,8 @@ environment implementation.
 | `max_episode_seconds`   | Episode duration that produces truncation                                       |
 | `ctrl_dt`               | Policy control period and the timestep scale applied to the reward sum          |
 
-Built-in flat and rough configs both use `spawn_xy_range=4.0`. A rough config inherits the complete flat config and
-overrides only `scene`, replacing `FlatTerrainCfg` with `QuadrupedWalkTerrainSceneAssetsCfg` and `HFieldTerrainCfg`.
-At reset, the environment raises the base above the highest of nine terrain samples near the spawn point; the body-height
-reward also remains relative to local terrain during the episode.
+Built-in flat and rough configs both use `spawn_xy_range=4.0`. Terrain variants inherit the complete flat config and
+override only the scene and terrain-specific fields: rough replaces `FlatTerrainCfg` with
+`QuadrupedWalkRoughSceneAssetsCfg` and `HFieldTerrainCfg`, while stairs additionally uses fixed stair-structure spawn
+slots. At reset, the environment raises the base above the highest of nine terrain samples near the spawn point; the
+body-height reward also remains relative to local terrain during the episode.

@@ -59,11 +59,12 @@ python scripts/view.py env=<env-id>
 | <img src="../../_static/images/poster/g1-walk-flat.jpg" alt="g1-walk-flat" width="240"> | `g1-walk-flat` | 控制 Unitree G1 在平地上跟踪行走指令。 | `motrix.fastsac` |
 | <img src="../../_static/images/poster/g1-walk-rough.jpg" alt="g1-walk-rough" width="240"> | `g1-walk-rough` | 控制 Unitree G1 在起伏地形上跟踪行走指令。 | `motrix.fastsac` |
 | <img src="../../_static/images/poster/g1-wbt-dance.jpg" alt="g1-wbt-dance" width="240"> | `g1-wbt-dance` | 让 Unitree G1 跟踪内置舞蹈参考动作。 | `motrix.fastsac` |
-| <img src="../../_static/images/poster/go1-stairs-terrain-walk.jpg" alt="go1-stairs-terrain-walk" width="240"> | `go1-stairs-terrain-walk` | 控制 Unitree Go1 在台阶地形上行走。 | `rslrl.ppo`, `skrl.ppo` |
 | <img src="../../_static/images/poster/go1-walk-flat.jpg" alt="go1-walk-flat" width="240"> | `go1-walk-flat` | 控制 Unitree Go1 在平地上跟踪行走指令。 | `rslrl.ppo`, `skrl.ppo` |
 | <img src="../../_static/images/poster/go1-walk-rough.jpg" alt="go1-walk-rough" width="240"> | `go1-walk-rough` | 控制 Unitree Go1 在程序化粗糙高度场上跟踪行走指令。 | `rslrl.ppo`, `skrl.ppo` |
+| <img src="../../_static/images/poster/go1-walk-stairs.jpg" alt="go1-walk-stairs" width="240"> | `go1-walk-stairs` | 控制 Unitree Go1 在四周为平地的程序化金字塔台阶地形上跟踪行走指令。 | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` |
 | <img src="../../_static/images/poster/go2-walk-flat.jpg" alt="go2-walk-flat" width="240"> | `go2-walk-flat` | 控制 Unitree Go2 在平地上跟踪行走指令。 | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` |
 | <img src="../../_static/images/poster/go2-walk-rough.jpg" alt="go2-walk-rough" width="240"> | `go2-walk-rough` | 控制 Unitree Go2 在程序化粗糙高度场上跟踪行走指令。 | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` |
+| <img src="../../_static/images/poster/go2-walk-stairs.jpg" alt="go2-walk-stairs" width="240"> | `go2-walk-stairs` | 控制 Unitree Go2 在四周为平地的程序化金字塔台阶地形上跟踪行走指令。 | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` |
 | <img src="../../_static/images/poster/k1-walk-flat.jpg" alt="k1-walk-flat" width="240"> | `k1-walk-flat` | 控制 Booster K1 在平地上跟踪行走指令。 | `motrix.fastsac` |
 | <img src="../../_static/images/poster/k1-walk-rough.jpg" alt="k1-walk-rough" width="240"> | `k1-walk-rough` | 控制 Booster K1 在起伏地形上跟踪行走指令。 | `motrix.fastsac` |
 | <img src="../../_static/images/poster/k1-wbt-freekick.jpg" alt="k1-wbt-freekick" width="240"> | `k1-wbt-freekick` | 让 Booster K1 跟踪任意球射门参考动作。 | `motrix.fastsac` |

@@ -13,13 +13,17 @@ motrix_envs/src/motrix_envs/
 │   └── assets/<robot>/           # 可跨任务复用的机器人资产
 └── locomotion/
     └── quadruped/
-        └── <robot>.py            # 平地/粗糙地形配置与环境注册
+        └── <robot>.py            # 各地形任务配置与环境注册
 
 configs/task/
 ├── <robot>-walk-flat/
 │   ├── rslrl.ppo.yaml
 │   └── skrl.ppo.yaml
-└── <robot>-walk-rough/
+├── <robot>-walk-rough/
+    ├── rslrl.ppo.yaml
+    └── skrl.ppo.yaml
+└── <robot>-walk-stairs/        # 可选，如 Go1/Go2 台阶任务
+    ├── motrix.fastsac.yaml
     ├── rslrl.ppo.yaml
     └── skrl.ppo.yaml
 ```
@@ -137,14 +141,14 @@ class RobotWalkCfg(QuadrupedWalkEnvCfg):
 
 ## 4. 派生粗糙地形配置
 
-粗糙地形配置应继承平地配置并只覆盖 `scene`：
+粗糙地形配置应继承平地配置，只覆盖地形相关字段：
 
 ```python
 @registry.envcfg("<robot>-walk-rough")
 @configclass
 class RobotWalkRoughCfg(RobotWalkCfg):
     scene: QuadrupedSceneCfg = QuadrupedSceneCfg(
-        assets=QuadrupedWalkTerrainSceneAssetsCfg(),
+        assets=QuadrupedWalkRoughSceneAssetsCfg(),
         objs=StandardSceneObjsCfg(
             floor=HFieldTerrainCfg(hfield="terrain", material="mat_ground"),
             robot=registry.make_robot_config("<robot-config-id>"),
@@ -152,8 +156,10 @@ class RobotWalkRoughCfg(RobotWalkCfg):
     )
 ```
 
-内置高度场使用固定 seed `0`、`32 m × 32 m` 尺寸、`320 × 320` 采样点和 `0.1 m` 高度尺度。若使用自定义
-高度场，应继续保留 `floor` 地面 geom，并验证出生高度和机体高度奖励都能正确查询地形。
+内置高度场使用固定 seed `0`、`64 m × 64 m` 尺寸、`320 × 320` 采样点和 `0.1 m` 高度尺度。若使用自定义
+高度场，应继续保留 `floor` 地面 geom，并验证出生高度和机体高度奖励都能正确查询地形。粗糙变体需要调整奖励
+目标时，应在 `__post_init__` 中只修改对应字段；直接替换整个 `RewardConfig` 会把平地任务继承的兄弟字段重置为
+默认值。
 
 ## 5. 注册共享环境实现
 

@@ -24,7 +24,7 @@ from motrix_envs.locomotion.quadruped.cfg import (
     QuadrupedSceneCfg,
     QuadrupedTaskSensorsCfg,
     QuadrupedWalkEnvCfg,
-    QuadrupedWalkTerrainSceneAssetsCfg,
+    QuadrupedWalkRoughSceneAssetsCfg,
     RewardConfig,
     RewardScales,
     Sensor,
@@ -141,7 +141,7 @@ class AnymalCWalkRoughDirectEnvCfg(AnymalCWalkDirectEnvCfg):
     """
 
     scene: AnymalCWalkSceneCfg = AnymalCWalkSceneCfg(
-        assets=QuadrupedWalkTerrainSceneAssetsCfg(),
+        assets=QuadrupedWalkRoughSceneAssetsCfg(),
         objs=StandardSceneObjsCfg(
             floor=HFieldTerrainCfg(
                 hfield="terrain",

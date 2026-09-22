@@ -14,13 +14,17 @@ motrix_envs/src/motrix_envs/
 │   └── assets/<robot>/           # Robot assets reusable across tasks
 └── locomotion/
     └── quadruped/
-        └── <robot>.py            # Flat/rough configs and environment registration
+        └── <robot>.py            # Terrain-variant configs and environment registration
 
 configs/task/
 ├── <robot>-walk-flat/
 │   ├── rslrl.ppo.yaml
 │   └── skrl.ppo.yaml
-└── <robot>-walk-rough/
+├── <robot>-walk-rough/
+    ├── rslrl.ppo.yaml
+    └── skrl.ppo.yaml
+└── <robot>-walk-stairs/        # Optional, as in the Go1/Go2 stairs tasks
+    ├── motrix.fastsac.yaml
     ├── rslrl.ppo.yaml
     └── skrl.ppo.yaml
 ```
@@ -141,14 +145,14 @@ coupled adjustments.
 
 ## 4. Derive the rough-terrain config
 
-A rough-terrain config should inherit the flat config and override only `scene`:
+A rough-terrain config should inherit the flat config and override only its terrain-specific fields:
 
 ```python
 @registry.envcfg("<robot>-walk-rough")
 @configclass
 class RobotWalkRoughCfg(RobotWalkCfg):
     scene: QuadrupedSceneCfg = QuadrupedSceneCfg(
-        assets=QuadrupedWalkTerrainSceneAssetsCfg(),
+        assets=QuadrupedWalkRoughSceneAssetsCfg(),
         objs=StandardSceneObjsCfg(
             floor=HFieldTerrainCfg(hfield="terrain", material="mat_ground"),
             robot=registry.make_robot_config("<robot-config-id>"),
@@ -156,9 +160,10 @@ class RobotWalkRoughCfg(RobotWalkCfg):
     )
 ```
 
-The built-in height field uses seed `0`, a `32 m × 32 m` area, a `320 × 320` grid, and a `0.1 m` height scale. A custom
+The built-in height field uses seed `0`, a `64 m × 64 m` area, a `320 × 320` grid, and a `0.1 m` height scale. A custom
 height field should retain the `floor` ground geom and verify that both spawn height and body-height rewards query terrain
-correctly.
+correctly. When a rough variant changes a reward target, mutate only that field in `__post_init__`; replacing the whole
+`RewardConfig` resets sibling fields inherited from the flat task.
 
 ## 5. Register the shared environment implementation
 

@@ -24,6 +24,7 @@ from motrix_env_core.sim import (
     BodyRotationWrite,
     DofVelocityQuery,
     GeomFrictionQuery,
+    GeomPositionQuery,
     LinkPositionQuery,
     SensorValuesQuery,
 )
@@ -45,6 +46,7 @@ from motrix_envs.robot import QuadrupedRobotCfg
 
 def _sim_data_queries(cfg: QuadrupedWalkEnvCfg):
     base_link_name = cfg.scene.objs.robot.resolved_base_link_name
+    foot_geoms = cfg.scene.objs.robot.foot_contact_geom_names
     return {
         "joint_dof_pos": BodyJointPositionQuery(body=base_link_name),
         "joint_dof_vel": BodyJointVelocityQuery(body=base_link_name),
@@ -62,6 +64,10 @@ def _sim_data_queries(cfg: QuadrupedWalkEnvCfg):
         "FR_pos": SensorValuesQuery(sensors=(cfg.sensor.foot_positions[1],)),
         "RL_pos": SensorValuesQuery(sensors=(cfg.sensor.foot_positions[2],)),
         "RR_pos": SensorValuesQuery(sensors=(cfg.sensor.foot_positions[3],)),
+        "FL_world_pos": GeomPositionQuery(geom=foot_geoms[0]),
+        "FR_world_pos": GeomPositionQuery(geom=foot_geoms[1]),
+        "RL_world_pos": GeomPositionQuery(geom=foot_geoms[2]),
+        "RR_world_pos": GeomPositionQuery(geom=foot_geoms[3]),
     }
 
 
@@ -159,6 +165,7 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             "rear_right_contact",
         )
         self._feet_position_sensors = foot_position_sensors
+        self._feet_world_position_queries = ("FL_world_pos", "FR_world_pos", "RL_world_pos", "RR_world_pos")
         velocity_cfg = cfg.commands.velocity
         root_seed = int(np.random.randint(0, np.iinfo(np.uint32).max, dtype=np.uint32))
         command_seed, randomization_seed = np.random.SeedSequence(root_seed).spawn(2)
@@ -220,6 +227,8 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
 
         self.feet_contact = np.zeros((num_envs, self._num_feet), dtype=bool)
         self.feet_pos = np.zeros((num_envs, self._num_feet, 3), dtype=np.float32)
+        self.feet_world_pos = np.zeros((num_envs, self._num_feet, 3), dtype=np.float32)
+        self.feet_stance_world_z = np.zeros((num_envs, self._num_feet), dtype=np.float32)
 
         # Episode-scoped task state: full-batch buffers, reset writes the done
         # rows in place.
@@ -303,6 +312,9 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         self.feet_contact[rows, :] = contacts[rows, :]
         for i, name in enumerate(self._feet_position_sensors):
             self.feet_pos[rows, i, :] = self.sim_data[name][rows]
+            self.feet_world_pos[rows, i, :] = self.sim_data[self._feet_world_position_queries[i]][rows]
+            stance_z = self.feet_world_pos[rows, i, 2]
+            self.feet_stance_world_z[rows, i] = np.where(contacts[rows, i], stance_z, self.feet_stance_world_z[rows, i])
 
     def _advance_phase(self):
         commands = self._commands
@@ -422,8 +434,14 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         self._randomize_dof_noise(env_ids, base_linear_velocity, base_angular_velocity, joint_position, joint_velocity)
 
         spawn_range = self.cfg.spawn_xy_range
-        if spawn_range > 0.0:
+        if self.cfg.spawn_points:
+            slots = np.asarray(self.cfg.spawn_points, dtype=np.float32)
+            xy = slots[np.random.randint(0, slots.shape[0], size=(num_reset,))]
+        elif spawn_range > 0.0:
             xy = np.random.uniform(-spawn_range, spawn_range, size=(num_reset, 2)).astype(np.float32)
+        else:
+            xy = None
+        if xy is not None:
             ground_height = self.sim.sample_terrain_height(
                 self.cfg.ground_geom_name, env_ids, xy[:, None, :] + _FOOTPRINT[None, :, :]
             ).max(axis=1)
@@ -442,6 +460,7 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
 
         self.sim_data.execute(np.asarray(env_ids, dtype=np.int64))
         self._update_feet_buffers(env_ids)
+        self.feet_stance_world_z[env_ids] = self.feet_world_pos[env_ids, :, 2]
 
         self._commands[env_ids] = self.resample_commands(num_reset)
         self._command_resampling_time[env_ids] = self._sample_command_resampling_time(num_reset)
@@ -608,12 +627,10 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         contacts = self.feet_contact
         valid_swing = (feet_phase >= 0.6) & ~contacts
         reward_cfg = self.cfg.reward_config
-        # feet_pos is body-relative (framepos with ref=imu). The foot lifts
-        # `target_height` above its stance position, so the body-frame target is
-        # target_height - base_height_target (e.g. 0.1 - 0.3 = -0.2). This keeps
-        # the reward invariant to the body's world-frame vertical motion.
-        target_z = reward_cfg.target_foot_height - reward_cfg.base_height_target
-        height_error = np.square(self.feet_pos[:, :, 2] - target_z)
+        # World-space liftoff height keeps the target fixed while the base
+        # pitches or moves vertically over split-level terrain.
+        target_z = self.feet_stance_world_z + reward_cfg.target_foot_height
+        height_error = np.square(self.feet_world_pos[:, :, 2] - target_z)
         sigma_sq = reward_cfg.swing_feet_height_sigma**2
         swing_rew = np.exp(-height_error / sigma_sq) * valid_swing
         return np.sum(swing_rew, axis=1) / self._num_feet

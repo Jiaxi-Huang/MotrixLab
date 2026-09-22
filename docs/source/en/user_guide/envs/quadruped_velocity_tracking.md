@@ -69,17 +69,19 @@ quadruped_velocity_tracking/config_tuning
 
 ## Built-in robots
 
-MotrixLab provides flat-ground and procedural rough-height-field configs for the following robots. Every environment ID
-registers the same `QuadrupedWalkTask`, but selects its own complete configuration. Click a training-curve thumbnail to
-open the full-size SVG.
+MotrixLab provides flat-ground, procedural rough-height-field, and composed height-field configs such as stairs terrain
+for the following robots. Every environment ID registers the same `QuadrupedWalkTask`, but selects its own complete
+configuration. Click a training-curve thumbnail to open the full-size SVG.
 
 :::{div} task-table
 | Environment ID | Robot | Terrain | Available training configs | Training curve |
 | --- | --- | --- | --- | --- |
 | `go1-walk-flat` | Unitree Go1 | Flat ground | `rslrl.ppo`, `skrl.ppo` | — |
 | `go1-walk-rough` | Unitree Go1 | Procedural rough height field | `rslrl.ppo`, `skrl.ppo` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="go1-walk-rough-curve" aria-label="Enlarge the Unitree Go1 rough-terrain training curve"><img src="../../_static/images/performance/go1-walk-rough.svg" alt="Unitree Go1 rough-terrain RSL-RL PPO training curve" width="180"></button> |
+| `go1-walk-stairs` | Unitree Go1 | Procedural pyramid-stairs platforms and pits | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` | — |
 | `go2-walk-flat` | Unitree Go2 | Flat ground | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` | — |
 | `go2-walk-rough` | Unitree Go2 | Procedural rough height field | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="go2-walk-rough-curve" aria-label="Enlarge the Unitree Go2 rough-terrain training curve"><img src="../../_static/images/performance/go2-walk-rough.svg" alt="Unitree Go2 rough-terrain RSL-RL PPO training curve" width="180"></button> |
+| `go2-walk-stairs` | Unitree Go2 | Procedural pyramid-stairs platforms and pits | `motrix.fastsac`, `rslrl.ppo`, `skrl.ppo` | — |
 | `anymalc-walk-flat` | ANYmal-C | Flat ground | `rslrl.ppo`, `skrl.ppo` | — |
 | `anymalc-walk-rough` | ANYmal-C | Procedural rough height field | `rslrl.ppo`, `skrl.ppo` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="anymalc-walk-rough-curve" aria-label="Enlarge the ANYmal-C rough-terrain training curve"><img src="../../_static/images/performance/anymalc-walk-rough.svg" alt="ANYmal-C rough-terrain RSL-RL PPO training curve" width="180"></button> |
 :::
@@ -102,12 +104,13 @@ open the full-size SVG.
   <p id="anymalc-walk-rough-curve-caption">ANYmal-C (<code>anymalc-walk-rough</code>) training curve</p>
 </dialog>
 
-The flat-ground and rough-terrain configs for each robot share the robot, control, commands, rewards, spawn range, and
-termination logic; only the scene terrain differs. The curves in the table show rough-terrain training progress: the x-axis
-reports cumulative environment steps, and the y-axis reports mean episode return, making learning progress and convergence
-trends easy to inspect. Returns rise rapidly early in training and then stabilize, showing that the policies quickly learn
-sustained rough-terrain locomotion. Under the current training configs and hardware, the tasks shown here converge in roughly
-1–2 minutes, demonstrating the high throughput of the parallel simulation and training pipeline.
+Each terrain config starts from the corresponding flat task. Rough terrain changes only the height field; stairs also place
+resets on stair-structure centers and relax the vertical-velocity penalty so climbing and descending are not punished as
+failure motion. The curves in the table show rough-terrain training progress: the x-axis reports cumulative environment
+steps, and the y-axis reports mean episode return, making learning progress and convergence trends easy to inspect. Returns
+rise rapidly early in training and then stabilize, showing that the policies quickly learn sustained rough-terrain
+locomotion. Under the current training configs and hardware, the tasks shown here converge in roughly 1–2 minutes,
+demonstrating the high throughput of the parallel simulation and training pipeline.
 
 ## Commands
 

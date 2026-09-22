@@ -1,7 +1,7 @@
 # Copyright Motphys Technology Co., Ltd. 2025, 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Configuration for the generic quadruped flat-terrain walk task."""
+"""Shared configuration for quadruped flat-, rough-, and stairs-terrain walk tasks."""
 
 from dataclasses import replace
 
@@ -12,11 +12,16 @@ from omegaconf import MISSING
 from motrix_env_core.base import SimCfg
 from motrix_env_core.config import configclass
 from motrix_env_core.config.scene import (
+    CompositeTerrainGeneratorCfg,
     ContactSensorCfg,
     ContactSensorReduce,
+    FlatTerrainGeneratorCfg,
     NoiseTerrainGeneratorCfg,
     ProceduralHFieldAssetCfg,
     SceneSensorsCfg,
+    StairsTerrainGeneratorCfg,
+    TerrainRegionCfg,
+    grid_terrain,
 )
 from motrix_env_core.direct.env import DirectEnvCfg
 from motrix_envs.config.scene import StandardSceneAssetsCfg, StandardSceneCfg
@@ -59,8 +64,8 @@ class QuadrupedSceneCfg(StandardSceneCfg):
 
 
 @configclass
-class QuadrupedWalkTerrainSceneAssetsCfg(StandardSceneAssetsCfg):
-    """Standard scene assets plus the procedural terrain used by rough-walk tasks."""
+class QuadrupedWalkRoughSceneAssetsCfg(StandardSceneAssetsCfg):
+    """Standard scene assets plus the procedural rough height field used by rough-walk tasks."""
 
     terrain: ProceduralHFieldAssetCfg = ProceduralHFieldAssetCfg(
         generator=NoiseTerrainGeneratorCfg(
@@ -71,6 +76,154 @@ class QuadrupedWalkTerrainSceneAssetsCfg(StandardSceneAssetsCfg):
         size=(64.0, 64.0),
         shape=(320, 320),
     )
+
+
+# Stairs field layout: a centered 4x4 checkerboard of stair cells on a flat
+# corridor covering the rest of the field.
+_STAIRS_FIELD_CELLS = 8
+_STAIRS_BLOCK_CELLS = 4
+_STAIRS_STEP_HEIGHT = 0.08
+_STAIRS_STEP_WIDTH = 0.3
+_STAIRS_PLATFORM_WIDTH = 2.0
+# Structure difficulty by block ring: the inner 2x2 platforms and pits span
+# three risers, the outer twelve six.
+_STAIRS_INNER_STEPS = 4
+_STAIRS_OUTER_STEPS = 7
+
+
+def _stairs_rise(step_count: int) -> float:
+    """Corridor-to-plateau (platform) or rim-to-floor (pit) height."""
+    return (step_count - 1) * _STAIRS_STEP_HEIGHT
+
+
+def _stairs_corridor() -> float:
+    """Corridor height above the height-field floor; also the deepest pit depth.
+
+    Pits need headroom below their rim, so the corridor sits at half the field
+    span: platforms climb above it and pits sink below it, both anchored to the
+    cell-edge corridor through ``base_level``.
+    """
+    return _stairs_rise(_STAIRS_OUTER_STEPS)
+
+
+def _stairs_field_scale() -> float:
+    """Full height-field span: corridor plus the tallest platform rise."""
+    return _stairs_corridor() + _stairs_rise(_STAIRS_OUTER_STEPS)
+
+
+def _stairs_cell(step_count: int, *, descending: bool) -> StairsTerrainGeneratorCfg:
+    """One pyramid-stairs platform (``descending``) or pit (``ascending``).
+
+    A central plateau or pit floor with one exact ``step_height`` riser per
+    ``step_width`` ring back to the cell-edge corridor. Both scales span to
+    fraction 1.0, so the composite output covers [0, 1] exactly and the
+    engine's min-max height-field normalization stays the identity.
+    """
+    corridor = _stairs_corridor()
+    rise = _stairs_rise(step_count)
+    if descending:
+        scale = corridor + rise
+        base_level = corridor / scale
+    else:
+        scale = corridor
+        base_level = (corridor - rise) / scale
+    return StairsTerrainGeneratorCfg(
+        axis="radial",
+        profile="descending" if descending else "ascending",
+        step_count=step_count,
+        step_height=_STAIRS_STEP_HEIGHT,
+        step_width=_STAIRS_STEP_WIDTH,
+        platform_width=_STAIRS_PLATFORM_WIDTH,
+        base_level=base_level,
+        height_scale=scale,
+    )
+
+
+def _stairs_grid() -> CompositeTerrainGeneratorCfg:
+    """Alternating platforms and pits with difficulty by block ring."""
+
+    def step_count(i: int, j: int) -> int:
+        ring = max(abs(2 * i - (_STAIRS_BLOCK_CELLS - 1)), abs(2 * j - (_STAIRS_BLOCK_CELLS - 1)))
+        return _STAIRS_INNER_STEPS if ring == 1 else _STAIRS_OUTER_STEPS
+
+    cells = [
+        [
+            _stairs_cell(
+                step_count(i, j),
+                descending=(i + j) % 2 == 0,
+            )
+            for j in range(_STAIRS_BLOCK_CELLS)
+        ]
+        for i in range(_STAIRS_BLOCK_CELLS)
+    ]
+    return grid_terrain(
+        cells,
+        height_scale=_stairs_field_scale(),
+        base=FlatTerrainGeneratorCfg(
+            height=_stairs_corridor() / _stairs_field_scale(),
+            height_scale=_stairs_field_scale(),
+        ),
+    )
+
+
+def _stairs_terrain() -> CompositeTerrainGeneratorCfg:
+    """The stairs-walk field: one stair grid surrounded by flat corridor."""
+    corridor = FlatTerrainGeneratorCfg(
+        height=_stairs_corridor() / _stairs_field_scale(),
+        height_scale=_stairs_field_scale(),
+    )
+    block_fraction = _STAIRS_BLOCK_CELLS / _STAIRS_FIELD_CELLS
+    return CompositeTerrainGeneratorCfg(
+        base=corridor,
+        regions=(
+            TerrainRegionCfg(
+                generator=_stairs_grid(),
+                center=(0.5, 0.5),
+                size=(block_fraction, block_fraction),
+            ),
+        ),
+        height_scale=_stairs_field_scale(),
+    )
+
+
+@configclass
+class QuadrupedWalkStairsSceneAssetsCfg(StandardSceneAssetsCfg):
+    """Standard scene assets plus the procedural stairs terrain used by stairs-walk tasks.
+
+    Like the rough-walk field this is one bounded 64 m square. A centered 32 m
+    block carries a 4x4 grid of pyramid-stairs platforms and pits:
+    2.0 m plateaus and pit floors with exact 0.08 m risers on 0.3 m treads,
+    three risers in the inner 2x2 and six in the outer twelve, every structure
+    anchored to the cell-edge corridor through ``base_level``. Pits need
+    headroom below their rim, so the corridor sits at 0.48 m - half the field
+    span - and the deepest pit floors bottom out at the height-field floor.
+    Outside the block, the field is flat corridor.
+    """
+
+    terrain: ProceduralHFieldAssetCfg = ProceduralHFieldAssetCfg(
+        generator=_stairs_terrain(),
+        size=(64.0, 64.0),
+        shape=(641, 641),
+    )
+
+    def spawn_points(self) -> tuple[tuple[float, float], ...]:
+        """Return fixed spawn slots at the stairs structures' centers.
+
+        Platform plateaus and pit floors are both slots, so every episode
+        starts on a stair structure and traverses it.
+        """
+        generator = self.terrain.generator
+        size = np.asarray(self.terrain.size, dtype=np.float64)
+        block = generator.regions[0]
+        centers = (
+            (
+                block.center[0] - 0.5 * block.size[0] + (i + 0.5) / _STAIRS_BLOCK_CELLS * block.size[0],
+                block.center[1] - 0.5 * block.size[1] + (j + 0.5) / _STAIRS_BLOCK_CELLS * block.size[1],
+            )
+            for i in range(_STAIRS_BLOCK_CELLS)
+            for j in range(_STAIRS_BLOCK_CELLS)
+        )
+        return tuple((float((x - 0.5) * size[0]), float((y - 0.5) * size[1])) for x, y in centers)
 
 
 @configclass
@@ -227,6 +380,9 @@ class QuadrupedWalkEnvCfg(DirectEnvCfg):
     ground_geom_name: str = "floor"
     initial_base_position: tuple[float, float, float] = (0.0, 0.0, 0.3)
     spawn_xy_range: float = 0.0
+    # Fixed spawn slots (world xy); when non-empty, resets pick one slot at
+    # random instead of uniform sampling inside spawn_xy_range.
+    spawn_points: tuple[tuple[float, float], ...] = ()
     trot_pairs: tuple[tuple[int, int], ...] = ((0, 3), (1, 2))
     gait_frequency: float = 2.0
     sim: SimCfg = SimCfg(dt=0.01, solver_iterations=1)
@@ -264,7 +420,8 @@ __all__ = [
     "QuadrupedSceneCfg",
     "QuadrupedTaskSensorsCfg",
     "QuadrupedWalkEnvCfg",
-    "QuadrupedWalkTerrainSceneAssetsCfg",
+    "QuadrupedWalkStairsSceneAssetsCfg",
+    "QuadrupedWalkRoughSceneAssetsCfg",
     "RewardConfig",
     "RewardScales",
     "Sensor",

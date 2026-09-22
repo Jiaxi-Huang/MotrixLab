@@ -35,8 +35,8 @@ MotrixLab 是一个为机器人训练设计的机器学习通用架构。它基�
 
 :::{grid-item-card}
 
-```{video} _static/videos/go1_rough_terrain_walk.mp4
-:poster: _static/images/poster/go1_rough_terrain_walk.jpg
+```{video} _static/videos/go2-walk-rough.mp4
+:poster: _static/images/poster/go2-walk-rough.jpg
 :nocontrols:
 :autoplay:
 :playsinline:
@@ -49,8 +49,8 @@ MotrixLab 是一个为机器人训练设计的机器学习通用架构。它基�
 
 :::{grid-item-card}
 
-```{video} _static/videos/go1_stairs_terrain_walk.mp4
-:poster: _static/images/poster/go1_stairs_terrain_walk.jpg
+```{video} _static/videos/go1-walk-rough.mp4
+:poster: _static/images/poster/go1-walk-rough.jpg
 :nocontrols:
 :autoplay:
 :playsinline:

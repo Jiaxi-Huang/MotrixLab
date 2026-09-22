@@ -64,16 +64,6 @@ from motrix_envs.locomotion.humanoid.k1 import make_k1_walk_flat_cfg, make_k1_wa
 
 _CARTPOLE_XML = Path(__file__).parents[1] / "src" / "motrix_envs" / "basic" / "cartpole" / "cartpole.xml"
 _GROUND_TEXTURE = Path(__file__).parents[1] / "src" / "motrix_envs" / "common" / "motphys-ground.png"
-_HFIELD_FILE = (
-    Path(__file__).parents[1]
-    / "src"
-    / "motrix_envs"
-    / "locomotion"
-    / "go1"
-    / "xmls"
-    / "assets"
-    / "heightmap_stairs.hfield"
-)
 
 
 def test_scene_cfg_loads_base_model_file():
@@ -397,10 +387,16 @@ def test_light_cfg_rejects_negative_illuminance():
         validate_scene_cfg(scene)
 
 
-def test_scene_cfg_builds_hfield_terrain():
+def test_scene_cfg_builds_hfield_terrain(tmp_path):
+    hfield_file = tmp_path / "test_terrain.hfield"
+    shape = (4, 4)
+    with open(hfield_file, "wb") as f:
+        f.write(np.asarray(shape, dtype=np.int32).tobytes())
+        f.write(np.zeros(shape, dtype=np.float32).tobytes())
+
     @configclass
     class TerrainAssetsCfg(SceneAssetsCfg):
-        terrain_hfield: HFieldAssetCfg = HFieldAssetCfg(file=_HFIELD_FILE)
+        terrain_hfield: HFieldAssetCfg = HFieldAssetCfg(file=hfield_file)
 
     @configclass
     class TerrainSceneObjsCfg(SceneObjsCfg):

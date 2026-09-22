@@ -1,0 +1,9 @@
+# @package _global_
+# Task go2-walk-stairs: rslrl.ppo delta from the flat-terrain recipe.
+defaults:
+  - /task/go2-walk-flat/rslrl.ppo@_global_
+  - _self_
+task:
+  env: go2-walk-stairs
+algo:
+  max_iterations: 1000
