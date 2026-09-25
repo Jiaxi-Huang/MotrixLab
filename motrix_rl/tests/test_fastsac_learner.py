@@ -55,14 +55,43 @@ def test_own_copies_compiled_outputs_out_of_the_graph_pool() -> None:
     assert all(torch.isfinite(torch.as_tensor(float(v))) for v in owned)
 
 
+def test_own_copies_nested_compiled_metrics_out_of_the_graph_pool() -> None:
+    """Regression for variant metrics returned by the policy update."""
+    import pytest
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA graphs require a GPU")
+
+    from motrix_rl.fastsac.agent import _own
+
+    @torch.compile(mode="reduce-overhead")
+    def step(x):
+        y = x.tanh() @ x
+        return y.mean(), {"variant_reconstruction": y.square().mean(), "variant_total": y.abs().mean()}
+
+    x = torch.randn(64, 64, device="cuda")
+
+    torch.compiler.cudagraph_mark_step_begin()
+    loss, metrics = _own(step(x))
+    for _ in range(2):
+        torch.compiler.cudagraph_mark_step_begin()
+        step(x)
+
+    assert loss.device == x.device
+    assert all(value.device == x.device for value in metrics.values())
+    assert torch.isfinite(torch.as_tensor(float(loss)))
+    assert all(torch.isfinite(torch.as_tensor(float(value))) for value in metrics.values())
+
+
 def test_own_leaves_non_tensors_alone() -> None:
     from motrix_rl.fastsac.agent import _own
 
-    assert _own((1, "a", None)) == (1, "a", None)
+    assert _own((1, "a", None, {"nested": (2,)})) == (1, "a", None, {"nested": (2,)})
 
 
 def _tiny_agent_cfg(**overrides):
-    """Minimal valid FastSacAgentCfg namespace for a real (tiny) CUDA agent."""
+    """Minimal provider-level FastSac namespace for a real (tiny) CUDA agent."""
     values = dict(
         actor_hidden_dim=16,
         critic_hidden_dim=16,
@@ -97,7 +126,7 @@ def _tiny_agent_cfg(**overrides):
         device=None,
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return SimpleNamespace(agent=SimpleNamespace(**values), policy_variant="default")
 
 
 def test_update_metrics_survive_later_graph_generations() -> None:

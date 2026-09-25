@@ -46,6 +46,7 @@ from motrix_rl.fastsac.async_impl.worker import (
     run_learner_process,
 )
 from motrix_rl.fastsac.config import FastSacCfg
+from motrix_rl.fastsac.factory import configure_env_spec
 from motrix_rl.fastsac.wrap import FastSacEnvWrap
 from motrix_rl.frameworks import TrainerBase, TrainerContext
 from motrix_rl.system_metrics import (
@@ -64,7 +65,7 @@ class Trainer(TrainerBase):
         env_name = context.env_name
         self._rlcfg = context.rl_cfg
         self._env_name = env_name
-        self._env_spec = env_registry.resolve(env_name, sim=context.sim)
+        self._env_spec = configure_env_spec(self._rlcfg, env_registry.resolve(env_name, sim=context.sim))
         self._render = context.render
         self._resume_from = context.resume_from
         self._context = context
@@ -110,7 +111,7 @@ class Trainer(TrainerBase):
             critic_obs_dim=critic_obs_dim,
             act_dim=act_dim,
             num_envs=env.num_envs,
-            cfg=self._rlcfg.agent,
+            cfg=self._rlcfg,
             device=self._device(),
             action_scale=action_scale,
             action_bias=action_bias,

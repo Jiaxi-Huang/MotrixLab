@@ -70,6 +70,16 @@ def test_train_nested_algo_override():
     assert cfg.seed == 7
 
 
+def test_sonic_task_selects_single_policy_variant():
+    cfg = _compose("train", ["task=g1-sonic/motrix.fastsac"])
+
+    assert cfg.task.env == "g1-sonic"
+    assert cfg.algo.policy_variant == "sonic"
+    assert "num_future_frames" in cfg.algo.variant.model
+    assert "num_history_frames" in cfg.algo.variant.model
+    assert "auxiliary" in cfg.algo.variant
+
+
 def test_play_and_view_compose():
     play = _compose(
         "play",

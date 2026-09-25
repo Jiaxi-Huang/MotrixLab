@@ -57,6 +57,7 @@ from motrix_rl.fastsac.async_impl.transport.weight_channel import (
     weight_receiver_for,
 )
 from motrix_rl.fastsac.config import FastSacCfg
+from motrix_rl.fastsac.factory import make_actor
 from motrix_rl.fastsac.wrap import FastSacEnvWrap
 from motrix_rl.fastsac.wrap_np import FastSacNpEnvWrap
 from motrix_rl.fastsac.wrap_torch import FastSacTorchEnvWrap
@@ -93,25 +94,13 @@ def build_env(
 def actor_param_numel(cfg: FastSacCfg, dims, action_scale, action_bias) -> int:
     """Total actor parameter count, used to size the shared weight buffer.
 
-    Builds a throwaway CPU actor mirroring the learner's — device-independent, so
-    the parent can size shared memory without touching CUDA.
+    Builds a throwaway CPU actor mirroring the learner's — through the
+    configured policy variant, whose structure may differ from the vanilla
+    actor — device-independent, so the parent can size shared memory without
+    touching CUDA.
     """
-    from motrix_rl.fastsac.networks import Actor
-
     obs_dim, _critic_obs_dim, act_dim = dims
-    a = cfg.agent
-    actor = Actor(
-        n_obs=obs_dim,
-        n_act=act_dim,
-        hidden_dim=a.actor_hidden_dim,
-        log_std_max=a.log_std_max,
-        log_std_min=a.log_std_min,
-        use_tanh=a.use_tanh,
-        use_layer_norm=a.use_layer_norm,
-        action_scale=action_scale,
-        action_bias=action_bias,
-        device="cpu",
-    )
+    actor = make_actor(cfg, dims=(obs_dim, act_dim), action_scale=action_scale, action_bias=action_bias, device="cpu")
     return sum(p.numel() for p in actor.parameters())
 
 
@@ -138,7 +127,7 @@ def build_agent(
         critic_obs_dim=critic_obs_dim,
         act_dim=act_dim,
         num_envs=num_envs,
-        cfg=cfg.agent,
+        cfg=cfg,
         device=device,
         action_scale=action_scale,
         action_bias=action_bias,
@@ -547,9 +536,10 @@ def run_learner_process(
         # collector maps it through the queue's CUDA-IPC reducers.
         # Transport per channel was decided by the parent topology pass
         # (TrainerTopology.weight_ipc, indexed per collector); this process
-        # only constructs the endpoints. One throwaway CPU actor counts the
-        # parameters that size both transports' buffers.
-        param_numel = actor_param_numel(cfg, dims, action_scale, action_bias)
+        # only constructs the endpoints. The live actor counts the parameters
+        # that size both transports' buffers — its structure depends on the
+        # configured policy variant, so a vanilla-actor count could misize them.
+        param_numel = sum(parameter.numel() for parameter in agent.actor.parameters())
         weight_txs = []
         for j, shared in enumerate(weights):
             channel = rank * per_learner + j

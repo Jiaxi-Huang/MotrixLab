@@ -21,8 +21,19 @@ import torch.nn.functional as F
 from torch import nn, optim
 
 from motrix_rl.fastsac.buffer import EmpiricalNormalization, SimpleReplayBuffer
-from motrix_rl.fastsac.config import FastSacAgentCfg
-from motrix_rl.fastsac.networks import Actor, Critic
+from motrix_rl.fastsac.config import FastSacCfg
+from motrix_rl.fastsac.factory import make_actor, resolve_policy_variant
+from motrix_rl.fastsac.networks import Critic
+
+
+def _own_value(value):
+    if torch.is_tensor(value):
+        return value.clone()
+    if isinstance(value, tuple):
+        return tuple(_own_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _own_value(item) for key, item in value.items()}
+    return value
 
 
 def _own(outputs: tuple) -> tuple:
@@ -35,13 +46,15 @@ def _own(outputs: tuple) -> tuple:
     record, and the actor pair is carried across policy-frequency gating. So they
     are copied out here, while they are still valid.
 
-    Cloning a handful of 0-dim tensors costs nothing and does not synchronize;
-    what the caller must keep avoiding is ``.item()`` / ``float()``, which does.
+    Nested tuples and metric mappings are copied recursively so every compiled
+    output has the same ownership rule. Cloning a handful of 0-dim tensors costs
+    nothing and does not synchronize or move data between devices; what the
+    caller must keep avoiding is ``.item()`` / ``float()``, which does.
     See https://docs.pytorch.org/docs/2.7/torch.compiler_cudagraph_trees.html
     -- "clone tensors of a prior iteration (outside of torch.compile) before you
     begin the next run".
     """
-    return tuple(t.clone() if torch.is_tensor(t) else t for t in outputs)
+    return tuple(_own_value(value) for value in outputs)
 
 
 class FastSacAgent:
@@ -51,7 +64,7 @@ class FastSacAgent:
         critic_obs_dim: int,
         act_dim: int,
         num_envs: int,
-        cfg: FastSacAgentCfg,
+        cfg: FastSacCfg,
         device: torch.device,
         action_scale: torch.Tensor | None = None,
         action_bias: torch.Tensor | None = None,
@@ -71,7 +84,8 @@ class FastSacAgent:
         across ranks; the all-reduce stays in the eager orchestrator so the
         compiled halves remain CUDA-graph capturable (see _update_main).
         """
-        self.cfg = cfg
+        self.cfg = cfg.agent
+        self._provider_cfg = cfg
         self.device = device
         self.world_size = world_size
         self.obs_dim = obs_dim
@@ -79,6 +93,7 @@ class FastSacAgent:
         self.act_dim = act_dim
         self.num_envs = num_envs
         self.writer = writer
+        self.policy_variant = resolve_policy_variant(cfg.policy_variant)
         self.global_step = 0
         # Persistent gradient-update counter shared by all trainers. Used for
         # policy_frequency gating (so the actor/Q ratio is exactly 1/policy_freq
@@ -87,18 +102,14 @@ class FastSacAgent:
         self.update_idx = 0
         self._last_update_timing_ms: dict[str, float] = {}
 
-        self.actor = Actor(
-            n_obs=obs_dim,
-            n_act=act_dim,
-            hidden_dim=cfg.actor_hidden_dim,
-            log_std_max=cfg.log_std_max,
-            log_std_min=cfg.log_std_min,
-            use_tanh=cfg.use_tanh,
-            use_layer_norm=cfg.use_layer_norm,
+        self.actor = make_actor(
+            cfg,
+            dims=(obs_dim, act_dim),
             action_scale=action_scale,
             action_bias=action_bias,
             device=device,
         )
+        cfg = self.cfg
         critic_kwargs = dict(
             n_obs=critic_obs_dim,
             n_act=act_dim,
@@ -135,7 +146,10 @@ class FastSacAgent:
         self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=cfg.alpha_learning_rate, betas=(0.9, 0.95), fused=fused)
 
         if cfg.obs_normalization:
-            self.obs_normalizer: nn.Module = EmpiricalNormalization(shape=obs_dim, device=device)
+            selector_dims = self.policy_variant.passthrough_dims(self._provider_cfg)
+            self.obs_normalizer: nn.Module = EmpiricalNormalization(
+                shape=obs_dim, device=device, passthrough_dims=selector_dims
+            )
             self.critic_obs_normalizer: nn.Module = EmpiricalNormalization(shape=critic_obs_dim, device=device)
         else:
             self.obs_normalizer = nn.Identity()
@@ -313,18 +327,22 @@ class FastSacAgent:
     def _actor_backward(self, b: dict):
         """Pure-compute half of the actor update: forward + backward only."""
         with self._autocast():
-            actions, log_probs = self._actor_runtime.get_actions_and_log_probs(b["obs"])
+            actions, log_probs, variant_loss, variant_metrics = self.policy_variant.policy_update(
+                self._actor_runtime,
+                b["obs"],
+                self._provider_cfg,
+            )
             q_outputs = self._qnet_runtime(b["critic_obs"], actions)
             q_values = self._qnet_runtime.get_value(F.softmax(q_outputs, dim=-1))
             qf_value = q_values.mean(dim=0)
-            actor_loss = (self.log_alpha.exp().detach() * log_probs - qf_value).mean()
+            actor_loss = (self.log_alpha.exp().detach() * log_probs - qf_value).mean() + variant_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
-        return actor_loss.detach().float().clone(), (-log_probs.mean()).detach().float().clone()
+        return actor_loss.detach().float().clone(), (-log_probs.mean()).detach().float().clone(), variant_metrics
 
     def _update_pol(self, b: dict):
-        actor_loss, neg_logp = self._actor_backward_runtime(b)
+        actor_loss, neg_logp, variant_metrics = self._actor_backward_runtime(b)
         # The policy loss backpropagates into BOTH the actor and the critic (the
         # critic's q_values feed the objective); averaging both keeps every
         # rank's parameters identical, matching what DDP would sync.
@@ -332,7 +350,7 @@ class FastSacAgent:
         if self.cfg.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.actor_optimizer.step()
-        return actor_loss, neg_logp
+        return actor_loss, neg_logp, variant_metrics
 
     def update(self, num_updates: int):
         """Run ``num_updates`` gradient steps, each on a fresh batch.
@@ -362,6 +380,7 @@ class FastSacAgent:
         # trainer's single global-batch step.
         batch_per_env = max(cfg.batch_size // self.world_size // self.num_envs, 1)
         last = (torch.zeros((), device=self.device),) * 5
+        self._last_variant_metrics = {}
         timing_s = {key: 0.0 for key in ("sample_normalize", "critic_alpha", "actor")}
         update_started = time.perf_counter()
         # Batched data preparation (Holosoma-style): sample once and normalize
@@ -407,7 +426,8 @@ class FastSacAgent:
                 # Always own: the pair is carried across later generations
                 # within this call AND the returned metrics must stay readable
                 # after future update() calls replay the pol graph.
-                actor_pair = _own(pol_outputs)
+                actor_pair = _own(pol_outputs[:2])
+                self._last_variant_metrics = _own_value(pol_outputs[2])
 
             # Only the final step's main outputs feed the returned metrics; own
             # them so they survive future update() calls' replays. Earlier
@@ -425,6 +445,7 @@ class FastSacAgent:
             "actor_loss": last[3],
             "policy_entropy": last[4],
             "alpha": self.log_alpha.exp(),
+            **self._last_variant_metrics,
         }
 
     # --------------------------------------------------------------- rollout
@@ -476,6 +497,8 @@ class FastSacAgent:
             "alpha_optimizer": self.alpha_optimizer.state_dict(),
             "global_step": self.global_step,
             "update_idx": self.update_idx,
+            "policy_variant": self.policy_variant.name,
+            "policy_variant_metadata": self.policy_variant.checkpoint_metadata(self._provider_cfg),
         }
 
     def load_state_dict(self, ckpt: dict, load_optimizers: bool = True) -> None:
@@ -486,6 +509,15 @@ class FastSacAgent:
         serialization) the optimizer states are skipped — the mode for
         inference-only / play loads that don't resume training.
         """
+        self.policy_variant.validate_checkpoint(ckpt)
+        checkpoint_variant = ckpt.get("policy_variant", "default")
+        if not isinstance(checkpoint_variant, str):
+            raise ValueError("FastSAC checkpoint has an invalid policy_variant")
+        if checkpoint_variant != self.policy_variant.name:
+            raise ValueError(
+                f"FastSAC checkpoint policy variant {checkpoint_variant!r} does not match "
+                f"configured variant {self.policy_variant.name!r}"
+            )
         self.actor.load_state_dict(ckpt["actor"])
         self.qnet.load_state_dict(ckpt["qnet"])
         self.qnet_target.load_state_dict(ckpt["qnet_target"])

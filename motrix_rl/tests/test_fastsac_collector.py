@@ -71,6 +71,8 @@ class _PerfEnv(_CpuEnv):
 
 def _cfg(device: str, *, compile: bool = False, amp: bool = False):
     return SimpleNamespace(
+        policy_variant="default",
+        variant={},
         agent=SimpleNamespace(
             actor_hidden_dim=32,
             log_std_max=0.0,

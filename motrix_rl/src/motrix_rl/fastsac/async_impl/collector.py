@@ -24,7 +24,7 @@ from motrix_rl.fastsac.async_impl.transport import Control, IpcTransitionRing, S
 from motrix_rl.fastsac.async_impl.transport.weight_channel import WeightReceiver
 from motrix_rl.fastsac.buffer import EmpiricalNormalization
 from motrix_rl.fastsac.config import FastSacAgentCfg, FastSacCfg
-from motrix_rl.fastsac.networks import Actor
+from motrix_rl.fastsac.factory import make_actor, resolve_policy_variant
 from motrix_rl.fastsac.wrap import FastSacEnvWrap
 
 
@@ -49,7 +49,7 @@ def resolve_collector_inference_device(device_spec: str) -> torch.device:
 class _CollectorPolicy(nn.Module):
     """Read-only normalizer + stochastic actor callable compiled as one graph."""
 
-    def __init__(self, actor: Actor, obs_normalizer: nn.Module):
+    def __init__(self, actor: nn.Module, obs_normalizer: nn.Module):
         super().__init__()
         self.actor = actor
         self.obs_normalizer = obs_normalizer
@@ -104,21 +104,19 @@ class Collector:
             self._env_perf.enable()
         self._learning_starts = acfg.learning_starts
 
-        self.actor = Actor(
-            n_obs=obs_dim,
-            n_act=act_dim,
-            hidden_dim=acfg.actor_hidden_dim,
-            log_std_max=acfg.log_std_max,
-            log_std_min=acfg.log_std_min,
-            use_tanh=acfg.use_tanh,
-            use_layer_norm=acfg.use_layer_norm,
+        self.actor = make_actor(
+            cfg,
+            dims=(obs_dim, act_dim),
             action_scale=action_scale,
             action_bias=action_bias,
             device=self.device,
         )
         self.actor.eval()
         if acfg.obs_normalization:
-            self.obs_normalizer = EmpiricalNormalization(shape=obs_dim, device=self.device)
+            selector_dims = resolve_policy_variant(cfg.policy_variant).passthrough_dims(cfg)
+            self.obs_normalizer = EmpiricalNormalization(
+                shape=obs_dim, device=self.device, passthrough_dims=selector_dims
+            )
         else:
             self.obs_normalizer = torch.nn.Identity()
         self.obs_normalizer.eval()  # read-only: never updates stats on the collector

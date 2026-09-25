@@ -9,6 +9,10 @@ defaults:
 device: null
 # Use the heterogeneous collector/learner trainer instead of the synchronous trainer.
 asynchronous: true
+# Neutral policy-variant selector; tasks opt into a specialized actor (e.g. "sonic").
+policy_variant: default
+# Free-form mapping consumed only by the selected policy variant; empty for the default actor.
+variant: {}
 agent:
   # AdamW learning rate for the actor network.
   actor_learning_rate: 0.0003
