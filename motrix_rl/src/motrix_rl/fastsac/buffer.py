@@ -234,7 +234,7 @@ class EmpiricalNormalization(nn.Module):
     buffers — they are per-process bookkeeping, not checkpoint state.
     """
 
-    def __init__(self, shape, device, eps=1e-2, until=None):
+    def __init__(self, shape, device, eps=1e-2, until=None, passthrough_dims: int = 0):
         super().__init__()
         self.eps = eps
         self.until = until
@@ -242,6 +242,7 @@ class EmpiricalNormalization(nn.Module):
         self._local_mean = torch.zeros(shape, dtype=torch.float64, device=device)
         self._local_var = torch.ones(shape, dtype=torch.float64, device=device)
         self._local_count = 0
+        self.passthrough_dims = passthrough_dims
         self.register_buffer("_mean", torch.zeros(shape).unsqueeze(0).to(device))
         self.register_buffer("_var", torch.ones(shape).unsqueeze(0).to(device))
         self.register_buffer("_std", torch.ones(shape).unsqueeze(0).to(device))
@@ -252,8 +253,12 @@ class EmpiricalNormalization(nn.Module):
         if self.training and update:
             self.update(x)
         if center:
-            return (x - self._mean) / (self._std + self.eps)
-        return x / (self._std + self.eps)
+            normalized = (x - self._mean) / (self._std + self.eps)
+        else:
+            normalized = x / (self._std + self.eps)
+        if self.passthrough_dims:
+            return torch.cat((normalized[..., : -self.passthrough_dims], x[..., -self.passthrough_dims :]), dim=-1)
+        return normalized
 
     @torch.jit.unused
     def update(self, x: torch.Tensor) -> None:
