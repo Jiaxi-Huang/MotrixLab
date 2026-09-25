@@ -225,6 +225,8 @@ class _AsyncTorchEnv(_AsyncEnv, TorchEnv):
 
 def _async_cfg():
     return SimpleNamespace(
+        policy_variant="default",
+        variant={},
         agent=SimpleNamespace(
             actor_hidden_dim=16,
             log_std_max=2.0,

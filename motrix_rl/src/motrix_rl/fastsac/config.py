@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from omegaconf import MISSING
 
@@ -123,6 +124,10 @@ class FastSacCfg:
 
     # learning device; None -> cuda if available else cpu
     device: str | None = MISSING
+    # Neutral policy-variant selector. The ``variant`` mapping is interpreted
+    # only by the selected PolicyVariant implementation.
+    policy_variant: str = "default"
+    variant: dict[str, Any] = field(default_factory=dict)
     agent: FastSacAgentCfg = field(default_factory=FastSacAgentCfg)
     trainer: FastSacTrainerCfg = field(default_factory=FastSacTrainerCfg)
 
