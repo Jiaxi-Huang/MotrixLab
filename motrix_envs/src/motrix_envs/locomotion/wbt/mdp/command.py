@@ -25,7 +25,7 @@ from motrix_env_core.manager.math.quaternion import mul as quat_mul
 from motrix_env_core.manager.math.quaternion import rotate_vector
 from motrix_env_core.numba.manager.commands import ResetContext
 from motrix_env_core.numba.manager.dispatch import dispatch
-from motrix_envs.motion import MotrixMotion, WbtMotionClip
+from motrix_envs.motion import MotionLibrary, MotrixMotion, WbtMotionClip
 
 
 @njit(inline="always")
@@ -60,7 +60,9 @@ class WbtMotionCommand(CommandTerm):
     methods maintain adaptive-sampling statistics and the sampling distribution.
 
     Attributes:
-        clip: Shared numeric reference-motion clip in model and tracked-body order.
+        clip: Shared numeric reference-motion corpus in model and tracked-body
+            order — one clip or several concatenated onto a global frame axis
+            with per-frame ``frame_clip_end`` boundaries.
         reference_index: Index of the alignment body in the tracked-body order.
         command: Per-environment joint-position and joint-velocity command buffer
             (inherited ``CommandTerm.command``).
@@ -213,15 +215,23 @@ class WbtMotionCommand(CommandTerm):
     def advance(self, ctx: ManagerContext) -> None:
         """Advance one frame for the current environment lane.
 
+        The lane leaves its clip when the step index exceeds the per-frame
+        ``frame_clip_end`` boundary of the clip it just tracked (the clip's
+        final frame is tracked one step before the index goes out of range).
+        ``hold_at_clip_end`` clamps the lane onto its own clip's final frame;
+        otherwise the wrap branch resamples from the whole corpus.
+
         The lowering already binds this lane's writable row view to
         ``self.steps`` / ``self.clip_ended``; only the wrap branch needs ``ctx``
         to draw the replacement frame.
         """
         num_frames = self.clip.joint_pos.shape[0]
-        self.steps[0] += 1
-        self.clip_ended[0] = self.steps[0] >= num_frames
+        clip_end = self.clip.frame_clip_end[self.steps[0]]
+        step = self.steps[0] + 1
+        self.steps[0] = step
+        self.clip_ended[0] = step > clip_end
         if self.hold_at_clip_end:
-            self.steps[0] = min(self.steps[0], num_frames - 1)
+            self.steps[0] = min(step, clip_end)
         elif self.clip_ended[0]:
             # Request sim-only rematerialization: the reset pipeline resamples
             # this lane's frame via reset_env from the freshly rebuilt CDF and
@@ -256,6 +266,8 @@ class WbtMotionCommand(CommandTerm):
 @configclass(kw_only=True)
 class WbtMotionCommandCfg(CommandCfg):
     motion_file: str = MISSING
+    motion_files: tuple[str, ...] = ()
+    extension_channels: tuple[str, ...] = ()
     joint_names: tuple[str, ...] = MISSING
     tracked_body_names: tuple[str, ...] = MISSING
     reference_body_name: str = MISSING
@@ -284,15 +296,29 @@ class WbtMotionCommandCfg(CommandCfg):
             raise ValueError(
                 f"tracked_body_names must include the reference body {self.reference_body_name!r}"
             ) from None
-        source = WbtMotionClip.create(
-            MotrixMotion(self.motion_file),
-            list(self.joint_names),
-            self.tracked_body_names,
-            self.reference_body_name,
-            robot.base_link_name,
-        )
+        env_fps = max(int(round(1.0 / env.cfg.ctrl_dt)), 1)
+        if self.motion_files:
+            if self.motion_file is not MISSING:
+                raise ValueError("Configure either motion_file or motion_files, not both.")
+            source = MotionLibrary(
+                self.motion_files,
+                joint_names=list(self.joint_names),
+                tracked_body_names=self.tracked_body_names,
+                reference_body_name=self.reference_body_name,
+                root_body_name=robot.base_link_name,
+                fps=env_fps,
+                extension_channels=self.extension_channels,
+            ).assemble()
+        else:
+            source = WbtMotionClip.create(
+                MotrixMotion(self.motion_file),
+                list(self.joint_names),
+                self.tracked_body_names,
+                self.reference_body_name,
+                robot.base_link_name,
+                self.extension_channels,
+            )
         if self.adaptive_sampling_enabled:
-            env_fps = max(int(round(1.0 / env.cfg.ctrl_dt)), 1)
             num_bins = source.joint_pos.shape[0] // env_fps + 1
         else:
             num_bins = 0
