@@ -242,7 +242,11 @@ class WbtEnvCfg(ManagerBasedEnvCfg):
         cfg = deepcopy(self)
         cfg.max_episode_seconds = None
         cfg.commands.motion.adaptive_sampling_enabled = False
-        cfg.commands.motion.start_at_timestep_zero_prob = 1.0
+        # A single-file clip has one head frame worth starting playback from; a
+        # multi-file corpus has none — forcing every start and wrap back to its
+        # frame 0 would loop one clip forever. Start and wrap-resample uniformly
+        # over the whole corpus instead, matching the training start distribution.
+        cfg.commands.motion.start_at_timestep_zero_prob = 0.0 if self.commands.motion.motion_files else 1.0
         cfg.commands.motion.hold_at_clip_end = False
         cfg.sim_reset.body_pos.noise_scale = 0.0
         cfg.sim_reset.body_rot.noise_scale = 0.0

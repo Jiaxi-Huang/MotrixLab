@@ -104,5 +104,22 @@ def make_g129dof_wbt_dance_cfg() -> EnvCfg:
     return G1WbtEnvCfg(motion_file=str(_MOTION_DIR / "dance1_subject2.npz"))
 
 
+@registry.envcfg("g1-wbt-dance-multi")
+def make_g129dof_wbt_dance_multi_cfg() -> EnvCfg:
+    """Track a three-clip LAFAN dance corpus with the manager-based environment.
+
+    The corpus directory holds one schema v1 npz per clip; MotionLibrary
+    concatenates them onto a global frame axis (wrap resamples over the whole
+    corpus, hold clamps to the owning clip's end).
+
+    zh_CN: 让 Unitree G1 在三段 LAFAN 舞蹈语料上做多段跟踪。
+    """
+
+    cfg = G1WbtEnvCfg()
+    cfg.commands.motion.motion_files = (str(_MOTION_DIR / "dance_multi"),)
+    return cfg
+
+
 registry.env("g1-29dof-wbt-largebox")(ManagerEnv)
 registry.env("g1-wbt-dance")(ManagerEnv)
+registry.env("g1-wbt-dance-multi")(ManagerEnv)

@@ -298,7 +298,11 @@ class WbtMotionCommandCfg(CommandCfg):
             ) from None
         env_fps = max(int(round(1.0 / env.cfg.ctrl_dt)), 1)
         if self.motion_files:
-            if self.motion_file is not MISSING:
+            # An unset motion_file reaches this point as either the omegaconf
+            # MISSING sentinel (fresh factory config) or its '???' literal
+            # (config validated / pickled into async collectors); only a real
+            # path string means both sources are configured.
+            if isinstance(self.motion_file, str) and self.motion_file != "???":
                 raise ValueError("Configure either motion_file or motion_files, not both.")
             source = MotionLibrary(
                 self.motion_files,

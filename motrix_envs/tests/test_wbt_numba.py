@@ -592,6 +592,20 @@ def test_wbt_manager_play_disables_each_reset_term_noise() -> None:
     assert all(term.noise_scale == 0.0 for term in cfg.sim_reset.to_dict().values())
 
 
+def test_wbt_manager_play_start_semantics_follows_motion_source(tmp_path) -> None:
+    """Single-clip play restarts at the head frame; a multi-clip corpus has no
+    single head frame (its frame 0 is an arbitrary mid-motion cut), so play
+    starts and wrap-resamples uniformly over the whole corpus."""
+    single = registry.make_env_config("g1-wbt-dance", mode="play")
+    assert isinstance(single, WbtEnvCfg)
+    assert single.commands.motion.start_at_timestep_zero_prob == 1.0
+
+    multi = _multi_clip_cfg(tmp_path).for_play()
+    assert multi.commands.motion.start_at_timestep_zero_prob == 0.0
+    assert multi.commands.motion.motion_files
+    assert not multi.commands.motion.adaptive_sampling_enabled
+
+
 def test_wbt_robot_config_subclasses_isolate_nested_overrides() -> None:
     g1 = registry.make_env_config("g1-wbt-dance")
     another_g1 = registry.make_env_config("g1-wbt-dance")
@@ -962,3 +976,20 @@ def test_wbt_motion_command_cfg_rejects_dual_motion_sources(tmp_path) -> None:
     )
     with pytest.raises(ValueError, match="motion_file or motion_files"):
         _make_numba_env(cfg, num_envs=1)
+
+
+@pytest.mark.parametrize("missing_marker", [MISSING, "???"])
+def test_numba_wbt_multi_clip_cfg_survives_pickle_round_trip(tmp_path, missing_marker) -> None:
+    """Async collectors receive the env spec via pickle; whichever MISSING
+    marker the config pipeline leaves behind (the omegaconf sentinel on a
+    fresh config, or its '???' literal after validation) must not read as a
+    configured motion_file after the round-trip."""
+    cfg = _multi_clip_cfg(tmp_path)
+    motion = cfg.commands.motion
+    assert isinstance(motion, WbtMotionCommandCfg)
+    cfg = replace(cfg, commands=replace(cfg.commands, motion=replace(motion, motion_file=missing_marker)))
+    restored = pickle.loads(pickle.dumps(cfg))
+    assert isinstance(restored, WbtEnvCfg)
+    env = _make_numba_env(restored, num_envs=2)
+    motion_term = _motion_command(env)
+    assert motion_term.clip.clip_lengths.tolist() == [_DANCE_SPLIT, 999 - _DANCE_SPLIT]
