@@ -19,36 +19,37 @@ encoder mask 选择参考编码器。该时序深度是 `g1-sonic` 的公共契�
 
 ## 数据与运行
 
-环境默认回退到仓库内置小型 smoke store，因此干净 checkout 可以直接完成 registry 检查和
-短时集成运行。正式训练需要提供完整动作集，并通过环境变量指定原生 packed store：
+训练读取 NPZ 动作语料目录——每个文件是一个 MotrixLab motion schema v1 clip，携带
+`ext_smpl_joints` / `ext_smpl_root_quat` 参考通道。默认语料位置即 converter 的缓存输出，
+因此下面三步无需额外参数即可串起；自定义位置用 `SONIC_MOTION_DIR`（支持 `:` 分隔多个语料根目录）：
 
 ```bash
 source .venv/bin/activate
-SONIC_PACKED_STORE=$PWD/data/sonic/lafan1-packed \
+SONIC_MOTION_DIR=$PWD/data/bones_seed_npz \
   python scripts/train.py task=g1-sonic/motrix.fastsac
 ```
 
-也可以通过 `SONIC_DATA_ROOT` 指向包含单个 `sonic.npz` 的目录。两者都存在时，
-`SONIC_PACKED_STORE` 选择只读 memory-mapped 动作集。
+`SONIC_MOTION_DIR` 支持以 `:` 分隔多个语料根目录。
 
-## 构建 packed store
+## 构建语料
 
-打包器读取成对的 robot 与 SMPL NPZ 目录。输入四元数为 `wxyz`，输出转换为 `xyzw`，
-并把关节与 body 列重排为任务约定顺序。
+从 HuggingFace 下载配对的 BONES-SEED 子集（G1 重定向 CSV + SMPL PKL），再转换成语料目录：
 
 ```bash
-python scripts/motion/pack_sonic_data.py \
-  /path/to/robot_filtered \
-  /path/to/smpl_filtered \
-  data/sonic/lafan1-packed
+python scripts/motion/download_bone_seed.py   # 原始子集 -> ~/.cache/motrixlab/bones_seed/g1
+python scripts/motion/convert_bones_seed.py --workers 8  # 语料 -> ~/.cache/motrixlab/bones_seed_npz/g1
 ```
 
-输出格式版本为 `motrixlab_sonic_packed_v1`。生成目录被 Git 忽略；仓库只包含小型 smoke store。
+下载器按字节预算流式读取两个归档（默认保留约 6000 对、落盘 3-4 GB）；转换器对每个 clip
+用 G1 模型做正向运动学并写出一个 schema v1 npz，名称命中默认关键词列表（床/椅/台阶等
+道具场景与倒立/侧翻等极限动作，列表来自 gear_sonic）的 clip 会被剔除
+（`--filter-keywords=` 关闭）。`--workers N` 起 N 个转换进程，各持一份模型与
+FK buffer；已存在的输出自动跳过，中断后可直接续跑。仓库不捆绑任何动作数据。
 
 ## 小规模验证
 
-从仓库根目录执行时，内置 smoke store 不需要外部动作数据。小规模验证继续使用同一个
-`g1-sonic` 配置，只覆盖并行数和训练长度：
+先构建一个小语料（小预算几分钟即可拿到少量配对），再用同一个 `g1-sonic` 配置，
+只覆盖并行数和训练长度：
 
 ```bash
 python scripts/train.py task=g1-sonic/motrix.fastsac \

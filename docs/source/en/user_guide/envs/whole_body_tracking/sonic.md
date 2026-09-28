@@ -24,42 +24,42 @@ keeps an identity action affine.
 
 ## Data and execution
 
-The environment falls back to the bundled small smoke store so registry checks
-and short integration runs work from a clean checkout. Meaningful training
-requires the full motion corpus supplied separately. Point the task at a native
-packed store:
+Training reads a NPZ motion corpus — a directory holding one MotrixLab motion
+schema v1 clip per file with the `ext_smpl_joints` / `ext_smpl_root_quat`
+reference channels. The default corpus location is the converter's cache
+output, so the three steps below chain up without extra flags; override with
+`SONIC_MOTION_DIR` (`:`-separated paths join multiple corpus roots):
 
 ```bash
 source .venv/bin/activate
-SONIC_PACKED_STORE=$PWD/data/sonic/lafan1-packed \
+SONIC_MOTION_DIR=$PWD/data/bones_seed_npz \
   python scripts/train.py task=g1-sonic/motrix.fastsac
 ```
 
-`SONIC_DATA_ROOT` can instead select a directory containing a single
-`sonic.npz`. When both are available, `SONIC_PACKED_STORE` selects the
-read-only memory-mapped corpus.
+## Build a corpus
 
-## Build a packed store
-
-The packer consumes paired robot and SMPL NPZ directories. Input quaternions
-are `wxyz`; output quaternions are `xyzw`, and joint/body columns are
-reordered to the task contract.
+Download a paired BONES-SEED subset (G1 retargeted CSVs + SMPL PKLs) from
+HuggingFace and convert it into a corpus directory:
 
 ```bash
-python scripts/motion/pack_sonic_data.py \
-  /path/to/robot_filtered \
-  /path/to/smpl_filtered \
-  data/sonic/lafan1-packed
+python scripts/motion/download_bone_seed.py   # raw subset -> ~/.cache/motrixlab/bones_seed/g1
+python scripts/motion/convert_bones_seed.py --workers 8  # corpus -> ~/.cache/motrixlab/bones_seed_npz/g1
 ```
 
-The output format is versioned as `motrixlab_sonic_packed_v1`. The generated
-directory is ignored by Git; only the small smoke store is bundled.
+The downloader streams both archives with byte budgets (defaults keep about
+6000 pairs, 3-4 GB on disk); the converter writes one schema v1 npz per clip
+with forward kinematics from the G1 model, dropping clips whose name matches
+the default keyword list (prop scenes such as beds/chairs/stairs and extreme
+acrobatics such as handstands; the list mirrors gear_sonic, and
+`--filter-keywords=` disables it).
+`--workers N` runs N conversion processes, each holding its own model and FK
+buffer; existing outputs are skipped, so an interrupted run resumes. No
+motion data is bundled with the repository.
 
 ## Small-scale validation
 
-From the repository root, the bundled smoke store needs no external motion data.
-Small-scale validation uses the same `g1-sonic` recipe and overrides only scale
-and duration:
+Build a tiny corpus first (a couple of pairs land in minutes), then run the
+same `g1-sonic` recipe overriding only scale and duration:
 
 ```bash
 python scripts/train.py task=g1-sonic/motrix.fastsac \
