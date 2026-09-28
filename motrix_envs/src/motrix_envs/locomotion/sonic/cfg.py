@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import Path
 
 from omegaconf import MISSING
 
@@ -176,7 +177,12 @@ class SonicManagerEnvCfg(ManagerBasedEnvCfg):
         cfg = deepcopy(self)
         cfg.max_episode_seconds = None
         cfg.commands.motion.adaptive_sampling_enabled = False
-        cfg.commands.motion.start_at_timestep_zero_prob = 1.0
+        # A corpus directory has no single head frame — forcing frame 0 would
+        # loop the first clip forever, so starts and wrap-resamples draw over
+        # the whole corpus. A lone file corpus keeps restarting from its head.
+        sources = self.commands.motion.motion_files
+        single_file = len(sources) == 1 and Path(sources[0]).is_file()
+        cfg.commands.motion.start_at_timestep_zero_prob = 1.0 if single_file else 0.0
         cfg.commands.motion.encoder_sampling = "g1"
         cfg.sim_reset.body_pos.noise_scale = 0.0
         cfg.sim_reset.body_rot.noise_scale = 0.0

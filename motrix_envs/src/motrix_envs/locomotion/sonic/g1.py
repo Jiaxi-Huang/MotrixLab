@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from motrix_env_core import registry
 from motrix_env_core.base import SimCfg
@@ -30,6 +31,13 @@ class SonicManagerEnv(ManagerEnv):
 def _make_g1_sonic_cfg() -> SonicManagerEnvCfg:
     num_future_frames = mdp.SONIC_DEFAULT_NUM_FUTURE_FRAMES
     num_history_frames = mdp.SONIC_DEFAULT_NUM_HISTORY_FRAMES
+    # Motion source is a NPZ corpus directory (one schema v1 clip per file
+    # with the SMPL extension channels). The default is the converter's cache
+    # output, so `download_bone_seed.py` + `convert_bones_seed.py` + training
+    # chain up with zero extra flags; SONIC_MOTION_DIR overrides (':'-separated
+    # paths join multiple roots).
+    default_corpus = os.path.join(Path.home(), ".cache", "motrixlab", "bones_seed_npz", "g1")
+    motion_files = tuple(filter(None, os.environ.get("SONIC_MOTION_DIR", default_corpus).split(":")))
     return SonicManagerEnvCfg(
         sim=SimCfg(dt=0.005, solver_iterations=3),
         scene=StandardSceneCfg(
@@ -39,8 +47,7 @@ def _make_g1_sonic_cfg() -> SonicManagerEnvCfg:
         ),
         commands=SonicCommandsCfg(
             motion=mdp.SonicMotionCommandCfg(
-                motion_file=os.path.join(os.environ.get("SONIC_DATA_ROOT", "data/sonic"), "sonic.npz"),
-                packed_store=os.environ.get("SONIC_PACKED_STORE", "data/sonic/lafan1-pack-smoke"),
+                motion_files=motion_files,
                 num_future_frames=num_future_frames,
             )
         ),

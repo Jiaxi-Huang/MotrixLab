@@ -8,7 +8,6 @@ from typing import cast
 
 import gymnasium as gym
 import numpy as np
-from omegaconf import MISSING
 
 from motrix_env_core.config import configclass
 from motrix_env_core.config.scene import RobotCfg
@@ -73,7 +72,6 @@ from motrix_envs.locomotion.wbt.mdp.rewards import (
 from motrix_envs.locomotion.wbt.mdp.rewards import (
     UndesiredContactsRewardCfg as UndesiredContactsRewardCfg,
 )
-from motrix_envs.motion import MotrixMotion
 from motrix_envs.motion.sonic import SonicMotionClip
 
 G1_SONIC_JOINTS = (
@@ -465,9 +463,10 @@ class SonicMotionCommand(CommandTerm):
 
 @configclass(kw_only=True)
 class SonicMotionCommandCfg(CommandCfg):
-    motion_file: str = MISSING
-    packed_store: str | None = None
-    packed_clip_limit: int | None = None
+    # NPZ corpus source (files and/or directories; a directory expands to its
+    # schema v1 clips in sorted order). One clip per file, SMPL extension
+    # channels required.
+    motion_files: tuple[str, ...] = ()
     joint_names: tuple[str, ...] = G1_SONIC_JOINTS
     tracked_body_names: tuple[str, ...] = G1_SONIC_BODY_NAMES
     reference_body_name: str = "pelvis"
@@ -504,10 +503,8 @@ class SonicMotionCommandCfg(CommandCfg):
             raise ValueError("SONIC num_future_frames must be a positive integer")
         if self.encoder_sampling not in ENCODER_SAMPLING_MODES:
             raise ValueError(f"SONIC encoder_sampling must be one of {ENCODER_SAMPLING_MODES}")
-        if self.packed_clip_limit is not None and (
-            isinstance(self.packed_clip_limit, bool) or self.packed_clip_limit <= 0
-        ):
-            raise ValueError("SONIC packed_clip_limit must be a positive integer or None")
+        if self.motion_files and not all(isinstance(path, str) and path for path in self.motion_files):
+            raise ValueError("SONIC motion_files entries must be non-empty path strings")
         if len(self.reward_point_body_names) != len(self.reward_point_body_offsets):
             raise ValueError("SONIC reward-point body names and offsets must have equal length")
         if len(set(self.reward_point_body_names)) != len(self.reward_point_body_names):
@@ -520,23 +517,15 @@ class SonicMotionCommandCfg(CommandCfg):
 
     def __call__(self, env: ManagerEnv) -> CommandTerm:
         robot = cast(RobotCfg, env.cfg.scene.objs.robot)
-        if self.packed_store:
-            clip = SonicMotionClip.from_packed(
-                self.packed_store,
-                joint_names=self.joint_names,
-                body_names=self.tracked_body_names,
-                reference_body_name=self.reference_body_name,
-                root_body_name=robot.base_link_name,
-                clip_limit=self.packed_clip_limit,
-            )
-        else:
-            clip = SonicMotionClip.from_motion(
-                MotrixMotion(self.motion_file),
-                self.joint_names,
-                self.tracked_body_names,
-                self.reference_body_name,
-                robot.base_link_name,
-            )
+        if not self.motion_files:
+            raise ValueError("SONIC motion_files must name at least one npz file or directory.")
+        clip = SonicMotionClip.from_corpus(
+            self.motion_files,
+            joint_names=self.joint_names,
+            tracked_body_names=self.tracked_body_names,
+            reference_body_name=self.reference_body_name,
+            root_body_name=robot.base_link_name,
+        )
         reference_index = self.tracked_body_names.index(self.reference_body_name)
         nbin = (
             clip.joint_pos.shape[0] // max(int(round(1.0 / env.cfg.ctrl_dt)), 1) + 1

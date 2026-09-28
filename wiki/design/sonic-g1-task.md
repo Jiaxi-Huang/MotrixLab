@@ -9,10 +9,10 @@ Manager、simulator registry、Hydra Task 和 FastSAC 公共契约。不引入�
 迁移包含：
 
 - Manager-based G1 环境与 canonical 10 future-frame 时序契约；
-- 版本化、只读 mmap 的 SONIC packed motion store；
+- SONIC motion 语料装载（schema v1 npz + `ext_smpl_*` 通道，见 [sonic-bones-seed-corpus](./sonic-bones-seed-corpus.md)）；
 - 通过 `PolicyVariant` 注册的 SONIC FastSAC actor、命名辅助损失和同步/异步训练；
 - MotrixLab checkpoint 保存、恢复与回放；
-- 小型 smoke store、行为测试和双语用户文档。
+- 行为测试（合成语料 fixture）和双语用户文档。
 
 ## 环境与数据
 
@@ -21,9 +21,12 @@ Manager group，term factory 返回 `ObsTerm`、`RewardTerm`、`TerminationTerm`
 `ResetTerm`；所有 fused-kernel 入口使用 `@dispatch`。
 
 `SonicMotionClip` 在通用 `WbtMotionClip` 数组之外保存 SMPL reference 和逐帧 clip
-边界。运行时只读取 `motrixlab_sonic_packed_v1`，四元数统一为 `xyzw`，关节和 body
-数组按 task contract 排列。环境在未设置变量时回退到仓库内的小型 store，以满足
-registry 和集成测试契约；有效训练所需的完整动作集由 `SONIC_PACKED_STORE` 外部提供。
+边界。运行时只读取带 `ext_smpl_joints` / `ext_smpl_root_quat` 通道的 schema v1 npz 语料，
+四元数统一为 `xyzw`，关节和 body 数组按 name-based 重排为 task contract。环境在未设置变量时
+缺省指向 converter 的缓存输出 `~/.cache/motrixlab/bones_seed_npz/g1`——`download_bone_seed.py`
++ `convert_bones_seed.py` + 训练零额外参数即可串起；`SONIC_MOTION_DIR` 可覆盖（原 packed store
+与内置 smoke 语料已移除，集成测试改用合成语料 fixture，见
+[sonic-bones-seed-corpus](./sonic-bones-seed-corpus.md)）。
 `configs/task/g1-sonic/motrix.fastsac.yaml` 是唯一 task recipe，直接内联
 `algo.variant`。`model.num_future_frames=10` 同时驱动环境 observation 布局和
 SONIC actor 输入；小规模验证只覆盖 CLI 的环境数、播放环境数、checkpoint 间隔和迭代数。
@@ -62,9 +65,9 @@ MotrixLab 训练 checkpoint 的回放继续依赖 run metadata，与其他任务
 
 ## 发布约束
 
-Bundled smoke store 的公开再分发已由用户确认，但可审计的授权引用、权利人和具体许可
-文本尚未提供。该状态记录在 `THIRD_PARTY_NOTICES.md`，补齐凭据前不得将相关数据纳入
-公开 release。
+仓库不再捆绑任何 SONIC 动作数据（内置 smoke 语料已移除，测试改用合成 fixture）。
+BONES-SEED / GEAR-SONIC 下载子集仅供内部训练；公开再分发相关数据前需补齐可审计的
+授权引用、权利人和具体许可文本。
 
 ## 与上游 gear_sonic 的逐项对照（2026-09 复查）
 
@@ -113,9 +116,9 @@ SMPL stride 1 ≙ 0.02 s，与上游 `dt_future_ref_frames` 一致）；
 - **feet_acc 重置尖峰**：上游在 articulation 层用 reset 速度播种 previous velocity；
   本地曾清零后差分，产生 `(v-0)/dt` 假加速度。现 `reset_env` 用 teleport 目标帧的
   `clip.joint_vel` 播种。
-- **NPZ 路径 fps 防护**：`SonicMotionClip.from_motion` 现要求 50 Hz（与 packed store
-  一致）。上游对非 50 fps 数据做重采样而非报错，本仓库选择 fail-fast；换全量数据时
-  请用 `scripts/motion/pack_sonic_data.py`（内含 wxyz→xyzw 转换与校验）重打包。
+- **NPZ 路径 fps 防护**：`SonicMotionClip.from_corpus`（MotionLibrary 校验）要求 50 Hz。上游对非 50 fps 数据做
+  重采样而非报错，本仓库选择 fail-fast；换全量数据时请用 BONES-SEED / LAFAN converter
+  重采样转换。
 
 ### 保留差异（有意决定，暂不跟进上游）
 

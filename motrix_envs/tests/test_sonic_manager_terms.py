@@ -17,7 +17,7 @@ def _identity_quaternions(shape: tuple[int, ...]) -> np.ndarray:
 
 
 def test_sonic_config_defaults_match_upstream_base() -> None:
-    motion = mdp.SonicMotionCommandCfg(motion_file="unused.npz")
+    motion = mdp.SonicMotionCommandCfg()
 
     assert motion.reward_point_body_names == (
         "pelvis",
@@ -77,14 +77,13 @@ def test_sonic_actuator_dynamics_reset_uses_release_gains() -> None:
 def test_sonic_reward_point_config_validation() -> None:
     with pytest.raises(ValueError, match="equal length"):
         mdp.SonicMotionCommandCfg(
-            motion_file="unused.npz",
             reward_point_body_names=("torso_link",),
             reward_point_body_offsets=(),
         )
     with pytest.raises(ValueError, match="positive and finite"):
         mdp.SonicTrackingRewardCfg(weight=2.0, std=0.0)
     with pytest.raises(ValueError, match="encoder_sampling"):
-        mdp.SonicMotionCommandCfg(motion_file="unused.npz", encoder_sampling="both")
+        mdp.SonicMotionCommandCfg(encoder_sampling="both")
 
 
 def test_sonic_encoder_sampling_mode_selection() -> None:
