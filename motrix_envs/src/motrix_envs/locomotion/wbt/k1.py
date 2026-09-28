@@ -49,7 +49,7 @@ _K1_TRACKED_BODY_NAMES = (
 class K1WbtEnvCfg(WbtEnvCfg):
     """Whole-body tracking configuration specialized for Booster K1."""
 
-    motion_file: InitVar[str | None] = None
+    motion_files: InitVar[tuple[str, ...] | None] = None
     commands: CommandsCfg = CommandsCfg(motion=WbtMotionCommandCfg())
     actions: ActionsCfg = ActionsCfg(
         joint_position=WbtJointPositionActionCfg(
@@ -71,10 +71,10 @@ class K1WbtEnvCfg(WbtEnvCfg):
         ),
     )
 
-    def __post_init__(self, motion_file: str | None) -> None:
+    def __post_init__(self, motion_files: tuple[str, ...] | None) -> None:
         super().__post_init__()
-        if motion_file is not None:
-            self.commands.motion.motion_file = motion_file
+        if motion_files is not None:
+            self.commands.motion.motion_files = motion_files
         self._set_tracked_body_names(_K1_TRACKED_BODY_NAMES)
         self.commands.motion.reference_body_name = "Trunk"
 
@@ -90,7 +90,7 @@ def make_k1_wbt_freekick_cfg() -> EnvCfg:
 
     zh_CN: 让 Booster K1 跟踪任意球射门参考动作。
     """
-    cfg = K1WbtEnvCfg(motion_file=str(_MOTION_DIR / "freekick_shoot_arc_02.npz"))
+    cfg = K1WbtEnvCfg(motion_files=(str(_MOTION_DIR / "freekick_shoot_arc_02.npz"),))
     cfg.rewards.action_rate_l2 = ActionRateRewardCfg(weight=-0.1)
     return cfg
 

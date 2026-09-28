@@ -22,8 +22,8 @@ def load_extension_channel(motion: MotrixMotion, name: str) -> np.ndarray:
         Contiguous array whose first axis is the motion frame axis.
 
     Raises:
-        MotionFormatError: If the file lacks the channel or it is not a
-            per-frame numeric array matching ``num_frames``.
+        MotionFormatError: If the file lacks the channel, it is not a per-frame
+            numeric array matching ``num_frames``, or it holds non-finite values.
     """
     if name not in motion.extensions:
         raise MotionFormatError(f"Motion file {motion.path} does not provide declared extension channel 'ext_{name}'.")
@@ -33,6 +33,8 @@ def load_extension_channel(motion: MotrixMotion, name: str) -> np.ndarray:
             f"Extension channel 'ext_{name}' in {motion.path} must be a per-frame array "
             f"with {motion.num_frames} frames, got shape {channel.shape}."
         )
+    if not np.all(np.isfinite(channel)):
+        raise MotionFormatError(f"Extension channel 'ext_{name}' in {motion.path} contains non-finite values.")
     return channel
 
 

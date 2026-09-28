@@ -53,7 +53,7 @@ _DEX_EVT_TRACKED_BODY_NAMES = (
 class DexEvtWbtEnvCfg(WbtEnvCfg):
     """Whole-body tracking configuration specialized for Dex-EVT."""
 
-    motion_file: InitVar[str | None] = None
+    motion_files: InitVar[tuple[str, ...] | None] = None
     commands: CommandsCfg = CommandsCfg(motion=WbtMotionCommandCfg())
     actions: ActionsCfg = ActionsCfg(
         joint_position=WbtJointPositionActionCfg(
@@ -80,10 +80,10 @@ class DexEvtWbtEnvCfg(WbtEnvCfg):
     )
     render_spacing: float = 1.5
 
-    def __post_init__(self, motion_file: str | None) -> None:
+    def __post_init__(self, motion_files: tuple[str, ...] | None) -> None:
         super().__post_init__()
-        if motion_file is not None:
-            self.commands.motion.motion_file = motion_file
+        if motion_files is not None:
+            self.commands.motion.motion_files = motion_files
         self._set_tracked_body_names(_DEX_EVT_TRACKED_BODY_NAMES)
         self.commands.motion.reference_body_name = "waist_pitch_link"
 
@@ -100,7 +100,7 @@ def make_dex_evt_wbt_dance_cfg() -> EnvCfg:
 
     zh_CN: 让 Dex-EVT 跟踪内置舞蹈参考动作。
     """
-    return DexEvtWbtEnvCfg(motion_file=str(_MOTION_DIR / "dance1_easy.npz"))
+    return DexEvtWbtEnvCfg(motion_files=(str(_MOTION_DIR / "dance1_easy.npz"),))
 
 
 registry.env("dex-evt-wbt-dance")(ManagerEnv)

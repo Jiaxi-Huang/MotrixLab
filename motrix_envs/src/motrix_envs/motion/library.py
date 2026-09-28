@@ -77,7 +77,7 @@ class MotionLibrary:
             extension_channels: Names (without the ``ext_`` prefix) of channels
                 to load from every file; undeclared channels are not loaded.
         """
-        self.entries = _expand_paths(paths)
+        self.entries = expand_motion_paths(paths)
         self.joint_names = joint_names
         self.tracked_body_names = tracked_body_names
         self.reference_body_name = reference_body_name
@@ -147,7 +147,12 @@ class MotionLibrary:
                 )
 
 
-def _expand_paths(paths: Sequence[str | Path]) -> tuple[Path, ...]:
+def expand_motion_paths(paths: Sequence[str | Path]) -> tuple[Path, ...]:
+    """Expand motion sources to an ordered tuple of ``.npz`` file paths.
+
+    Directory entries expand to their ``.npz`` children in sorted order, so
+    the corpus order of a directory source is fixed and reproducible.
+    """
     entries: list[Path] = []
     for raw in paths:
         path = Path(raw).expanduser()
@@ -156,7 +161,7 @@ def _expand_paths(paths: Sequence[str | Path]) -> tuple[Path, ...]:
         else:
             entries.append(path)
     if not entries:
-        raise ValueError("MotionLibrary received no motion files.")
+        raise ValueError("No motion files were found in the given sources.")
     return tuple(entries)
 
 

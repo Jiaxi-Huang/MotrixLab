@@ -40,7 +40,7 @@ G1_TRACKED_BODY_NAMES = (
 class G1WbtEnvCfg(WbtEnvCfg):
     """Whole-body tracking configuration specialized for Unitree G1."""
 
-    motion_file: InitVar[str | None] = None
+    motion_files: InitVar[tuple[str, ...] | None] = None
     commands: CommandsCfg = CommandsCfg(motion=WbtMotionCommandCfg())
     sim: SimCfg = SimCfg(dt=0.005, solver_iterations=3)
     scene: StandardSceneCfg = StandardSceneCfg(
@@ -60,10 +60,10 @@ class G1WbtEnvCfg(WbtEnvCfg):
         ),
     )
 
-    def __post_init__(self, motion_file: str | None) -> None:
+    def __post_init__(self, motion_files: tuple[str, ...] | None) -> None:
         super().__post_init__()
-        if motion_file is not None:
-            self.commands.motion.motion_file = motion_file
+        if motion_files is not None:
+            self.commands.motion.motion_files = motion_files
         self._set_tracked_body_names(G1_TRACKED_BODY_NAMES)
         self.commands.motion.reference_body_name = "torso_link"
 

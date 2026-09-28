@@ -137,7 +137,7 @@ gradually stabilizing with continued training. This demonstrates fast iteration 
 duration, difficulty, and reward scale differ, each curve is best used to assess its own learning progress rather than for a
 direct numerical comparison.
 
-The training CLI does not replace a motion with `motion_file=...`; follow
+The training CLI does not replace a motion with `motion_files=...`; follow
 [Adding a WBT Training Task](adding_wbt_task.md) to register a new environment ID for a custom motion.
 
 ## Run a built-in task

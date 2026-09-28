@@ -88,18 +88,18 @@ def test_record_config_requires_force_to_overwrite(tmp_path):
         generate_video._render_config(args)
 
 
-def test_wbt_default_duration_uses_the_complete_motion_clip(monkeypatch):
+def test_wbt_default_duration_spans_the_whole_motion_source(monkeypatch):
     cfg = G1WbtEnvCfg()
-    cfg.commands.motion.motion_file = "demo.npz"
+    cfg.commands.motion.motion_files = ("demo_a.npz", "demo_b.npz")
 
     class FakeMotion:
         def __init__(self, path):
-            assert path == "demo.npz"
-            self.num_frames = 625
+            assert path in (Path("demo_a.npz"), Path("demo_b.npz"))
+            self.num_frames = 625 if path.name == "demo_a.npz" else 375
             self.fps = 50
 
     monkeypatch.setattr(generate_video.registry, "make_env_config", lambda env, mode: cfg)
     monkeypatch.setattr(generate_video, "MotrixMotion", FakeMotion)
 
-    assert generate_video._record_seconds("demo-wbt", None) == pytest.approx(12.5)
+    assert generate_video._record_seconds("demo-wbt", None) == pytest.approx(20.0)
     assert generate_video._record_seconds("demo-wbt", 3.0) == 3.0

@@ -198,12 +198,22 @@ def test_library_rejects_non_finite_values(tmp_path):
         MotionLibrary([tmp_path / "a.npz", tmp_path / "b.npz"], **_TASK_ORDER).assemble()
 
 
+def test_library_rejects_non_finite_extension_channel(tmp_path):
+    _write_motion_npz(tmp_path / "a.npz", extensions={"ext_smpl_joints": np.zeros((6, 3), np.float32)})
+    with np.load(tmp_path / "a.npz", allow_pickle=False) as data:
+        fields = {key: data[key] for key in data.files}
+    fields["ext_smpl_joints"][3, 1] = np.inf
+    np.savez(tmp_path / "a.npz", **fields)
+    with pytest.raises(MotionFormatError, match="ext_smpl_joints.*non-finite"):
+        MotionLibrary([tmp_path / "a.npz"], extension_channels=("smpl_joints",), **_TASK_ORDER).assemble()
+
+
 def test_library_rejects_empty_source(tmp_path):
-    with pytest.raises(ValueError, match="no motion files"):
+    with pytest.raises(ValueError, match="No motion files"):
         MotionLibrary([], **_TASK_ORDER)
     empty_dir = tmp_path / "empty"
     empty_dir.mkdir()
-    with pytest.raises(ValueError, match="no motion files"):
+    with pytest.raises(ValueError, match="No motion files"):
         MotionLibrary([empty_dir], **_TASK_ORDER)
 
 

@@ -159,7 +159,7 @@ def make_g129dof_wbt_backflip_cfg() -> EnvCfg:
     zh_CN: 让 Unitree G1 跟踪内置后空翻参考动作。
     """
 
-    return G1BackflipWbtEnvCfg(motion_file=str(MOTION_DIR / "backflip.npz"))
+    return G1BackflipWbtEnvCfg(motion_files=(str(MOTION_DIR / "backflip.npz"),))
 
 
 registry.env("g1-wbt-backflip")(ManagerEnv)

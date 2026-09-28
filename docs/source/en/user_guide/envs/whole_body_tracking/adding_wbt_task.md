@@ -19,11 +19,11 @@ from motrix_envs.locomotion.wbt.g1.common import G1WbtEnvCfg, MOTION_DIR
 
 @registry.envcfg("g1-wbt-dance1-subject1")
 def make_g129dof_wbt_dance1_subject1_cfg() -> G1WbtEnvCfg:
-    return G1WbtEnvCfg(motion_file=str(MOTION_DIR / "dance1_subject1.npz"))
+    return G1WbtEnvCfg(motion_files=(str(MOTION_DIR / "dance1_subject1.npz"),))
 ```
 
 `G1WbtEnvCfg` inherits `WbtEnvCfg` and provides the G1 scene, tracked bodies, reference body, control scaling,
-rewards, and termination rules. When a new motion uses the same robot and tracking semantics, pass a different `motion_file`
+rewards, and termination rules. When a new motion uses the same robot and tracking semantics, pass a different `motion_files`
 directly to the constructor. Do not copy `ManagerEnv` for each clip.
 
 ## 2. Prepare and replay the motion
@@ -54,7 +54,7 @@ only when these semantics change:
 | Config                                                     | Responsibility                                                                                        |
 | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- |
 | `scene.objs.robot`                                         | Robot assets, default key pose, base link, joint/actuator position ranges, and physical `force_range` |
-| `motion_file`                                              | MotrixLab Motion NPZ path                                                                             |
+| `motion_files`                                             | Ordered MotrixLab Motion NPZ file/directory list                                                      |
 | `tracked_body_names`                                       | Links used by relative body-pose and velocity rewards                                                 |
 | `reference_body_name`                                      | Link used for global reference pose and local alignment                                               |
 | `control_config.action_scale`                              | Base scale from policy action to position target                                                      |
@@ -72,7 +72,7 @@ effort as the largest absolute endpoint and uses it for position-target scaling.
 
 Existing robot config classes provide starting points:
 
--   G1: `G1WbtEnvCfg(motion_file=...)`
+-   G1: `G1WbtEnvCfg(motion_files=...)`
 -   Dex-EVT: `DexEvtWbtManagerCfg()`
 -   K1: `K1WbtManagerCfg(commands=_k1_commands(...), rewards=...)`
 

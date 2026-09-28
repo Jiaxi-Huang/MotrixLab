@@ -17,7 +17,7 @@ def make_g129dof_wbt_largebox_cfg() -> EnvCfg:
     zh_CN: 让 Unitree G1 跟踪搬运大箱子的参考动作。
     """
 
-    return G1WbtEnvCfg(motion_file=str(MOTION_DIR / "sub3_largebox_003.npz"))
+    return G1WbtEnvCfg(motion_files=(str(MOTION_DIR / "sub3_largebox_003.npz"),))
 
 
 registry.env("g1-29dof-wbt-largebox")(ManagerEnv)

@@ -21,6 +21,7 @@ import motrix_envs  # noqa: F401 registers built-in environments
 from motrix_env_core import registry
 from motrix_env_core.renderer import RenderConfig
 from motrix_envs.locomotion.wbt.cfg import WbtEnvCfg
+from motrix_envs.motion.library import expand_motion_paths
 from motrix_envs.motion.loader import MotrixMotion
 from motrix_rl import checkpoints, runner, runs
 
@@ -109,7 +110,7 @@ def _recording_path(env_name: str, output: Path | None) -> Path:
 
 
 def _record_seconds(env_name: str, requested_seconds: float | None) -> float:
-    """Resolve an explicit duration or derive one complete WBT motion clip."""
+    """Resolve an explicit duration or derive one complete pass of the WBT motion source."""
     if requested_seconds is not None:
         if requested_seconds <= 0:
             raise ValueError(f"--seconds must be positive, got {requested_seconds}.")
@@ -117,8 +118,8 @@ def _record_seconds(env_name: str, requested_seconds: float | None) -> float:
 
     env_cfg = registry.make_env_config(env_name, mode="play")
     if isinstance(env_cfg, WbtEnvCfg):
-        motion = MotrixMotion(env_cfg.commands.motion.motion_file)
-        return motion.num_frames / motion.fps
+        motions = [MotrixMotion(path) for path in expand_motion_paths(env_cfg.commands.motion.motion_files)]
+        return sum(motion.num_frames / motion.fps for motion in motions)
     return DEFAULT_RECORD_SECONDS
 
 

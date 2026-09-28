@@ -68,10 +68,9 @@ main 上唯一的 motion 消费者是 `WbtMotionCommand`，"单 clip"假设同�
 shape 一致。SMPL 类双参考表示即此机制的应用：任务侧不再需要 motion clip 数据子类，也不需要专用
 打包/存储格式。
 
-`WbtMotionCommandCfg` 的多文件源与通道声明写法（单文件 `motion_file` 路径保持默认不变；两者互斥）：
+`WbtMotionCommandCfg` 的动作源与通道声明写法（统一走 `motion_files`，单文件即长度为 1 的列表）：
 
 ```python
-commands.motion.motion_file = MISSING                # 改用多文件源时置 MISSING
 commands.motion.motion_files = (                     # 有序文件/目录列表（目录按排序展开）
     "assets/motion/g1/dance_a.npz",
     "assets/motion/g1/dance_b.npz",

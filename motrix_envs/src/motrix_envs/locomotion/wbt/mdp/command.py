@@ -25,7 +25,7 @@ from motrix_env_core.manager.math.quaternion import mul as quat_mul
 from motrix_env_core.manager.math.quaternion import rotate_vector
 from motrix_env_core.numba.manager.commands import ResetContext
 from motrix_env_core.numba.manager.dispatch import dispatch
-from motrix_envs.motion import MotionLibrary, MotrixMotion, WbtMotionClip
+from motrix_envs.motion import MotionLibrary, WbtMotionClip
 
 
 @njit(inline="always")
@@ -310,8 +310,7 @@ class WbtMotionCommand(CommandTerm):
 
 @configclass(kw_only=True)
 class WbtMotionCommandCfg(CommandCfg):
-    motion_file: str = MISSING
-    motion_files: tuple[str, ...] = ()
+    motion_files: tuple[str, ...] = MISSING
     extension_channels: tuple[str, ...] = ()
     joint_names: tuple[str, ...] = MISSING
     tracked_body_names: tuple[str, ...] = MISSING
@@ -343,31 +342,15 @@ class WbtMotionCommandCfg(CommandCfg):
                 f"tracked_body_names must include the reference body {self.reference_body_name!r}"
             ) from None
         env_fps = max(int(round(1.0 / env.cfg.ctrl_dt)), 1)
-        if self.motion_files:
-            # An unset motion_file reaches this point as either the omegaconf
-            # MISSING sentinel (fresh factory config) or its '???' literal
-            # (config validated / pickled into async collectors); only a real
-            # path string means both sources are configured.
-            if isinstance(self.motion_file, str) and self.motion_file != "???":
-                raise ValueError("Configure either motion_file or motion_files, not both.")
-            source = MotionLibrary(
-                self.motion_files,
-                joint_names=list(self.joint_names),
-                tracked_body_names=self.tracked_body_names,
-                reference_body_name=self.reference_body_name,
-                root_body_name=robot.base_link_name,
-                fps=env_fps,
-                extension_channels=self.extension_channels,
-            ).assemble()
-        else:
-            source = WbtMotionClip.create(
-                MotrixMotion(self.motion_file),
-                list(self.joint_names),
-                self.tracked_body_names,
-                self.reference_body_name,
-                robot.base_link_name,
-                self.extension_channels,
-            )
+        source = MotionLibrary(
+            self.motion_files,
+            joint_names=list(self.joint_names),
+            tracked_body_names=self.tracked_body_names,
+            reference_body_name=self.reference_body_name,
+            root_body_name=robot.base_link_name,
+            fps=env_fps,
+            extension_channels=self.extension_channels,
+        ).assemble()
         if self.adaptive_sampling_enabled:
             num_bins = source.joint_pos.shape[0] // env_fps + 1
         else:

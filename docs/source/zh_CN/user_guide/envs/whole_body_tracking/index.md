@@ -133,7 +133,7 @@ adding_wbt_task
 后逐步趋于稳定，体现出并行仿真对动作跟踪任务的快速迭代能力。不同 motion 的时长、难度和奖励尺度不同，曲线数值
 适合用于观察各自的学习进展，不宜直接横向比较。
 
-训练 CLI 不支持用 `motion_file=...` 临时替换动作；接入新动作时应按照[新增 WBT 训练任务](adding_wbt_task.md)注册新的
+训练 CLI 不支持用 `motion_files=...` 临时替换动作；接入新动作时应按照[新增 WBT 训练任务](adding_wbt_task.md)注册新的
 Env ID。
 
 ## 运行内置任务

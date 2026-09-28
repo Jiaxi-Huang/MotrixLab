@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import numba
 import numpy as np
 import pytest
-from omegaconf import MISSING
 
 import motrix_envs  # noqa: E402, F401
 from motrix_env_core import registry  # noqa: E402
@@ -555,7 +554,7 @@ def test_numba_wbt_registry_uses_generic_manager_env() -> None:
 
     assert isinstance(manager_cfg, WbtEnvCfg)
     assert not hasattr(manager_cfg, "manager")
-    assert "motion_file" not in {field.name for field in fields(manager_cfg)}
+    assert "motion_files" not in {field.name for field in fields(manager_cfg)}
     assert not hasattr(manager_cfg, "tracked_body_names")
     assert not hasattr(manager_cfg, "reference_body_name")
     assert [term_field.name for term_field in fields(manager_cfg.commands)] == ["motion"]
@@ -815,7 +814,6 @@ def _multi_clip_cfg(
     motion = cfg.commands.motion
     assert isinstance(motion, WbtMotionCommandCfg)
     replacements = {
-        "motion_file": MISSING,
         "motion_files": motion_files
         if motion_files is not None
         else _split_dance_corpus(tmp_path, split=split, extension_channels=extension_channels),
@@ -844,8 +842,7 @@ def _single_file_cfg(*, start_at_timestep_zero_prob: float | None = None) -> Wbt
     motion = cfg.commands.motion
     assert isinstance(motion, WbtMotionCommandCfg)
     replacements: dict[str, object] = {
-        "motion_file": str(_DANCE_MOTION),
-        "motion_files": (),
+        "motion_files": (str(_DANCE_MOTION),),
         "hold_at_clip_end": False,
         "sequential_clips": False,
     }
@@ -1104,28 +1101,10 @@ def test_numba_wbt_multi_clip_adaptive_bins_span_whole_corpus(tmp_path) -> None:
     assert motion.sampling_cdf[-1] == pytest.approx(1.0)
 
 
-def test_wbt_motion_command_cfg_rejects_dual_motion_sources(tmp_path) -> None:
+def test_numba_wbt_multi_clip_cfg_survives_pickle_round_trip(tmp_path) -> None:
+    """Async collectors receive the env spec via pickle; the assembled corpus
+    must survive the round-trip unchanged."""
     cfg = _multi_clip_cfg(tmp_path)
-    motion = cfg.commands.motion
-    assert isinstance(motion, WbtMotionCommandCfg)
-    cfg = replace(
-        cfg,
-        commands=replace(cfg.commands, motion=replace(motion, motion_file=str(_DANCE_MOTION))),
-    )
-    with pytest.raises(ValueError, match="motion_file or motion_files"):
-        _make_numba_env(cfg, num_envs=1)
-
-
-@pytest.mark.parametrize("missing_marker", [MISSING, "???"])
-def test_numba_wbt_multi_clip_cfg_survives_pickle_round_trip(tmp_path, missing_marker) -> None:
-    """Async collectors receive the env spec via pickle; whichever MISSING
-    marker the config pipeline leaves behind (the omegaconf sentinel on a
-    fresh config, or its '???' literal after validation) must not read as a
-    configured motion_file after the round-trip."""
-    cfg = _multi_clip_cfg(tmp_path)
-    motion = cfg.commands.motion
-    assert isinstance(motion, WbtMotionCommandCfg)
-    cfg = replace(cfg, commands=replace(cfg.commands, motion=replace(motion, motion_file=missing_marker)))
     restored = pickle.loads(pickle.dumps(cfg))
     assert isinstance(restored, WbtEnvCfg)
     env = _make_numba_env(restored, num_envs=2)

@@ -109,7 +109,7 @@ class CartPoleEnvCfg(EnvCfg): ...
 
 @registry.envcfg("g1-wbt")
 def make_g1_wbt_cfg() -> WbtEnvCfg:
-    return WbtEnvCfg(scene=..., motion_file=...)
+    return WbtEnvCfg(scene=..., motion_files=(...,))
 
 
 @registry.env("cartpole")  # 注册实现，backend 自动推断
@@ -167,7 +167,7 @@ RslrlCfg (继承 RslrlRunnerCfg)
 @registry.envcfg("g1-wbt")
 def make_g1_wbt_cfg() -> WbtEnvCfg:
     return WbtEnvCfg(
-        motion_file="...",
+        motion_files=("...",),
         tracked_body_names=(...),
         reference_body_name="torso_link",
     )

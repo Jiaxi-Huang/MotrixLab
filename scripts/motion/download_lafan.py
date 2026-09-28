@@ -55,7 +55,7 @@ _LIST = flags.DEFINE_bool("list", False, "List available clips for --robot and e
 
 
 def _default_motion_dir() -> Path:
-    """Package motion dir the G1 WBT cfg resolves motion_file against."""
+    """Package motion dir the G1 WBT cfg resolves motion_files against."""
     import motrix_envs.locomotion.wbt as wbt_pkg
 
     return Path(wbt_pkg.__file__).resolve().parent / "assets" / "motion" / _ROBOT.value

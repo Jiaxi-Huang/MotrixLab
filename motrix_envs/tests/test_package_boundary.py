@@ -21,22 +21,23 @@ def test_importing_builtins_registers_environments_in_core_registry():
 
 
 @pytest.mark.parametrize("cfg_type", [G1WbtEnvCfg, K1WbtEnvCfg, DexEvtWbtEnvCfg])
-def test_wbt_robot_config_accepts_motion_file(cfg_type):
-    cfg = cfg_type(motion_file="dance.npz")
+def test_wbt_robot_config_accepts_motion_files(cfg_type):
+    cfg = cfg_type(motion_files=("dance.npz",))
 
-    assert cfg.commands.motion.motion_file == "dance.npz"
+    assert cfg.commands.motion.motion_files == ("dance.npz",)
 
 
 @pytest.mark.parametrize("cfg_type", [G1WbtEnvCfg, K1WbtEnvCfg, DexEvtWbtEnvCfg])
-def test_wbt_robot_config_preserves_nested_yaml_motion_file(cfg_type):
-    base_cfg = cfg_type(motion_file="default.npz")
+def test_wbt_robot_config_preserves_nested_yaml_motion_files(cfg_type):
+    base_cfg = cfg_type(motion_files=("default.npz",))
     cfg = OmegaConf.merge(
         OmegaConf.structured(base_cfg),
-        {"commands": {"motion": {"motion_file": "dance.yaml.npz"}}},
+        {"commands": {"motion": {"motion_files": ["dance.yaml.npz"]}}},
     )
     typed_cfg = OmegaConf.to_object(cfg)
 
-    assert typed_cfg.commands.motion.motion_file == "dance.yaml.npz"
+    # YAML-sourced sequences come back as lists; MotionLibrary accepts any sequence.
+    assert typed_cfg.commands.motion.motion_files == ["dance.yaml.npz"]
 
 
 def test_builtin_and_framework_defaults_are_isolated():
