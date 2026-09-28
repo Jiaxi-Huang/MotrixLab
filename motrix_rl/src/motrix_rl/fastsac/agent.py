@@ -362,6 +362,7 @@ class FastSacAgent:
         # trainer's single global-batch step.
         batch_per_env = max(cfg.batch_size // self.world_size // self.num_envs, 1)
         last = (torch.zeros((), device=self.device),) * 5
+        actor_pair = (last[3], last[4])
         timing_s = {key: 0.0 for key in ("sample_normalize", "critic_alpha", "actor")}
         update_started = time.perf_counter()
         # Batched data preparation (Holosoma-style): sample once and normalize
@@ -399,7 +400,6 @@ class FastSacAgent:
             outputs = self._update_main(b)
             timing_s["critic_alpha"] += time.perf_counter() - stage_started
 
-            actor_pair = (last[3], last[4])
             if (self.update_idx + i) % cfg.policy_frequency == 0:
                 stage_started = time.perf_counter()
                 pol_outputs = self._update_pol(b)
@@ -412,8 +412,11 @@ class FastSacAgent:
             # Only the final step's main outputs feed the returned metrics; own
             # them so they survive future update() calls' replays. Earlier
             # steps' outputs are never read — only replaced below.
+            # The critic tuple carries a fourth tv_min element the metrics
+            # dict does not expose, so compose the five-slot layout from the
+            # first three main outputs.
             main_outputs = _own(outputs) if i == num_updates - 1 else outputs
-            last = (*main_outputs, *actor_pair)
+            last = (*main_outputs[:3], *actor_pair)
 
         self.update_idx += num_updates
         timing_s["total"] = time.perf_counter() - update_started

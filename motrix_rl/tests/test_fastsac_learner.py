@@ -153,6 +153,57 @@ def test_update_metrics_survive_later_graph_generations() -> None:
         assert all(value == value for value in values.values())  # no NaNs from torn reads
 
 
+def test_update_metrics_keep_actor_pair_when_final_step_skips_policy() -> None:
+    """The carried actor pair must stay the actor pair under gating.
+
+    Regression for the four-element critic tuple: re-deriving the pair as
+    ``(last[3], last[4])`` inside the loop picked up ``(tv_min, actor_loss)``
+    instead — shifting every metric label by one and, under
+    ``mode="reduce-overhead"``, leaking an unowned CUDA-graph tensor into the
+    metrics whenever the FINAL gradient step skipped the policy update (the
+    next replay invalidated it and crashed the async learner's log path).
+    """
+    import torch
+
+    from motrix_rl.fastsac.agent import FastSacAgent
+
+    n_env, obs, cri, act = 8, 5, 7, 3
+    agent = FastSacAgent(
+        obs_dim=obs,
+        critic_obs_dim=cri,
+        act_dim=act,
+        num_envs=n_env,
+        cfg=_tiny_agent_cfg(policy_frequency=2, amp=False, compile=False),
+        device=torch.device("cpu"),
+    )
+    for _ in range(4):
+        agent.rb.extend(
+            torch.randn(n_env, obs),
+            torch.randn(n_env, cri),
+            torch.randn(n_env, act),
+            torch.randn(n_env),
+            torch.zeros(n_env, dtype=torch.long),
+            torch.zeros(n_env, dtype=torch.long),
+        )
+    agent._update_main = lambda b: (
+        torch.tensor(1.0),
+        torch.tensor(2.0),
+        torch.tensor(3.0),
+        torch.tensor(4.0),
+    )
+    agent._update_pol = lambda b: (torch.tensor(1234.5), torch.tensor(777.0))
+
+    # update_idx 0 with policy_frequency 2: the actor step runs at i=0 while
+    # the FINAL iteration (i=1) skips it, so the pair must be carried intact.
+    metrics = agent.update(2)
+
+    assert float(metrics["qf_loss"]) == 1.0
+    assert float(metrics["alpha_loss"]) == 2.0
+    assert float(metrics["qf_max"]) == 3.0
+    assert float(metrics["actor_loss"]) == 1234.5
+    assert float(metrics["policy_entropy"]) == 777.0
+
+
 def test_nest_timing_path_merges_scalar_total_with_children_in_any_order() -> None:
     from motrix_rl.fastsac.async_impl.stats import nest_timing_path
 
