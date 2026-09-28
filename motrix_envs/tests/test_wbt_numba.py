@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import numba
 import numpy as np
 import pytest
+from omegaconf import MISSING
 
 import motrix_envs  # noqa: E402, F401
 from motrix_env_core import registry  # noqa: E402
@@ -21,6 +22,7 @@ from motrix_env_core.mdp.observations import (  # noqa: E402
     UniformNoiseCfg,
 )
 from motrix_env_core.mdp.state import RandValue  # noqa: E402
+from motrix_env_core.numba.manager.commands import ResetContext  # noqa: E402
 from motrix_env_core.numba.manager.compiler.compiler import TermScalarBuffer  # noqa: E402
 from motrix_env_core.sim import BatchLinkPositionQuery  # noqa: E402
 from motrix_envs.locomotion.wbt.cfg import (  # noqa: E402
@@ -29,6 +31,7 @@ from motrix_envs.locomotion.wbt.cfg import (  # noqa: E402
     WbtEnvCfg,
 )
 from motrix_envs.locomotion.wbt.dex_evt import DexEvtWbtEnvCfg  # noqa: E402
+from motrix_envs.locomotion.wbt.g1.common import MOTION_DIR as _G1_MOTION_DIR  # noqa: E402
 from motrix_envs.locomotion.wbt.g1.common import G1WbtEnvCfg  # noqa: E402
 from motrix_envs.locomotion.wbt.k1 import K1WbtEnvCfg  # noqa: E402
 from motrix_envs.locomotion.wbt.mdp.action import (  # noqa: E402
@@ -51,6 +54,7 @@ from motrix_envs.locomotion.wbt.mdp.reset import (  # noqa: E402
     BodyRotResetCfg,
     BodyRotVelResetCfg,
 )
+from motrix_envs.motion import MotrixMotion, WbtMotionClip  # noqa: E402
 
 
 def _motion_command(env: ManagerEnv) -> WbtMotionCommand:
@@ -90,6 +94,10 @@ def _deterministic_manager_cfg(*, hold_at_clip_end: bool = False) -> WbtEnvCfg:
             motion=replace(
                 motion,
                 hold_at_clip_end=hold_at_clip_end,
+                # Pin the head-frame start so wrap/buffer mechanics stay
+                # deterministic regardless of the play start distribution.
+                start_at_timestep_zero_prob=1.0,
+                sequential_clips=False,
             ),
         ),
     )
@@ -348,7 +356,10 @@ def test_numba_wbt_clip_end_behavior(hold_at_clip_end: bool) -> None:
 
 
 def test_numba_wbt_clip_wrap_rematerializes_sim_only() -> None:
-    env = _make_numba_env(_deterministic_manager_cfg(), num_envs=2, seed=11)
+    # The single dance file keeps the wrap frame adjacent to the episode-start
+    # pose, so forcing a wrap there cannot diverge the physics; the corpus
+    # directory's final frame belongs to a different clip and would.
+    env = _make_numba_env(_single_file_cfg(start_at_timestep_zero_prob=1.0), num_envs=2, seed=11)
     env.init_state()
     motion = _motion_command(env)
     action = env.action_terms["joint_position"]
@@ -399,7 +410,6 @@ def test_numba_wbt_adaptive_sampler_state_is_manager_owned() -> None:
     command_cfg = replace(command_cfg, adaptive_sampling_enabled=True)
     cfg = replace(
         cfg,
-        ctrl_dt=0.04,
         commands=replace(cfg.commands, motion=command_cfg),
     )
     env = _make_numba_env(cfg, num_envs=3)
@@ -559,7 +569,7 @@ def test_numba_wbt_registry_uses_generic_manager_env() -> None:
     action_cfg = manager_cfg.actions.joint_position
     assert isinstance(action_cfg, WbtJointPositionActionCfg)
     assert not hasattr(manager_cfg, "values")
-    assert motion_command_cfg.motion_file
+    assert motion_command_cfg.motion_files == (str(_G1_MOTION_DIR / "dance"),)
     tracked_body_pos = env.sim_data.query("tracked_body_pos")
     assert isinstance(tracked_body_pos, BatchLinkPositionQuery)
     assert motion_command_cfg.tracked_body_names == tracked_body_pos.links
@@ -587,6 +597,50 @@ def test_wbt_manager_play_disables_each_reset_term_noise() -> None:
     cfg = registry.make_env_config("g1-wbt-dance", mode="play")
 
     assert all(term.noise_scale == 0.0 for term in cfg.sim_reset.to_dict().values())
+
+
+def test_wbt_manager_play_enables_sequential_playback() -> None:
+    """Play walks the motion source as one ordered sequence: start at the
+    corpus head, cross clip boundaries in order, and at the corpus end loop
+    back to the head — hold_at_clip_end is cleared so playback loops the
+    corpus instead of freezing on the final frame."""
+    for name in ("g1-29dof-wbt-largebox", "g1-wbt-dance"):
+        cfg = registry.make_env_config(name, mode="play")
+        assert isinstance(cfg, WbtEnvCfg)
+        assert cfg.commands.motion.sequential_clips
+        assert not cfg.commands.motion.hold_at_clip_end
+        assert not cfg.commands.motion.adaptive_sampling_enabled
+
+
+def test_single_clip_motion_dir_reproduces_file_clip(tmp_path) -> None:
+    """A corpus directory holding one clip assembles bit-for-bit like loading
+    that clip through the single-file path (the library's N=1 special case)."""
+    corpus_dir = tmp_path / "dance"
+    corpus_dir.mkdir()
+    (corpus_dir / _DANCE_MOTION.name).write_bytes(_DANCE_MOTION.read_bytes())
+
+    cfg = registry.make_env_config("g1-wbt-dance", mode="play")
+    assert isinstance(cfg, WbtEnvCfg)
+    motion_cfg = cfg.commands.motion
+    assert isinstance(motion_cfg, WbtMotionCommandCfg)
+    dir_cfg = replace(
+        cfg,
+        commands=replace(cfg.commands, motion=replace(motion_cfg, motion_files=(str(corpus_dir),))),
+    )
+
+    env = _make_numba_env(dir_cfg, num_envs=2)
+    motion = _motion_command(env)
+    direct = WbtMotionClip.create(
+        MotrixMotion(_DANCE_MOTION),
+        list(motion_cfg.joint_names),
+        motion_cfg.tracked_body_names,
+        motion_cfg.reference_body_name,
+        cfg.scene.objs.robot.base_link_name,
+        motion_cfg.extension_channels,
+    )
+    for field in _CLIP_FRAME_FIELDS:
+        np.testing.assert_array_equal(getattr(motion.clip, field), getattr(direct, field))
+    np.testing.assert_array_equal(motion.clip.frame_clip_end, motion.clip.joint_pos.shape[0] - 1)
 
 
 def test_wbt_robot_config_subclasses_isolate_nested_overrides() -> None:
@@ -703,3 +757,378 @@ def test_g1_wbt_dance_mgr_uses_manager_environment() -> None:
 
     assert spec.env_cls is ManagerEnv
     assert isinstance(spec.env_cfg, WbtEnvCfg)
+
+
+# ---------------------------------------------------------------------------
+# Multi-clip corpus (MotionLibrary) behavior
+# ---------------------------------------------------------------------------
+
+_DANCE_MOTION = _G1_MOTION_DIR / "dance" / "dance1_subject2.npz"
+_DANCE_SPLIT = 500
+
+
+def _split_dance_corpus(tmp_path, *, split=_DANCE_SPLIT, extension_channels=()):
+    """Split the bundled G1 dance motion into two schema v1 files.
+
+    Slicing preserves every per-frame field, so the concatenated corpus
+    reproduces the original clip bit-for-bit on the global frame axis.
+    """
+    with np.load(_DANCE_MOTION, allow_pickle=False) as data:
+        fields = {key: data[key] for key in data.files}
+    total = int(np.asarray(fields["num_frames"]).reshape(-1)[0])
+    rng = np.random.default_rng(7)
+    paths = []
+    bounds = (0, split, total)
+    for index, (start, stop) in enumerate(zip(bounds[:-1], bounds[1:])):
+        part = {"num_frames": np.int32(stop - start)}
+        for name, value in fields.items():
+            if name == "num_frames":
+                continue
+            # Per-frame arrays (including ext_ channels) carry the frame axis;
+            # names and scalars are corpus-wide metadata.
+            if isinstance(value, np.ndarray) and value.shape[:1] == (total,):
+                part[name] = value[start:stop]
+            else:
+                part[name] = value
+        for channel in extension_channels:
+            part[f"ext_{channel}"] = rng.standard_normal((stop - start, 3)).astype(np.float32)
+        path = tmp_path / f"part{index}.npz"
+        np.savez(path, **part)
+        paths.append(str(path))
+    return tuple(paths)
+
+
+def _multi_clip_cfg(
+    tmp_path,
+    *,
+    hold_at_clip_end: bool = False,
+    sequential_clips: bool = False,
+    start_at_timestep_zero_prob: float | None = None,
+    adaptive_sampling_enabled: bool | None = None,
+    alpha: float | None = None,
+    split: int = _DANCE_SPLIT,
+    extension_channels: tuple[str, ...] = (),
+    motion_files: tuple[str, ...] | None = None,
+) -> WbtEnvCfg:
+    cfg = registry.make_env_config("g1-wbt-dance", mode="play")
+    assert isinstance(cfg, WbtEnvCfg)
+    motion = cfg.commands.motion
+    assert isinstance(motion, WbtMotionCommandCfg)
+    replacements = {
+        "motion_file": MISSING,
+        "motion_files": motion_files
+        if motion_files is not None
+        else _split_dance_corpus(tmp_path, split=split, extension_channels=extension_channels),
+        "extension_channels": tuple(extension_channels),
+        "hold_at_clip_end": hold_at_clip_end,
+        "sequential_clips": sequential_clips,
+    }
+    if start_at_timestep_zero_prob is not None:
+        replacements["start_at_timestep_zero_prob"] = start_at_timestep_zero_prob
+    if adaptive_sampling_enabled is not None:
+        replacements["adaptive_sampling_enabled"] = adaptive_sampling_enabled
+    if alpha is not None:
+        replacements["alpha"] = alpha
+    return replace(cfg, commands=replace(cfg.commands, motion=replace(motion, **replacements)))
+
+
+def _single_file_cfg(*, start_at_timestep_zero_prob: float | None = None) -> WbtEnvCfg:
+    """A play config pinned to the bundled dance file.
+
+    The g1-wbt-dance corpus directory holds however many clips are currently
+    dropped into it, so tests that need one exact clip load the file directly
+    instead of going through the registry preset.
+    """
+    cfg = registry.make_env_config("g1-wbt-dance", mode="play")
+    assert isinstance(cfg, WbtEnvCfg)
+    motion = cfg.commands.motion
+    assert isinstance(motion, WbtMotionCommandCfg)
+    replacements: dict[str, object] = {
+        "motion_file": str(_DANCE_MOTION),
+        "motion_files": (),
+        "hold_at_clip_end": False,
+        "sequential_clips": False,
+    }
+    if start_at_timestep_zero_prob is not None:
+        replacements["start_at_timestep_zero_prob"] = start_at_timestep_zero_prob
+    return replace(cfg, commands=replace(cfg.commands, motion=replace(motion, **replacements)))
+
+
+_CLIP_FRAME_FIELDS = (
+    "joint_pos",
+    "joint_vel",
+    "tracked_bodies_pos_w",
+    "tracked_bodies_quat_w",
+    "tracked_bodies_lin_vel_w",
+    "tracked_bodies_ang_vel_w",
+    "root_body_pos_w",
+    "root_body_quat_w",
+    "root_body_lin_vel_w",
+    "root_body_ang_vel_w",
+    "reference_body_pos_w",
+    "reference_body_quat_w",
+)
+
+
+def test_numba_wbt_multi_clip_corpus_reproduces_single_clip_arrays(tmp_path) -> None:
+    multi = _make_numba_env(_multi_clip_cfg(tmp_path), num_envs=2)
+    single = _make_numba_env(_single_file_cfg(), num_envs=2)
+    clip = _motion_command(multi).clip
+    single_clip = _motion_command(single).clip
+
+    for field in _CLIP_FRAME_FIELDS:
+        np.testing.assert_array_equal(getattr(clip, field), getattr(single_clip, field))
+    last = single_clip.joint_pos.shape[0] - 1
+    np.testing.assert_array_equal(clip.frame_clip_end[:_DANCE_SPLIT], _DANCE_SPLIT - 1)
+    np.testing.assert_array_equal(clip.frame_clip_end[_DANCE_SPLIT:], last)
+
+
+def test_numba_wbt_multi_clip_wrap_rematerializes_sim_only(tmp_path) -> None:
+    # Split after two frames: the first clip's final frame is adjacent to the
+    # episode-start pose, so forcing a wrap there cannot diverge the physics.
+    # The head-frame start keeps the priming step on that same pose.
+    cfg = _multi_clip_cfg(tmp_path, split=2, start_at_timestep_zero_prob=1.0)
+    env = _make_numba_env(cfg, num_envs=2, seed=11)
+    env.init_state()
+    motion = _motion_command(env)
+    action = env.action_terms["joint_position"]
+    assert isinstance(action, WbtJointPositionAction)
+    total = motion.clip.joint_pos.shape[0]
+    actions = np.full((env.num_envs, *env.action_space.shape), 0.25, dtype=np.float32)
+
+    env.step(actions)
+    episode_steps_before_wrap = env.state.episode_steps.copy()
+
+    # A lane inside the second clip advances normally: no wrap, no rematerialize.
+    motion.steps[:, 0] = 2
+    state = env.step(actions)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], False)
+    np.testing.assert_array_equal(motion.steps[:, 0], 3)
+    np.testing.assert_array_equal(state.terminated, False)
+    np.testing.assert_array_equal(env._sim_reset_requested[:, 0], False)
+
+    # A lane on the first clip's final frame wraps at the clip boundary, not at
+    # the corpus end: the frame is resampled over the whole corpus and the reset
+    # pipeline rematerializes the lane without ending the episode.
+    motion.steps[:, 0] = 1
+    state = env.step(actions)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], True)
+    assert np.all(motion.steps[:, 0] <= total - 2)
+    np.testing.assert_array_equal(state.terminated, False)
+    np.testing.assert_array_equal(state.truncated, False)
+    np.testing.assert_array_equal(state.episode_steps, episode_steps_before_wrap + 2)
+    np.testing.assert_array_equal(action.current, 0.25)
+    np.testing.assert_array_equal(action.previous, 0.25)
+
+    steps_after_wrap = motion.steps[:, 0].copy()
+    env.step(actions)
+    np.testing.assert_array_equal(env._sim_reset_requested[:, 0], False)
+    np.testing.assert_array_equal(motion.steps[:, 0], steps_after_wrap + 1)
+
+
+def test_numba_wbt_multi_clip_hold_clamps_to_own_clip_end(tmp_path) -> None:
+    env = _make_numba_env(_multi_clip_cfg(tmp_path, hold_at_clip_end=True), num_envs=2)
+    state = env.init_state()
+    motion = _motion_command(env)
+    total = motion.clip.joint_pos.shape[0]
+
+    # Hold on the first clip keeps the lane on that clip's final frame, not on
+    # the corpus final frame.
+    motion.steps.fill(_DANCE_SPLIT - 1)
+    env.compute_transition(state)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], True)
+    np.testing.assert_array_equal(motion.steps[:, 0], _DANCE_SPLIT - 1)
+
+    # The corpus-final clip still holds on the global final frame.
+    motion.steps.fill(total - 1)
+    env.compute_transition(state)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], True)
+    np.testing.assert_array_equal(motion.steps[:, 0], total - 1)
+
+
+def test_numba_wbt_multi_clip_sequential_crosses_boundaries_and_loops(tmp_path) -> None:
+    # Split after two frames so boundary crossings stay adjacent to the
+    # episode-start pose and cannot diverge the physics (same trick as the
+    # wrap test above).
+    cfg = _multi_clip_cfg(tmp_path, sequential_clips=True, split=2)
+    env = _make_numba_env(cfg, num_envs=2, seed=11)
+    env.init_state()
+    motion = _motion_command(env)
+    action = env.action_terms["joint_position"]
+    assert isinstance(action, WbtJointPositionAction)
+    total = motion.clip.joint_pos.shape[0]
+    actions = np.full((env.num_envs, *env.action_space.shape), 0.25, dtype=np.float32)
+
+    # The initial reset keeps the initialized corpus-head frame.
+    np.testing.assert_array_equal(motion.steps[:, 0], 0)
+
+    env.step(actions)
+    episode_steps_before_boundary = env.state.episode_steps.copy()
+
+    # A lane inside the second clip advances normally: no boundary crossed.
+    motion.steps[:, 0] = 2
+    state = env.step(actions)
+    np.testing.assert_array_equal(motion.steps[:, 0], 3)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], False)
+    np.testing.assert_array_equal(env._sim_reset_requested[:, 0], False)
+
+    # The first clip's final frame crosses into the second clip's head frame
+    # instead of resampling, rematerializing the lane there.
+    motion.steps[:, 0] = 1
+    state = env.step(actions)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], True)
+    np.testing.assert_array_equal(motion.steps[:, 0], 2)
+    np.testing.assert_array_equal(state.terminated, False)
+    np.testing.assert_array_equal(state.truncated, False)
+    np.testing.assert_array_equal(state.episode_steps, episode_steps_before_boundary + 2)
+    # Rematerialization is sim-only: the persistent action state keeps the
+    # processed values of this step.
+    np.testing.assert_array_equal(action.current, 0.25)
+    np.testing.assert_array_equal(action.previous, 0.25)
+
+    # The corpus-final frame loops back to the corpus head frame.
+    motion.steps[:, 0] = total - 1
+    state = env.step(actions)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], True)
+    np.testing.assert_array_equal(motion.steps[:, 0], 0)
+    np.testing.assert_array_equal(state.terminated, False)
+
+
+def test_numba_wbt_multi_clip_sequential_reset_keeps_frame(tmp_path) -> None:
+    env = _make_numba_env(_multi_clip_cfg(tmp_path, sequential_clips=True), num_envs=3)
+    state = env.init_state()
+    motion = _motion_command(env)
+    frames = [_DANCE_SPLIT - 1, _DANCE_SPLIT, motion.clip.joint_pos.shape[0] - 1]
+
+    # Episode resets keep the lane on its current frame: the robot is
+    # rematerialized onto that reference frame and the sequence continues.
+    motion.steps[:, 0] = frames
+    env._refresh_sim_reads()
+    state.terminated[:] = True
+    env._reset_done_envs()
+
+    np.testing.assert_array_equal(motion.steps[:, 0], frames)
+    np.testing.assert_allclose(env.sim_data["robot_dof_pos"], motion.clip.joint_pos[motion.steps[:, 0]])
+
+
+def test_numba_wbt_multi_clip_sequential_hold_stops_at_corpus_end(tmp_path) -> None:
+    env = _make_numba_env(_multi_clip_cfg(tmp_path, sequential_clips=True, hold_at_clip_end=True, split=2), num_envs=2)
+    state = env.init_state()
+    motion = _motion_command(env)
+    total = motion.clip.joint_pos.shape[0]
+
+    # Intermediate boundaries still cross into the next clip's head frame.
+    motion.steps[:, 0] = 1
+    env.compute_transition(state)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], True)
+    np.testing.assert_array_equal(motion.steps[:, 0], 2)
+
+    # The corpus end holds on the final frame instead of looping back.
+    env._sim_reset_requested.fill(False)
+    motion.steps[:, 0] = total - 1
+    env.compute_transition(state)
+    np.testing.assert_array_equal(motion.clip_ended[:, 0], True)
+    np.testing.assert_array_equal(motion.steps[:, 0], total - 1)
+    np.testing.assert_array_equal(env._sim_reset_requested[:, 0], False)
+
+
+def test_numba_wbt_multi_clip_sampling_sequence_matches_single_clip(tmp_path) -> None:
+    """Same-seed start-frame draws over the split corpus match the original file."""
+
+    def build(cfg: WbtEnvCfg) -> list[np.ndarray]:
+        env = _make_numba_env(cfg, num_envs=4, seed=123)
+        motion = _motion_command(env)
+        state = env.init_state()
+        env.warmup()
+        sequence = [motion.steps[:, 0].copy()]
+        for _ in range(3):
+            state.terminated.fill(True)
+            env._refresh_sim_reads()
+            env._reset_done_envs()
+            sequence.append(motion.steps[:, 0].copy())
+        return sequence
+
+    single_cfg = _single_file_cfg(start_at_timestep_zero_prob=0.0)
+    multi_cfg = _multi_clip_cfg(tmp_path, start_at_timestep_zero_prob=0.0)
+
+    for multi_draws, single_draws in zip(
+        build(multi_cfg),
+        build(single_cfg),
+        strict=True,
+    ):
+        np.testing.assert_array_equal(multi_draws, single_draws)
+
+
+def test_numba_wbt_multi_clip_extension_channels_reach_kernel_inputs(tmp_path) -> None:
+    cfg = _multi_clip_cfg(tmp_path, extension_channels=("aux_reference",))
+    env = _make_numba_env(cfg, num_envs=2)
+    env.init_state()
+    motion = _motion_command(env)
+    channel = motion.clip.extensions["aux_reference"].data
+    total = motion.clip.joint_pos.shape[0]
+    assert channel.shape == (total, 3)
+    assert channel.dtype == np.float32
+
+    env._refresh_sim_reads()
+    arrays = (value for value in env._kernel_inputs if isinstance(value, np.ndarray))
+    assert any(np.shares_memory(value, channel) for value in arrays)
+
+
+def test_numba_wbt_multi_clip_adaptive_bins_span_whole_corpus(tmp_path) -> None:
+    # alpha=1.0 folds only this update's failure counts into the histogram.
+    cfg = _multi_clip_cfg(tmp_path, adaptive_sampling_enabled=True, alpha=1.0)
+    env = _make_numba_env(cfg, num_envs=3)
+    state = env.init_state()
+    motion = _motion_command(env)
+    total = motion.clip.joint_pos.shape[0]
+    env_fps = round(1.0 / cfg.ctrl_dt)
+    expected_num_bins = total // env_fps + 1
+    assert motion.adaptive_bin_failed_count.size == expected_num_bins
+
+    # Failures on frames of both clips fold into global bins without going out
+    # of range, and the rebuilt CDF stays normalized.
+    motion.steps[:, 0] = [_DANCE_SPLIT - 1, _DANCE_SPLIT, total - 1]
+    motion.adaptive_bin_failed_count.fill(0.0)
+    motion.adaptive_current_bin_failed_count.fill(0.0)
+    state.terminated[:] = [True, True, True]
+    motion.reset(
+        ResetContext(
+            env_ids=np.arange(env.num_envs, dtype=np.int64),
+            terminated=state.terminated,
+            metrics=state.metrics,
+        )
+    )
+    motion.on_transition()
+    assert np.sum(motion.adaptive_bin_failed_count) == pytest.approx(3.0)
+    assert np.all(motion.sampling_cdf[:-1] <= motion.sampling_cdf[1:] + 1e-6)
+    assert motion.sampling_cdf[-1] == pytest.approx(1.0)
+
+
+def test_wbt_motion_command_cfg_rejects_dual_motion_sources(tmp_path) -> None:
+    cfg = _multi_clip_cfg(tmp_path)
+    motion = cfg.commands.motion
+    assert isinstance(motion, WbtMotionCommandCfg)
+    cfg = replace(
+        cfg,
+        commands=replace(cfg.commands, motion=replace(motion, motion_file=str(_DANCE_MOTION))),
+    )
+    with pytest.raises(ValueError, match="motion_file or motion_files"):
+        _make_numba_env(cfg, num_envs=1)
+
+
+@pytest.mark.parametrize("missing_marker", [MISSING, "???"])
+def test_numba_wbt_multi_clip_cfg_survives_pickle_round_trip(tmp_path, missing_marker) -> None:
+    """Async collectors receive the env spec via pickle; whichever MISSING
+    marker the config pipeline leaves behind (the omegaconf sentinel on a
+    fresh config, or its '???' literal after validation) must not read as a
+    configured motion_file after the round-trip."""
+    cfg = _multi_clip_cfg(tmp_path)
+    motion = cfg.commands.motion
+    assert isinstance(motion, WbtMotionCommandCfg)
+    cfg = replace(cfg, commands=replace(cfg.commands, motion=replace(motion, motion_file=missing_marker)))
+    restored = pickle.loads(pickle.dumps(cfg))
+    assert isinstance(restored, WbtEnvCfg)
+    env = _make_numba_env(restored, num_envs=2)
+    motion_term = _motion_command(env)
+    assert motion_term.clip.frame_clip_end[_DANCE_SPLIT - 1] == _DANCE_SPLIT - 1
+    assert motion_term.clip.frame_clip_end[-1] == 999 - 1

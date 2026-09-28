@@ -96,6 +96,18 @@ python scripts/motion/download_lafan.py \
   --output-fps 50
 ```
 
+也可以下载额外的 clip, 用于多 clip 训练:
+
+```bash
+for m in dance1_subject1 dance1_subject2 dance2_subject1; do
+  python scripts/motion/download_lafan.py \
+    --motion "$m" \
+    --output motrix_envs/src/motrix_envs/locomotion/wbt/assets/motion/g1/dance/"$m".npz \
+    --output-fps 50 \
+    --end-sec 20
+done
+```
+
 也可以转换已经下载的 G1 CSV：
 
 ```bash

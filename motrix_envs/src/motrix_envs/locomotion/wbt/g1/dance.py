@@ -12,12 +12,19 @@ from .common import MOTION_DIR, G1WbtEnvCfg
 
 @registry.envcfg("g1-wbt-dance")
 def make_g129dof_wbt_dance_cfg() -> EnvCfg:
-    """Track the bundled G1 dance motion with the manager-based environment.
+    """Track the G1 dance motion corpus with the manager-based environment.
 
-    zh_CN: 让 Unitree G1 跟踪内置舞蹈参考动作。
+    The corpus directory holds one schema v1 npz per clip: a single clip
+    trains one motion, and additional clips (e.g. pulled from LAFAN1) train
+    the whole corpus.
+
+    zh_CN: 让 Unitree G1 在 dance 语料目录上做全身跟踪；目录内一个 clip
+    即单动作训练，放入多个 clip 即多动作训练。
     """
 
-    return G1WbtEnvCfg(motion_file=str(MOTION_DIR / "dance1_subject2.npz"))
+    cfg = G1WbtEnvCfg()
+    cfg.commands.motion.motion_files = (str(MOTION_DIR / "dance"),)
+    return cfg
 
 
 registry.env("g1-wbt-dance")(ManagerEnv)

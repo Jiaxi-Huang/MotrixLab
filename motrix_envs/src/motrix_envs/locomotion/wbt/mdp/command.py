@@ -25,7 +25,7 @@ from motrix_env_core.manager.math.quaternion import mul as quat_mul
 from motrix_env_core.manager.math.quaternion import rotate_vector
 from motrix_env_core.numba.manager.commands import ResetContext
 from motrix_env_core.numba.manager.dispatch import dispatch
-from motrix_envs.motion import MotrixMotion, WbtMotionClip
+from motrix_envs.motion import MotionLibrary, MotrixMotion, WbtMotionClip
 
 
 @njit(inline="always")
@@ -65,7 +65,9 @@ class WbtMotionCommand(CommandTerm):
     methods maintain adaptive-sampling statistics and the sampling distribution.
 
     Attributes:
-        clip: Shared numeric reference-motion clip in model and tracked-body order.
+        clip: Shared numeric reference-motion corpus in model and tracked-body
+            order — one clip or several concatenated onto a global frame axis
+            with per-frame ``frame_clip_end`` boundaries.
         reference_index: Index of the alignment body in the tracked-body order.
         command: Per-environment joint-position and joint-velocity command buffer
             (inherited ``CommandTerm.command``).
@@ -74,7 +76,14 @@ class WbtMotionCommand(CommandTerm):
         adaptive_bin_failed_count: Exponential moving failure count for each sampling bin.
         adaptive_current_bin_failed_count: Failure counts accumulated in the current update.
         start_at_timestep_zero_prob: Probability that a reset starts at frame zero.
-        hold_at_clip_end: Whether environments remain on the final frame instead of resetting.
+        hold_at_clip_end: Whether lanes remain on a final frame instead of
+            resetting — the lane's own clip end without ``sequential_clips``,
+            the corpus end with it.
+        sequential_clips: Whether lanes treat the corpus as one ordered sequence —
+            cross each clip boundary into the next clip's head frame, keep the
+            current frame on every reset instead of resampling, and at the
+            corpus end either loop back to the head or, with
+            ``hold_at_clip_end``, hold on the final frame.
         uniform_ratio: Uniform prior mass added to adaptive sampling probabilities.
         alpha: Update rate for adaptive failure-count statistics.
         kernel_size: Number of bins used to smooth adaptive probabilities.
@@ -97,6 +106,7 @@ class WbtMotionCommand(CommandTerm):
     sampling_cdf: SharedArray
     start_at_timestep_zero_prob: np.float32
     hold_at_clip_end: bool
+    sequential_clips: bool
     uniform_ratio: np.float32
     alpha: np.float32
     kernel_size: np.int64
@@ -206,6 +216,11 @@ class WbtMotionCommand(CommandTerm):
     @dispatch
     def reset_env(self, ctx: ManagerContext) -> None:
         """Sample the starting frame for one reset environment lane."""
+        if self.sequential_clips:
+            # Sequential playback keeps the timeline unbroken: every reset
+            # (episode terminations included) rematerializes the lane onto
+            # its current frame instead of resampling a new start.
+            return
         num_frames = self.clip.joint_pos.shape[0]
         self.steps[0] = _sample_motion_step(
             ctx.rand,
@@ -221,29 +236,58 @@ class WbtMotionCommand(CommandTerm):
     def advance(self, ctx: ManagerContext) -> None:
         """Advance one frame for the current environment lane.
 
+        The lane leaves its clip when the step index exceeds the per-frame
+        ``frame_clip_end`` boundary of the clip it just tracked (the clip's
+        final frame is tracked one step before the index goes out of range).
+        Without ``sequential_clips``, ``hold_at_clip_end`` clamps the lane
+        onto its own clip's final frame and the wrap branch otherwise
+        resamples from the whole corpus. With ``sequential_clips``, the lane
+        crosses intermediate boundaries into the next clip's head frame and
+        the corpus end either loops back to the head or, with
+        ``hold_at_clip_end``, holds on the corpus final frame.
+
         The lowering already binds this lane's writable row view to
         ``self.steps`` / ``self.clip_ended``; only the wrap branch needs ``ctx``
         to draw the replacement frame.
         """
         num_frames = self.clip.joint_pos.shape[0]
-        self.steps[0] += 1
-        self.clip_ended[0] = self.steps[0] >= num_frames
-        if self.hold_at_clip_end:
-            self.steps[0] = min(self.steps[0], num_frames - 1)
+        clip_end = self.clip.frame_clip_end[self.steps[0]]
+        step = self.steps[0] + 1
+        self.steps[0] = step
+        self.clip_ended[0] = step > clip_end
+        if self.hold_at_clip_end and not self.sequential_clips:
+            # Freeze on the lane's own clip final frame.
+            self.steps[0] = min(step, clip_end)
         elif self.clip_ended[0]:
-            # Request sim-only rematerialization: the reset pipeline resamples
-            # this lane's frame via reset_env from the freshly rebuilt CDF and
-            # the configured sim reset terms teleport the robot there. Episode
-            # bookkeeping and action-term state are untouched. The inline
-            # resample keeps steps valid and consistently distributed between
-            # this kernel and the reset pipeline.
-            self.steps[0] = _sample_motion_step(
-                ctx.rand,
-                self.sampling_cdf,
-                np.int64(num_frames),
-                self.start_at_timestep_zero_prob,
-            )
-            ctx.sim_reset_requested[0] = True
+            # The lane passed its clip's final frame. Crossing requests
+            # sim-only rematerialization: the reset pipeline reruns this
+            # lane's reset_env hook and the configured sim reset terms
+            # teleport the robot to the resulting frame. Episode bookkeeping
+            # and action-term state are untouched.
+            if self.sequential_clips:
+                # Clips are concatenated, so the frame past a clip boundary
+                # is the next clip's head. Intermediate boundaries cross in
+                # order; the corpus end loops back to the head, or holds on
+                # the final frame when hold_at_clip_end is set. reset_env
+                # keeps the chosen frame.
+                if step < num_frames:
+                    self.steps[0] = step
+                    ctx.sim_reset_requested[0] = True
+                elif self.hold_at_clip_end:
+                    self.steps[0] = num_frames - 1
+                else:
+                    self.steps[0] = 0
+                    ctx.sim_reset_requested[0] = True
+            else:
+                # The inline resample keeps steps valid and consistently
+                # distributed between this kernel and the reset pipeline.
+                self.steps[0] = _sample_motion_step(
+                    ctx.rand,
+                    self.sampling_cdf,
+                    np.int64(num_frames),
+                    self.start_at_timestep_zero_prob,
+                )
+                ctx.sim_reset_requested[0] = True
 
     def _sampling_probabilities(self) -> np.ndarray:
         """Build normalized frame-bin probabilities from failure history."""
@@ -267,12 +311,15 @@ class WbtMotionCommand(CommandTerm):
 @configclass(kw_only=True)
 class WbtMotionCommandCfg(CommandCfg):
     motion_file: str = MISSING
+    motion_files: tuple[str, ...] = ()
+    extension_channels: tuple[str, ...] = ()
     joint_names: tuple[str, ...] = MISSING
     tracked_body_names: tuple[str, ...] = MISSING
     reference_body_name: str = MISSING
     adaptive_sampling_enabled: bool = True
     start_at_timestep_zero_prob: float = 0.0
     hold_at_clip_end: bool = False
+    sequential_clips: bool = False
     uniform_ratio: float = 0.1
     alpha: float = 0.001
     kernel_size: int = 1
@@ -295,15 +342,33 @@ class WbtMotionCommandCfg(CommandCfg):
             raise ValueError(
                 f"tracked_body_names must include the reference body {self.reference_body_name!r}"
             ) from None
-        source = WbtMotionClip.create(
-            MotrixMotion(self.motion_file),
-            list(self.joint_names),
-            self.tracked_body_names,
-            self.reference_body_name,
-            robot.base_link_name,
-        )
+        env_fps = max(int(round(1.0 / env.cfg.ctrl_dt)), 1)
+        if self.motion_files:
+            # An unset motion_file reaches this point as either the omegaconf
+            # MISSING sentinel (fresh factory config) or its '???' literal
+            # (config validated / pickled into async collectors); only a real
+            # path string means both sources are configured.
+            if isinstance(self.motion_file, str) and self.motion_file != "???":
+                raise ValueError("Configure either motion_file or motion_files, not both.")
+            source = MotionLibrary(
+                self.motion_files,
+                joint_names=list(self.joint_names),
+                tracked_body_names=self.tracked_body_names,
+                reference_body_name=self.reference_body_name,
+                root_body_name=robot.base_link_name,
+                fps=env_fps,
+                extension_channels=self.extension_channels,
+            ).assemble()
+        else:
+            source = WbtMotionClip.create(
+                MotrixMotion(self.motion_file),
+                list(self.joint_names),
+                self.tracked_body_names,
+                self.reference_body_name,
+                robot.base_link_name,
+                self.extension_channels,
+            )
         if self.adaptive_sampling_enabled:
-            env_fps = max(int(round(1.0 / env.cfg.ctrl_dt)), 1)
             num_bins = source.joint_pos.shape[0] // env_fps + 1
         else:
             num_bins = 0
@@ -321,6 +386,7 @@ class WbtMotionCommandCfg(CommandCfg):
             sampling_cdf=np.ones((num_bins,), dtype=np.float32) if num_bins else np.empty((0,), dtype=np.float32),
             start_at_timestep_zero_prob=np.float32(self.start_at_timestep_zero_prob),
             hold_at_clip_end=self.hold_at_clip_end,
+            sequential_clips=self.sequential_clips,
             uniform_ratio=np.float32(self.uniform_ratio),
             alpha=np.float32(self.alpha),
             kernel_size=np.int64(self.kernel_size),

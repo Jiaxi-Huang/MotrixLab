@@ -98,6 +98,18 @@ python scripts/motion/download_lafan.py \
   --output-fps 50
 ```
 
+Download extra clips for multi-clip training:
+
+```bash
+for m in dance1_subject1 dance1_subject2 dance2_subject1; do
+  python scripts/motion/download_lafan.py \
+    --motion "$m" \
+    --output motrix_envs/src/motrix_envs/locomotion/wbt/assets/motion/g1/dance/"$m".npz \
+    --output-fps 50 \
+    --end-sec 20
+done
+```
+
 You can also convert an existing G1 CSV:
 
 ```bash

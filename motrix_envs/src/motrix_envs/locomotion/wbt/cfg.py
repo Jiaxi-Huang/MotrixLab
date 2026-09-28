@@ -243,6 +243,7 @@ class WbtEnvCfg(ManagerBasedEnvCfg):
         cfg.max_episode_seconds = None
         cfg.commands.motion.adaptive_sampling_enabled = False
         cfg.commands.motion.start_at_timestep_zero_prob = 1.0
+        cfg.commands.motion.sequential_clips = True
         cfg.commands.motion.hold_at_clip_end = False
         cfg.sim_reset.body_pos.noise_scale = 0.0
         cfg.sim_reset.body_rot.noise_scale = 0.0

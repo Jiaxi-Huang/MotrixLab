@@ -1,5 +1,6 @@
 # @package _global_
-# Task g1-wbt-dance: manager-based G1 dance tracking with Motrix FastSAC.
+# Task g1-wbt-dance: manager-based G1 dance tracking with Motrix FastSAC over the
+# motion corpus directory (one clip trains one motion; more clips train the corpus).
 defaults:
   - /algo_base@algo: motrix.fastsac
   - _self_
