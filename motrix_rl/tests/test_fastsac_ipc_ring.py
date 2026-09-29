@@ -110,6 +110,27 @@ def test_ipc_ring_cursor_publishes_only_after_event():
 
 
 @cuda_only
+def test_final_push_stays_unpublished_without_producer_poll():
+    """Regression guard for the mixed-rank learner hang: after the last push,
+    only a producer-endpoint poll flushes its completed event — consumer-side
+    calls cannot publish it. The real collector polls every env step, so a
+    test-standalone producer must poll too (the learner drain loops rely on
+    it, see ``test_learner_drains_mixed_host_and_ipc_rings``).
+    """
+    owner, receiver = _owner_receiver()
+    for t in range(CAPACITY):
+        assert owner.push(*_batch(t, seed=17))
+    torch.cuda.synchronize()  # the final push event has completed by now...
+    published = receiver.cursors.write_idx
+    assert published < CAPACITY  # ...but no poll happened, so it is unshown
+    receiver.has_next()  # a consumer-side poll must not publish either
+    assert receiver.cursors.write_idx == published
+    owner.size()  # the poll the collector performs every step
+    assert receiver.cursors.write_idx == CAPACITY
+    assert receiver.has_next()
+
+
+@cuda_only
 def test_ipc_ring_backpressure_bounds_in_flight():
     owner, receiver = _owner_receiver()
     for t in range(CAPACITY):
@@ -373,6 +394,8 @@ def test_learner_drains_mixed_host_and_ipc_rings():
         learner.drain()
 
     torch.cuda.synchronize()
+    owner.size()  # producer-side flush, as the collector's polling would do;
+    # without it the final IPC generation stays unpublished and drain spins
     while host_ring.has_next() or receiver.has_next():
         learner.drain()
     learner.wait_ingest()
