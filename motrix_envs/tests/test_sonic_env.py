@@ -61,6 +61,7 @@ def test_sonic_environment_compiles_and_steps(tmp_path) -> None:
         history_frames * mdp._sonic_actor_frame_dim(joints)
         + future_frames * mdp._g1_reference_frame_dim(joints)
         + future_frames * mdp._smpl_reference_frame_dim(smpl_joints)
+        + mdp._hybrid_reference_width(future_frames)
         + mdp.SONIC_ENCODER_COUNT
     )
     value_width = (
@@ -90,20 +91,29 @@ def test_sonic_action_contract_matches_wbt_affine_control(tmp_path) -> None:
 
     term = env.action_terms["joint_position"]
     space = env.action_space
+    # Shared WBT action term: scales derive from the model gains in the
+    # declared SONIC joint order as base_scale * effort_limit / kp.
+    kps = dict(
+        zip(
+            (spec.name for spec in env.model.actuators),
+            np.asarray(env.model.others["actuator_kp"], dtype=np.float32),
+        )
+    )
+    efforts = {
+        spec.name: float(np.max(np.abs(np.asarray(spec.force_range, dtype=np.float32)))) for spec in env.model.actuators
+    }
+    base_scale = cfg.actions.joint_position.control.action_scale
     expected_scales = np.asarray(
-        [
-            mdp.G1_SONIC_ACTION_SCALE
-            * mdp._SONIC_ACTUATOR_PARAMETERS[name][2]
-            / mdp._SONIC_ACTUATOR_PARAMETERS[name][0]
-            for name in mdp.G1_SONIC_JOINTS
-        ],
+        [base_scale * efforts[name] / kps[name] for name in mdp.G1_SONIC_JOINTS],
         dtype=np.float32,
     )
-    np.testing.assert_allclose(term.action_scales, expected_scales)
+    np.testing.assert_allclose(term.action_scales, expected_scales, rtol=1e-6)
     np.testing.assert_allclose(space.low, -space.high)
+    ctrl_ranges = {spec.name: np.asarray(spec.ctrl_range, dtype=np.float32) for spec in env.model.actuators}
+    ranges = np.stack([ctrl_ranges[name] for name in mdp.G1_SONIC_JOINTS])
     residual = np.maximum(
-        np.abs(term.joint_lower - term.default_angles),
-        np.abs(term.joint_upper - term.default_angles),
+        np.abs(ranges[:, 0] - term.default_angles),
+        np.abs(ranges[:, 1] - term.default_angles),
     )
     np.testing.assert_allclose(space.high * term.action_scales, residual, rtol=1e-6)
 
@@ -111,6 +121,21 @@ def test_sonic_action_contract_matches_wbt_affine_control(tmp_path) -> None:
     targets = term.process(actions)
     expected = actions * term.action_scales + term.default_angles
     np.testing.assert_allclose(targets, expected, atol=2e-7)
+
+
+def test_sonic_declared_joint_order_matches_model_actuator_order(tmp_path) -> None:
+    corpus = tmp_path / "corpus"
+    _write_corpus_npz(corpus)
+    cfg = registry.make_env_config("g1-sonic")
+    cfg.commands.motion.motion_files = (str(corpus),)
+
+    env = registry.resolve("g1-sonic", env_cfg=cfg).make(num_envs=2, seed=1)
+    env.init_state()
+
+    # The declared policy order IS the model actuator order: corpus arrays,
+    # dof queries and the action term all follow this single declaration, so
+    # no permutation is needed anywhere in the pipeline.
+    assert tuple(spec.name for spec in env.model.actuators) == mdp.G1_SONIC_JOINTS
 
 
 def test_sonic_reset_seeds_foot_velocity_from_teleport_frame(tmp_path) -> None:
@@ -129,7 +154,7 @@ def test_sonic_reset_seeds_foot_velocity_from_teleport_frame(tmp_path) -> None:
     env.init_state()
 
     motion = env.command_terms["motion"]
-    foot_indices = np.asarray((13, 14, 17, 18), dtype=np.int64)
+    foot_indices = np.asarray([mdp.G1_SONIC_JOINTS.index(n) for n in mdp.SONIC_FOOT_JOINTS], dtype=np.int64)
     seeded = motion.clip.joint_vel[np.ix_(motion.steps[:, 0], foot_indices)]
     np.testing.assert_allclose(motion.previous_foot_joint_velocity, seeded, atol=1e-6)
     np.testing.assert_array_equal(motion.foot_joint_acceleration, 0.0)
@@ -164,7 +189,7 @@ def test_sonic_sim_reset_switches_segment_within_episode(tmp_path) -> None:
     assert not state.done.any()
     assert (state.episode_steps == 1).all()
     assert (motion.steps[:, 0] < last_frame).all()
-    foot_indices = np.asarray((13, 14, 17, 18), dtype=np.int64)
+    foot_indices = np.asarray([mdp.G1_SONIC_JOINTS.index(n) for n in mdp.SONIC_FOOT_JOINTS], dtype=np.int64)
     seeded = motion.clip.joint_vel[np.ix_(motion.steps[:, 0], foot_indices)]
     np.testing.assert_allclose(motion.previous_foot_joint_velocity, seeded, atol=1e-6)
 

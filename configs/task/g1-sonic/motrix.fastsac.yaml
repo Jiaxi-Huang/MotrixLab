@@ -29,11 +29,15 @@ algo:
       action_dim: 29
       g1_encoder_hidden_dims: [512, 256] #[2048, 1024, 512, 512]
       smpl_encoder_hidden_dims: [512, 256] #[2048, 1024, 512, 512]
+      teleop_encoder_hidden_dims: [512, 256] #[2048, 1024, 512, 512]
       g1_motion_decoder_hidden_dims: [512, 256] #[2048, 1024, 512, 512]
+    # Upstream aux_loss_coef names and release coefficients.
     auxiliary:
-      reconstruction: 0.01
-      latent_alignment: 1.0
-      cycle_consistency: 1.0
+      g1_recon: 0.01
+      g1_smpl_latent: 1.0
+      g1_teleop_latent: 1.0
+      teleop_smpl_latent: 1.0
+      reencoded_smpl_g1_latent: 1.0
   agent:
     # Keep the generic FastSAC contract aligned with g1-wbt-dance. SONIC only
     # owns its policy variant and the resource-constrained batch size below.

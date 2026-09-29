@@ -1,19 +1,25 @@
 # SONIC G1 动作跟踪
 
 SONIC 是面向 Unitree G1 的 Manager 环境，并通过 FastSAC 的 `sonic` PolicyVariant 构建专用
-actor。策略将 10 帧本体感知历史、G1 未来参考和 SMPL 未来参考组合起来，通过两个值的
-encoder mask 选择参考编码器。该时序深度是 `g1-sonic` 的公共契约；训练、LAFAN 数据和
-小规模验证都使用同一个环境。
+actor。策略将滑窗本体感知历史、G1 未来参考、SMPL 未来参考和 hybrid（teleop）参考流组合
+起来，经由上游列序 `[g1, teleop, smpl]` 的三值 multi-hot encoder mask 路由：smpl 原生行
+同时激活 g1 encoder，并以 0.5 概率激活 teleop encoder，与上游 legacy 采样器一致。hybrid
+流对齐上游 teleop encoder 输入：多未来帧腿部块（G1 步长网格上的 12 个腿部关节位置与
+速度）加上当前帧尾部（VR 风格 3 点目标——双腕 + 躯干偏移点，位置与四元数均取
+reference-anchor 系——以及 anchor 姿态）。该时序深度是 `g1-sonic` 的公共契约；训练、
+LAFAN 数据和小规模验证都使用同一个环境。
 
 任务配置把 `algo.variant` 直接内联在 `configs/task/g1-sonic/motrix.fastsac.yaml` 中。
 其中 `model.num_future_frames` 同时决定环境 policy observation 宽度与 actor 输入宽度；
-`auxiliary` 是三个命名辅助损失的权重，由 FastSAC 统一加权求和并记录 `aux_*` 指标。
-`g1_control_decoder_hidden_dims` 不出现在训练配置中：训练 actor 不构造该 decoder，
-并用 FastSAC policy head 替代它。
+`auxiliary` 是五个上游命名辅助损失（`g1_recon`、`g1_smpl_latent`、`g1_teleop_latent`、
+`teleop_smpl_latent`、`reencoded_smpl_g1_latent`）的权重，由 FastSAC 加权求和并记录
+`aux_*` 指标。`g1_control_decoder_hidden_dims` 不出现在训练配置中：训练 actor 不构造该
+decoder，并用 FastSAC policy head 替代它。
 
 ## 观察与动作
 
-`g1-sonic` 的 policy observation 宽度为 2412，privileged value observation 宽度为 1645。
+`g1-sonic` 的 policy observation 宽度为 1355（`num_future_frames=5` 时；G1/SMPL 块随该值
+线性缩放，teleop 块另加 27 维常量当前帧尾部），privileged value observation 宽度为 890。
 动作是 29 维归一化关节位置目标，动作缩放和偏置在环境 action term 内完成；FastSAC actor
 保持 identity action affine。
 
@@ -28,8 +34,6 @@ source .venv/bin/activate
 SONIC_MOTION_DIR=$PWD/data/bones_seed_npz \
   python scripts/train.py task=g1-sonic/motrix.fastsac
 ```
-
-`SONIC_MOTION_DIR` 支持以 `:` 分隔多个语料根目录。
 
 ## 构建语料
 

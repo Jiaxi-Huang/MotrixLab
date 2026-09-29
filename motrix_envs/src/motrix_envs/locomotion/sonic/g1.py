@@ -20,6 +20,7 @@ from motrix_envs.locomotion.sonic.cfg import (
     SonicPolicyObsCfg,
     SonicValueObsCfg,
 )
+from motrix_envs.locomotion.wbt.mdp.action import WbtJointPositionActionCfg
 from motrix_envs.robot import UnitreeG129Dof
 from motrix_envs.robot.unitree import UNITREE_G1_ASSET_DIR
 
@@ -52,7 +53,7 @@ def _make_g1_sonic_cfg() -> SonicManagerEnvCfg:
             )
         ),
         actions=SonicActionsCfg(
-            joint_position=mdp.SonicJointPositionActionCfg(
+            joint_position=WbtJointPositionActionCfg(
                 actuator_names=mdp.G1_SONIC_JOINTS,
             )
         ),

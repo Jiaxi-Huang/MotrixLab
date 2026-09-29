@@ -6,8 +6,9 @@
 The module deliberately keeps the environment-facing contract small: a SONIC
 actor consumes the packed policy observation emitted by the manager and
 returns the same ``(actions, log_probs)`` pair as the generic FastSAC actor.
-The G1/SMPL tokenizer mirrors the upstream SONIC graph while the training policy
-head is the standard FastSAC actor sized by ``algo.agent.actor_hidden_dim``.
+The G1/SMPL/teleop tokenizer mirrors the upstream SONIC graph while the
+training policy head is the standard FastSAC actor sized by
+``algo.agent.actor_hidden_dim``.
 """
 
 from __future__ import annotations
@@ -27,9 +28,18 @@ from motrix_rl.fastsac.networks import Actor
 SONIC_VECTOR_DIM = 3
 SONIC_ROTATION_REPRESENTATION_DIM = 2 * SONIC_VECTOR_DIM
 SONIC_ACTOR_JOINT_FEATURES = 3
-SONIC_ENCODER_COUNT = 2
+# Width of the per-env encoder mask (multi-hot, upstream column order).
+SONIC_ENCODER_COUNT = 3
 SONIC_SMPL_JOINT_COUNT = 24
 SONIC_SMPL_END_EFFECTOR_COUNT = 2
+SONIC_HYBRID_VR_POINTS = 3
+# Hybrid ("teleop") stream width, mirroring the upstream release layout: a
+# multi-future lower-body block (12 leg joint positions + velocities per frame
+# on the G1 stride grid) followed by a current-frame tail of 3 vr point
+# positions (9), 3 vr point quaternions xyzw (12), and the anchor 6D.
+SONIC_HYBRID_LOWER_BODY_JOINTS = 12
+SONIC_HYBRID_LOWER_BODY_PER_FRAME = 2 * SONIC_HYBRID_LOWER_BODY_JOINTS
+SONIC_HYBRID_TAIL_DIM = SONIC_HYBRID_VR_POINTS * (SONIC_VECTOR_DIM + 4) + SONIC_ROTATION_REPRESENTATION_DIM
 
 
 @dataclass(frozen=True)
@@ -42,6 +52,7 @@ class SonicModelConfig:
     action_dim: int = 29
     g1_encoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 512)
     smpl_encoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 512)
+    teleop_encoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 512)
     g1_motion_decoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 512)
 
     @property
@@ -77,8 +88,14 @@ class SonicModelConfig:
         return self.num_future_frames * self.smpl_frame_dim
 
     @property
+    def teleop_input_dim(self) -> int:
+        return self.num_future_frames * SONIC_HYBRID_LOWER_BODY_PER_FRAME + SONIC_HYBRID_TAIL_DIM
+
+    @property
     def packed_obs_dim(self) -> int:
-        return self.actor_obs_dim + self.g1_input_dim + self.smpl_input_dim + SONIC_ENCODER_COUNT
+        return (
+            self.actor_obs_dim + self.g1_input_dim + self.smpl_input_dim + self.teleop_input_dim + SONIC_ENCODER_COUNT
+        )
 
     @property
     def token_total_dim(self) -> int:
@@ -96,12 +113,14 @@ class SonicModelConfig:
             "action_dim",
             "g1_encoder_hidden_dims",
             "smpl_encoder_hidden_dims",
+            "teleop_encoder_hidden_dims",
             "g1_motion_decoder_hidden_dims",
         }
         data = {key: values[key] for key in allowed if key in values}
         for key in (
             "g1_encoder_hidden_dims",
             "smpl_encoder_hidden_dims",
+            "teleop_encoder_hidden_dims",
             "g1_motion_decoder_hidden_dims",
         ):
             if key in data:
@@ -142,7 +161,7 @@ class SonicBackboneOutput:
 
 
 class SonicBackbone(nn.Module):
-    """G1/SMPL encoders, FSQ, and motion decoder used by the FastSAC actor."""
+    """G1/SMPL/teleop encoders, FSQ token, and motion decoder of the SONIC graph."""
 
     def __init__(self, config: SonicModelConfig, device=None):
         super().__init__()
@@ -156,6 +175,9 @@ class SonicBackbone(nn.Module):
                 ),
                 "smpl": SonicMLP(
                     config.smpl_input_dim, config.smpl_encoder_hidden_dims, config.token_total_dim, device=device
+                ),
+                "teleop": SonicMLP(
+                    config.teleop_input_dim, config.teleop_encoder_hidden_dims, config.token_total_dim, device=device
                 ),
             }
         )
@@ -178,6 +200,7 @@ class SonicBackbone(nn.Module):
         actor_obs: torch.Tensor,
         g1_reference: torch.Tensor,
         smpl_reference: torch.Tensor,
+        teleop_reference: torch.Tensor,
         encoder_index: torch.Tensor,
         *,
         compute_auxiliary: bool = False,
@@ -189,36 +212,60 @@ class SonicBackbone(nn.Module):
             raise ValueError("invalid SONIC G1 reference shape")
         if tuple(smpl_reference.shape[1:]) != (cfg.num_future_frames, cfg.smpl_frame_dim):
             raise ValueError("invalid SONIC SMPL reference shape")
+        if teleop_reference.ndim != 2 or teleop_reference.shape[-1] != cfg.teleop_input_dim:
+            raise ValueError("invalid SONIC teleop reference shape")
         if encoder_index.shape != (actor_obs.shape[0], SONIC_ENCODER_COUNT):
             raise ValueError(f"SONIC encoder_index must have shape (B, {SONIC_ENCODER_COUNT})")
+        # Column order mirrors upstream encoder_sample_probs: [g1, teleop, smpl].
+        # The mask is multi-hot: smpl-native rows also activate g1 and, with
+        # probability 0.5, teleop.
         g1_mask = encoder_index[:, 0].bool()
-        smpl_mask = encoder_index[:, 1].bool()
-        g1_required = torch.ones_like(g1_mask) if compute_auxiliary else g1_mask
-        g1_input = torch.where(g1_required[:, None, None], g1_reference, torch.zeros_like(g1_reference))
+        teleop_mask = encoder_index[:, 1].bool()
+        smpl_mask = encoder_index[:, 2].bool()
+        g1_input = torch.where(g1_mask[:, None, None], g1_reference, torch.zeros_like(g1_reference))
         smpl_input = torch.where(smpl_mask[:, None, None], smpl_reference, torch.zeros_like(smpl_reference))
+        teleop_input = torch.where(teleop_mask[:, None], teleop_reference, torch.zeros_like(teleop_reference))
         g1_encoded = self._encode("g1", g1_input)
         smpl_encoded = self._encode("smpl", smpl_input)
+        teleop_encoded = self._encode("teleop", teleop_input)
         g1_latent = g1_encoded * g1_mask[:, None, None]
         smpl_latent = smpl_encoded * smpl_mask[:, None, None]
+        teleop_latent = teleop_encoded * teleop_mask[:, None, None]
         g1_tokens = self.quantizer(g1_latent)[0].contiguous()
         smpl_tokens = self.quantizer(smpl_latent)[0].contiguous()
-        selected = torch.where(smpl_mask[:, None, None], smpl_tokens, g1_tokens)
+        teleop_tokens = self.quantizer(teleop_latent)[0].contiguous()
+        # The multi-hot mask routes one token stream to the policy head with
+        # upstream scatter-override priority: smpl over teleop over g1.
+        selected = torch.where(
+            smpl_mask[:, None, None],
+            smpl_tokens,
+            torch.where(teleop_mask[:, None, None], teleop_tokens, g1_tokens),
+        )
         losses: dict[str, torch.Tensor] = {}
         if compute_auxiliary:
             reconstruction = self.g1_kin_decoder(selected.flatten(start_dim=1)).reshape(
                 -1, cfg.num_future_frames, cfg.g1_frame_dim
             )
-            recon_loss = F.mse_loss(reconstruction, g1_reference)
+            g1_recon = F.mse_loss(reconstruction, g1_reference)
             smpl_weight = smpl_mask.to(g1_encoded.dtype)
             smpl_count = smpl_weight.sum().clamp_min(1.0)
-            align_per_sample = (smpl_encoded - g1_encoded).square().mean(dim=(1, 2))
-            cycle_per_sample = (self._encode("g1", reconstruction) - g1_encoded).square().mean(dim=(1, 2))
-            align = (align_per_sample * smpl_weight).sum() / smpl_count
-            cycle = (cycle_per_sample * smpl_weight).sum() / smpl_count
+            g1_smpl_per_sample = (smpl_encoded - g1_encoded).square().mean(dim=(1, 2))
+            reencoded_per_sample = (self._encode("g1", reconstruction) - g1_encoded).square().mean(dim=(1, 2))
+            g1_smpl_latent = (g1_smpl_per_sample * smpl_weight).sum() / smpl_count
+            reencoded_smpl_g1_latent = (reencoded_per_sample * smpl_weight).sum() / smpl_count
+            # The g1-teleop and teleop-smpl alignments only see tri-hot rows,
+            # where smpl co-activates both g1 and teleop; they are 0 when the
+            # sampler produced none, matching the upstream empty-mask losses.
+            hybrid_weight = (teleop_mask & smpl_mask).to(g1_encoded.dtype)
+            hybrid_count = hybrid_weight.sum().clamp_min(1.0)
+            g1_teleop_per_sample = (g1_encoded - teleop_encoded).square().mean(dim=(1, 2))
+            teleop_smpl_per_sample = (teleop_encoded - smpl_encoded).square().mean(dim=(1, 2))
             losses = {
-                "reconstruction": recon_loss,
-                "latent_alignment": align,
-                "cycle_consistency": cycle,
+                "g1_recon": g1_recon,
+                "g1_smpl_latent": g1_smpl_latent,
+                "reencoded_smpl_g1_latent": reencoded_smpl_g1_latent,
+                "g1_teleop_latent": (g1_teleop_per_sample * hybrid_weight).sum() / hybrid_count,
+                "teleop_smpl_latent": (teleop_smpl_per_sample * hybrid_weight).sum() / hybrid_count,
             }
         return SonicBackboneOutput(selected, losses)
 
@@ -265,25 +312,34 @@ class SonicActor(nn.Module):
     def action_bias(self) -> torch.Tensor:
         return self.policy_head.action_bias
 
-    def _split(self, obs):
+    def _split(
+        self, obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Slice the packed observation ``[actor history | g1 | smpl | teleop | mask]``.
+
+        The G1 and SMPL command terms are emitted feature-major ([all joint
+        positions, all joint velocities, all rotations]); the re-chunks below
+        rebuild the per-frame (F, frame_dim) layout the upstream tokenizer
+        consumes. That layout itself interleaves frames — upstream builds
+        command_multi_future as [all P, all V] and reshapes to (F, 2J), a
+        flattening bug it documents in trl/losses/token_losses.py ("temporal
+        axis is incorrectly flattened") and that its decoders depend on. The
+        permutation here reproduces the upstream flat order exactly (G1
+        frames stride 5 = 0.1 s, SMPL stride 1 = 0.02 s), so do NOT "fix"
+        these reshapes without porting upstream with it. The SMPL term is
+        per-frame by construction; only its wrist tail needs the same
+        re-chunking. The teleop stream is flat by construction (lower-body
+        block plus current-frame tail) and passes through unchanged.
+        """
         cfg = self.config
-        a = obs[:, : cfg.actor_obs_dim]
         g1_start = cfg.actor_obs_dim
-        g1_end = g1_start + cfg.g1_input_dim
-        smpl_end = g1_end + cfg.smpl_input_dim
-        g1_flat = obs[:, g1_start:g1_end]
-        smpl_flat = obs[:, g1_end:smpl_end]
-        # The G1 command term is emitted feature-major ([all joint positions, all
-        # joint velocities, all rotations]); this reshape re-chunks it into the
-        # per-frame (F, 64) layout the upstream tokenizer consumes. That layout
-        # itself interleaves frames — upstream builds command_multi_future as
-        # [all P, all V] and reshapes to (F, 2J), a flattening bug it documents
-        # in trl/losses/token_losses.py ("temporal axis is incorrectly
-        # flattened") and that its decoders depend on. The permutation here
-        # reproduces the upstream flat order exactly (G1 frames stride 5 = 0.1
-        # s, SMPL stride 1 = 0.02 s), so do NOT "fix" this reshape without
-        # porting upstream with it. The SMPL term is per-frame by construction;
-        # only its wrist tail needs the same re-chunking.
+        smpl_start = g1_start + cfg.g1_input_dim
+        teleop_start = smpl_start + cfg.smpl_input_dim
+        actor_obs = obs[:, :g1_start]
+        g1_flat = obs[:, g1_start:smpl_start]
+        smpl_flat = obs[:, smpl_start:teleop_start]
+        teleop = obs[:, teleop_start:teleop_start + cfg.teleop_input_dim]
+        encoder_index = obs[:, teleop_start + cfg.teleop_input_dim :]
         g1_command_frame_dim = cfg.g1_frame_dim - SONIC_ROTATION_REPRESENTATION_DIM
         g1_command_width = cfg.num_future_frames * g1_command_frame_dim
         g1 = torch.cat(
@@ -302,8 +358,7 @@ class SonicActor(nn.Module):
             ),
             dim=-1,
         )
-        index = obs[:, smpl_end : smpl_end + SONIC_ENCODER_COUNT]
-        return a, g1, smpl, index
+        return actor_obs, g1, smpl, teleop, encoder_index
 
     def forward(self, obs):
         control_input, _ = self._policy_input(obs, compute_auxiliary=self.training)
@@ -325,8 +380,8 @@ class SonicActor(nn.Module):
         return self.policy_head.explore(control_input, deterministic=deterministic)
 
     def _policy_input(self, obs, *, compute_auxiliary: bool) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        actor_obs, g1, smpl, index = self._split(obs)
-        output = self.backbone(actor_obs, g1, smpl, index, compute_auxiliary=compute_auxiliary)
+        actor_obs, g1, smpl, teleop, index = self._split(obs)
+        output = self.backbone(actor_obs, g1, smpl, teleop, index, compute_auxiliary=compute_auxiliary)
         control_input = torch.cat((actor_obs, output.selected_tokens.flatten(start_dim=1)), dim=-1)
         return control_input, output.auxiliary_losses
 

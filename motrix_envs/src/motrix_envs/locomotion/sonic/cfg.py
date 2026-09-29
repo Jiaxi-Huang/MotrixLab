@@ -26,14 +26,15 @@ from motrix_env_core.sim import (
     ActuatorKpQuery,
     BatchLinkAngularVelocityQuery,
     BatchLinkLinearVelocityQuery,
-    BatchLinkNetContactForceQuery,
     BatchLinkPositionQuery,
     BatchLinkQuaternionQuery,
     BodyJointPositionLimitsQuery,
+    BodyLinkNetContactForceQuery,
     JointPositionQuery,
     JointVelocityQuery,
 )
 from motrix_envs.locomotion.sonic import mdp
+from motrix_envs.locomotion.wbt.mdp.action import WbtJointPositionActionCfg
 from motrix_envs.locomotion.wbt.mdp.reset import (
     BodyDofPosResetCfg,
     BodyLinVelResetCfg,
@@ -45,7 +46,10 @@ from motrix_envs.locomotion.wbt.mdp.reset import (
 
 @configclass
 class SonicActionsCfg(ManagerActionsCfg):
-    joint_position: mdp.SonicJointPositionActionCfg = mdp.SonicJointPositionActionCfg()
+    # Shared WBT position action term; the env wires the SONIC policy joint
+    # order (``mdp.G1_SONIC_JOINTS``) into ``actuator_names`` at post-init,
+    # and scales derive from the model gains like every WBT task.
+    joint_position: WbtJointPositionActionCfg = WbtJointPositionActionCfg()
 
 
 @configclass
@@ -58,6 +62,7 @@ class SonicPolicyObsCfg(ManagerObservationGroupCfg):
     obs: mdp.SonicActorObservationCfg = mdp.SonicActorObservationCfg()
     g1_reference: mdp.SonicG1ReferenceObservationCfg = mdp.SonicG1ReferenceObservationCfg()
     smpl_reference: mdp.SonicSmplReferenceObservationCfg = mdp.SonicSmplReferenceObservationCfg()
+    hybrid_reference: mdp.SonicHybridReferenceObservationCfg = mdp.SonicHybridReferenceObservationCfg()
     encoder_index: mdp.SonicEncoderIndexObservationCfg = mdp.SonicEncoderIndexObservationCfg()
 
 
@@ -93,11 +98,11 @@ class SonicRewardsCfg(ManagerRewardsCfg):
         weight=1.0, sigma=3.14
     )
     action_rate_l2: mdp.ActionRateRewardCfg = mdp.ActionRateRewardCfg(weight=-0.1)
-    limits_dof_pos: mdp.DofLimitRewardCfg = mdp.DofLimitRewardCfg(weight=-10.0, soft_limit=0.9, cap=5.0)
+    limits_dof_pos: mdp.DofLimitRewardCfg = mdp.DofLimitRewardCfg(weight=-10.0, soft_limit=1.0, cap=float("inf"))
     undesired_contacts: mdp.UndesiredContactsRewardCfg = mdp.UndesiredContactsRewardCfg(weight=-0.1, threshold=1.0)
     anti_shake: mdp.SonicAntiShakeRewardCfg = mdp.SonicAntiShakeRewardCfg(weight=-0.005)
     feet_acc: mdp.SonicFeetAccelerationRewardCfg = mdp.SonicFeetAccelerationRewardCfg(weight=-2.5e-6)
-    tracking_vr_5point_local: mdp.SonicTrackingRewardCfg = mdp.SonicTrackingRewardCfg(weight=2.0)
+    tracking_vr_3point_local: mdp.SonicTrackingRewardCfg = mdp.SonicTrackingRewardCfg(weight=2.0)
 
 
 @configclass
@@ -116,7 +121,6 @@ class SonicResetCfg(ManagerResetCfg):
     body_lin_vel: BodyLinVelResetCfg = BodyLinVelResetCfg()
     body_rot_vel: BodyRotVelResetCfg = BodyRotVelResetCfg()
     body_dof_pos: BodyDofPosResetCfg = BodyDofPosResetCfg()
-    actuator_dynamics: mdp.SonicActuatorDynamicsResetCfg = mdp.SonicActuatorDynamicsResetCfg()
 
 
 @configclass
@@ -151,22 +155,19 @@ class SonicManagerEnvCfg(ManagerBasedEnvCfg):
                 "tracked_body_quat": BatchLinkQuaternionQuery(links=tracked_body_names),
                 "tracked_body_linear_velocity": BatchLinkLinearVelocityQuery(links=tracked_body_names),
                 "tracked_body_angular_velocity": BatchLinkAngularVelocityQuery(links=tracked_body_names),
-                "undesired_contact_forces": BatchLinkNetContactForceQuery(
-                    links=tuple(
+                "undesired_contact_forces": BodyLinkNetContactForceQuery(
+                    body=robot.resolved_base_link_name,
+                    exclude_links=tuple(
                         robot.resolve_name(name)
                         for name in (
-                            "pelvis",
-                            "left_hip_roll_link",
-                            "left_hip_yaw_link",
-                            "left_knee_link",
-                            "right_hip_roll_link",
-                            "right_hip_yaw_link",
-                            "right_knee_link",
-                            "torso_link",
-                            "left_shoulder_yaw_link",
-                            "right_shoulder_yaw_link",
+                            "left_ankle_roll_link",
+                            "right_ankle_roll_link",
+                            "left_wrist_yaw_link",
+                            "right_wrist_yaw_link",
+                            "left_elbow_link",
+                            "right_elbow_link",
                         )
-                    )
+                    ),
                 ),
             }
         )
