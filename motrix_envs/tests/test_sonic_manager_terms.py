@@ -8,6 +8,8 @@ import numpy as np
 import pytest
 
 from motrix_envs.locomotion.sonic import mdp
+from motrix_envs.locomotion.sonic.cfg import SonicActionsCfg
+from motrix_envs.locomotion.wbt.mdp.action import WbtJointPositionActionCfg
 
 
 def _identity_quaternions(shape: tuple[int, ...]) -> np.ndarray:
@@ -19,59 +21,41 @@ def _identity_quaternions(shape: tuple[int, ...]) -> np.ndarray:
 def test_sonic_config_defaults_match_upstream_base() -> None:
     motion = mdp.SonicMotionCommandCfg()
 
+    # Upstream sonic_release tracking set: a torso virtual point 0.5 m up
+    # plus both wrists, no offsets.
     assert motion.reward_point_body_names == (
-        "pelvis",
+        "torso_link",
         "left_wrist_yaw_link",
         "right_wrist_yaw_link",
-        "left_ankle_roll_link",
-        "right_ankle_roll_link",
     )
     assert motion.reward_point_body_offsets == (
-        (0.0, 0.0, 0.0),
-        (0.18, -0.025, 0.0),
-        (0.18, 0.025, 0.0),
+        (0.0, 0.0, 0.5),
         (0.0, 0.0, 0.0),
         (0.0, 0.0, 0.0),
     )
-    assert mdp.SonicJointPositionActionCfg().simulate_action_latency is False
-    assert mdp.SonicJointPositionActionCfg().scale == 0.25
+    # The sonic task reuses the shared WBT position action term; the env wires
+    # the SONIC policy joint order into it at post-init.
+    assert isinstance(SonicActionsCfg().joint_position, WbtJointPositionActionCfg)
     assert motion.reference_body_name == "pelvis"
     assert motion.encoder_sampling == "mixed"
 
 
-def test_sonic_model_hip_pitch_dynamics_match_policy_scaling_contract() -> None:
-    # Regression: runtime gain overrides left the generic G1's 88 Nm force
-    # clamp and smaller armature in place despite scaling actions for 139 Nm.
+def test_sonic_model_hip_pitch_release_gains() -> None:
+    # Regression: the model file once carried the generic G1's 88 Nm hip-pitch
+    # force clamp and smaller armature. The action term now derives its scales
+    # from these very gains, so pin the release contract in g1_sonic.xml.
     from motrix_envs.locomotion.sonic.g1 import make_g1_sonic_cfg
 
     root = ElementTree.parse(make_g1_sonic_cfg().scene.objs.robot.model.file).getroot()
     joint = root.find(".//default[@class='hip_pitch']/joint")
+    kp, kd, effort, armature = 99.098427777, 6.308801854, 139.0, 0.025101925
     for side in ("left", "right"):
-        name = f"{side}_hip_pitch_joint"
-        kp, kd, effort, armature = mdp._SONIC_ACTUATOR_PARAMETERS[name]
-        actuator = root.find(f"actuator/position[@name='{name}']")
+        actuator = root.find(f"actuator/position[@name='{side}_hip_pitch_joint']")
         assert float(actuator.attrib["kp"]) == pytest.approx(kp)
         assert float(actuator.attrib["kv"]) == pytest.approx(kd)
         assert tuple(map(float, actuator.attrib["forcerange"].split())) == (-effort, effort)
         assert tuple(map(float, joint.attrib["actuatorfrcrange"].split())) == (-effort, effort)
         assert float(joint.attrib["armature"]) == pytest.approx(armature)
-
-
-def test_sonic_actuator_dynamics_reset_uses_release_gains() -> None:
-    kp = np.empty(len(mdp.G1_SONIC_JOINTS), dtype=np.float32)
-    damping = np.empty_like(kp)
-    gains = tuple(np.float32(mdp._SONIC_ACTUATOR_PARAMETERS[name][0]) for name in mdp.G1_SONIC_JOINTS)
-    dampings = tuple(np.float32(mdp._SONIC_ACTUATOR_PARAMETERS[name][1]) for name in mdp.G1_SONIC_JOINTS)
-    mdp._reset_sonic_actuator_dynamics(
-        SimpleNamespace(),
-        {"kp": kp, "damping": damping},
-        gains,
-        dampings,
-    )
-
-    left_hip_pitch = mdp.G1_SONIC_JOINTS.index("left_hip_pitch_joint")
-    assert kp[left_hip_pitch] == pytest.approx(99.098427777)
-    assert damping[left_hip_pitch] == pytest.approx(6.308801854)
 
 
 def test_sonic_reward_point_config_validation() -> None:
@@ -87,16 +71,60 @@ def test_sonic_reward_point_config_validation() -> None:
 
 
 def test_sonic_encoder_sampling_mode_selection() -> None:
-    def sampled(mode: str, draws: int) -> set[bool]:
+    def sampled(mode: str, draws: int) -> set[int]:
         mode_id = mdp.ENCODER_SAMPLING_MODES.index(mode)
         return {
-            mdp._sample_encoder_use_smpl(np.asarray([seed], dtype=np.uint64), np.int64(mode_id))
+            int(mdp._sample_encoder_slot(np.asarray([seed], dtype=np.uint64), np.int64(mode_id)))
             for seed in range(draws)
         }
 
-    assert sampled("g1", 8) == {False}
-    assert sampled("smpl", 8) == {True}
-    assert sampled("mixed", 64) == {False, True}
+    # Slot order mirrors upstream encoder_sample_probs: [g1, teleop, smpl].
+    assert sampled("g1", 8) == {0}
+    assert sampled("teleop", 8) == {1}
+    assert sampled("smpl", 8) == {2}
+    # Mixed draws uniformly over the three reference streams.
+    assert sampled("mixed", 64) == {0, 1, 2}
+
+
+def test_sonic_reset_expands_smpl_native_rows_multi_hot() -> None:
+    joints = len(mdp.G1_SONIC_JOINTS)
+    clip = SimpleNamespace(
+        joint_pos=np.zeros((4, joints), np.float32),
+        joint_vel=np.zeros((4, joints), np.float32),
+        frame_clip_end=np.full(4, 3, np.int64),
+        reference_body_pos_w=np.zeros((4, 3), np.float32),
+    )
+    motion = SimpleNamespace(
+        clip=clip,
+        steps=np.zeros(1, np.int64),
+        sampling_cdf=np.ones(1, np.float32),
+        start_at_timestep_zero_prob=np.float32(1.0),
+        foot_joint_policy_indices=np.asarray([mdp.G1_SONIC_JOINTS.index(n) for n in mdp.SONIC_FOOT_JOINTS], np.int64),
+        previous_foot_joint_velocity=np.zeros(4, np.float32),
+        foot_joint_acceleration=np.zeros(4, np.float32),
+        encoder_index=np.zeros(mdp.SONIC_ENCODER_COUNT, np.float32),
+        encoder_sampling_mode=np.int64(1),
+        running_ref_height=np.zeros(1, np.float32),
+        low_reference=np.zeros(1, np.bool_),
+        low_reference_height_threshold=np.float32(0.5),
+    )
+    ctx = SimpleNamespace(rand=SimpleNamespace(state=np.zeros(1, np.uint64)))
+
+    def observed(mode: str, draws: int) -> set[tuple[float, ...]]:
+        motion.encoder_sampling_mode = np.int64(mdp.ENCODER_SAMPLING_MODES.index(mode))
+        rows = set()
+        for seed in range(draws):
+            ctx.rand.state[0] = seed
+            mdp.SonicMotionCommand.reset_env(motion, ctx)
+            rows.add(tuple(float(value) for value in motion.encoder_index))
+        return rows
+
+    # Upstream legacy multi-hot: only the smpl-native row expands — g1 is
+    # always co-activated and teleop with probability 0.5, producing the
+    # tri-hot rows the g1-teleop / teleop-smpl alignment losses train on.
+    assert observed("g1", 8) == {(1.0, 0.0, 0.0)}
+    assert observed("teleop", 8) == {(0.0, 1.0, 0.0)}
+    assert observed("smpl", 64) == {(1.0, 0.0, 1.0), (1.0, 1.0, 1.0)}
 
 
 def test_sonic_adaptive_sampling_changes_probability_and_draws() -> None:
@@ -188,6 +216,26 @@ def test_sonic_for_play_pins_g1_encoder_sampling() -> None:
     assert make_g1_sonic_cfg().for_play().commands.motion.encoder_sampling == "g1"
 
 
+def test_sonic_undesired_contacts_exclude_only_end_effectors() -> None:
+    from motrix_env_core.sim import BodyLinkNetContactForceQuery
+    from motrix_envs.locomotion.sonic.g1 import make_g1_sonic_cfg
+
+    query = make_g1_sonic_cfg().queries.data["undesired_contact_forces"]
+
+    assert isinstance(query, BodyLinkNetContactForceQuery)
+    assert query.body == "pelvis"
+    # Upstream undesired_contacts regex: every robot body except the six
+    # end-effector links (ankle rolls, wrist yaws, elbows).
+    assert set(query.exclude_links) == {
+        "left_ankle_roll_link",
+        "right_ankle_roll_link",
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+        "left_elbow_link",
+        "right_elbow_link",
+    }
+
+
 def test_sonic_low_reference_relaxes_z_terminations() -> None:
     bodies = len(mdp.G1_SONIC_BODY_NAMES)
     clip = SimpleNamespace(
@@ -203,7 +251,7 @@ def test_sonic_low_reference_relaxes_z_terminations() -> None:
         clip=clip,
         steps=np.asarray((0,), np.int64),
         reference_index=0,
-        foot_joint_policy_indices=np.asarray((13, 14, 17, 18), np.int64),
+        foot_joint_policy_indices=np.asarray([mdp.G1_SONIC_JOINTS.index(n) for n in mdp.SONIC_FOOT_JOINTS], np.int64),
         previous_foot_joint_velocity=np.zeros(4, np.float32),
         foot_joint_acceleration=np.zeros(4, np.float32),
         step_dt=np.float32(0.02),
@@ -248,7 +296,7 @@ def test_sonic_reference_advances_only_after_transition_evaluation() -> None:
         clip=clip,
         steps=np.asarray((0,), np.int64),
         reference_index=np.int64(0),
-        foot_joint_policy_indices=np.asarray((13, 14, 17, 18), np.int64),
+        foot_joint_policy_indices=np.asarray([mdp.G1_SONIC_JOINTS.index(n) for n in mdp.SONIC_FOOT_JOINTS], np.int64),
         previous_foot_joint_velocity=np.zeros(4, np.float32),
         foot_joint_acceleration=np.zeros(4, np.float32),
         step_dt=np.float32(0.02),
@@ -274,40 +322,6 @@ def test_sonic_reference_advances_only_after_transition_evaluation() -> None:
 
     mdp.SonicMotionCommand.advance(motion, ctx)
     assert motion.steps[0] == 1
-
-
-def test_sonic_action_latency_and_reset() -> None:
-    shape = (2, len(mdp.G1_SONIC_JOINTS))
-    current = np.full(shape, 2.0, dtype=np.float32)
-    previous = np.full(shape, 3.0, dtype=np.float32)
-    scales = np.full(shape[1], 0.5, dtype=np.float32)
-    term = mdp.SonicJointPositionAction(
-        current=current.copy(),
-        previous=previous.copy(),
-        default_angles=np.zeros(shape[1], dtype=np.float32),
-        joint_lower=np.full(shape[1], -10.0, dtype=np.float32),
-        joint_upper=np.full(shape[1], 10.0, dtype=np.float32),
-        action_scales=scales,
-        processed=np.zeros(shape, dtype=np.float32),
-        simulate_action_latency=False,
-    )
-
-    np.testing.assert_array_equal(term.process(np.full(shape, 4.0, dtype=np.float32)), 2.0)
-
-    delayed = mdp.SonicJointPositionAction(
-        current=current.copy(),
-        previous=previous.copy(),
-        default_angles=term.default_angles,
-        joint_lower=term.joint_lower,
-        joint_upper=term.joint_upper,
-        action_scales=term.action_scales,
-        processed=np.zeros(shape, dtype=np.float32),
-        simulate_action_latency=True,
-    )
-    np.testing.assert_array_equal(delayed.process(np.full(shape, 4.0, dtype=np.float32)), 1.0)
-    delayed.reset(np.asarray((0,), dtype=np.int64))
-    np.testing.assert_array_equal(delayed.current[0], 0.0)
-    np.testing.assert_array_equal(delayed.previous[0], 0.0)
 
 
 def test_sonic_actor_observation_uses_lane_local_action_width() -> None:
@@ -438,6 +452,73 @@ def test_sonic_smpl_reference_matches_release_local_frame_and_wrist_tail() -> No
     np.testing.assert_allclose(output, expected, atol=1.0e-6)
 
 
+def test_sonic_hybrid_reference_matches_release_layout() -> None:
+    num_future_frames = 2
+    frame_count = 6
+    joints = len(mdp.G1_SONIC_JOINTS)
+    bodies = len(mdp.G1_SONIC_BODY_NAMES)
+    positions = np.arange(frame_count * joints, dtype=np.float32).reshape(frame_count, joints)
+    velocities = positions + 100.0
+    body_pos = np.zeros((frame_count, bodies, 3), np.float32)
+    body_pos[:, mdp.SONIC_ROOT_BODY_INDEX] = (0.5, -0.25, 0.8)
+    vr_body_pos = ((1.2, 0.3, 0.9), (-0.4, 0.6, 1.1), (0.1, 0.2, 1.25))
+    for body, xyz in zip(mdp.HYBRID_VR_BODY_INDICES, vr_body_pos):
+        body_pos[:, body] = xyz
+    body_quat = _identity_quaternions((frame_count, bodies))
+    quarter_turn_z = np.asarray((0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)), dtype=np.float32)
+    body_quat[:, mdp.SONIC_ROOT_BODY_INDEX] = quarter_turn_z
+    tracked_quaternions = _identity_quaternions((bodies,))
+    motion = SimpleNamespace(
+        steps=np.asarray((0,), np.int64),
+        num_future_frames=np.int64(num_future_frames),
+        clip=SimpleNamespace(
+            joint_pos=positions,
+            joint_vel=velocities,
+            frame_clip_end=np.full(frame_count, frame_count - 1, np.int64),
+            tracked_bodies_pos_w=body_pos,
+            tracked_bodies_quat_w=body_quat,
+        ),
+    )
+    output = np.empty(num_future_frames * 24 + 27, dtype=np.float32)
+
+    mdp.SonicHybridReferenceObservation.compute(
+        SimpleNamespace(commands={"motion": motion}, sim={"tracked_body_quat": tracked_quaternions}),
+        output,
+    )
+
+    # Lower-body joint order: the six left-leg joints first, then the six
+    # right-leg ones, sampled on the G1 stride grid; positions of all frames
+    # first, then velocities. Columns resolve by name from the declared order.
+    selected = np.asarray((0, mdp.G1_FUTURE_STRIDE), dtype=np.int64)
+    leg_columns = np.asarray([mdp.G1_SONIC_JOINTS.index(name) for name in mdp.HYBRID_LEG_JOINTS], dtype=np.int64)
+    expected_lower = np.concatenate(
+        (
+            positions[selected][:, leg_columns].reshape(-1),
+            velocities[selected][:, leg_columns].reshape(-1),
+        )
+    )
+    # Current-frame vr targets in the reference-anchor local frame: the anchor
+    # is a quarter turn about z, so its inverse maps (x, y, z) -> (y, -x, z).
+    anchor = body_pos[0, mdp.SONIC_ROOT_BODY_INDEX]
+    vr_positions = []
+    for body, offset in zip(mdp.HYBRID_VR_BODY_INDICES, mdp.HYBRID_VR_BODY_OFFSETS):
+        target = body_pos[0, body] + np.asarray(offset, np.float32) - anchor
+        vr_positions.extend((target[1], -target[0], target[2]))
+    inverse_anchor_quat = np.asarray((0.0, 0.0, -np.sqrt(0.5), np.sqrt(0.5)), np.float32)
+    # First-two-columns 6D of Rz(90 deg), flattened row-major: (R00, R01,
+    # R10, R11, R20, R21).
+    anchor_rotation6 = np.asarray((0.0, -1.0, 1.0, 0.0, 0.0, 0.0), np.float32)
+    expected = np.concatenate(
+        (
+            expected_lower,
+            np.asarray(vr_positions, np.float32),
+            np.tile(inverse_anchor_quat, 3),
+            anchor_rotation6,
+        )
+    )
+    np.testing.assert_allclose(output, expected, atol=1.0e-6)
+
+
 def test_sonic_observation_sizes_are_derived_from_runtime_shapes() -> None:
     num_future_frames = np.int64(2)
     joint_count = 7
@@ -472,6 +553,9 @@ def test_sonic_observation_sizes_are_derived_from_runtime_shapes() -> None:
         + mdp.SONIC_ROTATION_REPRESENTATION_DIM
         + len(mdp.SONIC_WRIST_POLICY_INDICES)
     )
+    # Upstream teleop layout: lower-body block per future frame plus the
+    # static current-frame tail (3 positions + 3 quaternions + anchor 6D).
+    assert mdp.SonicHybridReferenceObservationCfg()(env).size == num_future_frames * 24 + 27
     current_frame_dim = 9 + body_count * 9
     critic_history_frames = 4
     assert mdp.SonicCriticObservationCfg(num_history_frames=critic_history_frames)(env).size == (
@@ -541,7 +625,7 @@ def test_sonic_feet_acc_matches_upstream_sum_of_squared_acceleration() -> None:
 
 
 def test_sonic_foot_acceleration_history_is_task_local() -> None:
-    foot_indices = np.asarray((13, 14, 17, 18), dtype=np.int64)
+    foot_indices = np.asarray([mdp.G1_SONIC_JOINTS.index(n) for n in mdp.SONIC_FOOT_JOINTS], dtype=np.int64)
     velocity = np.zeros(len(mdp.G1_SONIC_JOINTS), dtype=np.float32)
     velocity[foot_indices] = (0.02, 0.04, 0.06, 0.08)
     previous = np.zeros(4, dtype=np.float32)

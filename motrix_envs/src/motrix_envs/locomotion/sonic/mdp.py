@@ -6,22 +6,17 @@ from __future__ import annotations
 import math
 from typing import cast
 
-import gymnasium as gym
 import numpy as np
 
 from motrix_env_core.config import configclass
 from motrix_env_core.config.scene import RobotCfg
 from motrix_env_core.manager import (
-    ActionCfg,
-    ActionTerm,
     CommandCfg,
     CommandTerm,
     ManagerContext,
     ManagerEnv,
     ObservationTermCfg,
     ObsTerm,
-    ResetTerm,
-    ResetTermCfg,
     RewardTerm,
     RewardTermCfg,
     SharedArray,
@@ -43,11 +38,8 @@ from motrix_env_core.manager.math.quaternion import (
 from motrix_env_core.mdp.rewards import (
     ActionRateRewardCfg as ActionRateRewardCfg,
 )
-from motrix_env_core.numba.kernel_data import Map
 from motrix_env_core.numba.manager.commands import ResetContext
 from motrix_env_core.numba.manager.rand import next_uniform
-from motrix_env_core.sim.write import ActuatorDampingWrite, ActuatorKpWrite
-from motrix_envs.locomotion.action_space import joint_position_action_space_from_ctrl_ranges
 from motrix_envs.locomotion.wbt.mdp.rewards import (
     DofLimitRewardCfg as DofLimitRewardCfg,
 )
@@ -74,35 +66,41 @@ from motrix_envs.locomotion.wbt.mdp.rewards import (
 )
 from motrix_envs.motion.sonic import SonicMotionClip
 
+# Policy joint order: the g1_sonic.xml actuator order (grouped by limb).
+# Every joint-indexed plane follows this one declaration — the corpus is
+# reordered by name at load, the sim queries and the action term resolve by
+# name — so layouts stay internally consistent by construction. Running a
+# checkpoint laid out in the upstream interleaved order would need an
+# explicit permutation table.
 G1_SONIC_JOINTS = (
     "left_hip_pitch_joint",
-    "right_hip_pitch_joint",
-    "waist_yaw_joint",
     "left_hip_roll_joint",
-    "right_hip_roll_joint",
-    "waist_roll_joint",
     "left_hip_yaw_joint",
-    "right_hip_yaw_joint",
-    "waist_pitch_joint",
     "left_knee_joint",
-    "right_knee_joint",
-    "left_shoulder_pitch_joint",
-    "right_shoulder_pitch_joint",
     "left_ankle_pitch_joint",
-    "right_ankle_pitch_joint",
-    "left_shoulder_roll_joint",
-    "right_shoulder_roll_joint",
     "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
     "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
     "left_shoulder_yaw_joint",
-    "right_shoulder_yaw_joint",
     "left_elbow_joint",
-    "right_elbow_joint",
     "left_wrist_roll_joint",
-    "right_wrist_roll_joint",
     "left_wrist_pitch_joint",
-    "right_wrist_pitch_joint",
     "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 )
 G1_SONIC_BODY_NAMES = (
@@ -121,79 +119,80 @@ G1_SONIC_BODY_NAMES = (
     "right_elbow_link",
     "right_wrist_yaw_link",
 )
-G1_SONIC_EE_BODY_NAMES = (
-    "left_ankle_roll_link",
-    "right_ankle_roll_link",
-    "left_wrist_yaw_link",
-    "right_wrist_yaw_link",
-)
-G1_SONIC_ACTION_SCALE = 0.25
 SONIC_VECTOR_DIM = 3
 SONIC_ROTATION_REPRESENTATION_DIM = 2 * SONIC_VECTOR_DIM
 SONIC_ACTOR_JOINT_FEATURES = 3
-SONIC_ENCODER_COUNT = 2
-SONIC_WRIST_POLICY_INDICES = (23, 24, 25, 26, 27, 28)
-# motrixlab SONIC actuator contract: (kp, kd, effort_limit, armature).
-_SONIC_ACTUATOR_PARAMETERS = {
-    **{
-        n: (99.098427777, 6.308801854, 139.0, 0.025101925)
-        for n in (
-            "left_hip_pitch_joint",
-            "left_hip_roll_joint",
-            "left_knee_joint",
-            "right_hip_pitch_joint",
-            "right_hip_roll_joint",
-            "right_knee_joint",
-        )
-    },
-    **{
-        n: (40.179238471, 2.557889765, 88.0, 0.010177520)
-        for n in ("left_hip_yaw_joint", "right_hip_yaw_joint", "waist_yaw_joint")
-    },
-    **{
-        n: (28.501246196, 1.814445687, 50.0, 0.00721945)
-        for n in (
-            "left_ankle_pitch_joint",
-            "left_ankle_roll_joint",
-            "right_ankle_pitch_joint",
-            "right_ankle_roll_joint",
-            "waist_roll_joint",
-            "waist_pitch_joint",
-        )
-    },
-    **{
-        n: (14.250623098, 0.907222843, 25.0, 0.003609725)
-        for n in (
-            "left_shoulder_pitch_joint",
-            "left_shoulder_roll_joint",
-            "left_shoulder_yaw_joint",
-            "left_elbow_joint",
-            "left_wrist_roll_joint",
-            "right_shoulder_pitch_joint",
-            "right_shoulder_roll_joint",
-            "right_shoulder_yaw_joint",
-            "right_elbow_joint",
-            "right_wrist_roll_joint",
-        )
-    },
-    **{
-        n: (16.778327481, 1.068141502, 5.0, 0.00425)
-        for n in ("left_wrist_pitch_joint", "left_wrist_yaw_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint")
-    },
-}
+# Width of the per-env encoder mask (multi-hot, upstream column order):
+# g1, teleop, smpl.
+SONIC_ENCODER_COUNT = 3
+# Joint selections into G1_SONIC_JOINTS, resolved by name so they follow the
+# declared order instead of hardcoding positions.
+SONIC_WRIST_JOINTS = (
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+)
+SONIC_WRIST_POLICY_INDICES = tuple(G1_SONIC_JOINTS.index(name) for name in SONIC_WRIST_JOINTS)
+SONIC_FOOT_JOINTS = (
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+)
+# Hybrid ("teleop") stream inputs, resolved against G1_SONIC_JOINTS /
+# G1_SONIC_BODY_NAMES. The vr_3point bodies are both wrists plus a torso point
+# offset 0.35 m up (standing in for the head); the leg dof set keeps the
+# upstream semantic order — the six left-leg joints (hip pitch/roll/yaw, knee,
+# ankle pitch/roll) first, then the six right-leg joints.
+HYBRID_VR_BODY_INDICES = (10, 13, 7)  # left wrist, right wrist, torso
+HYBRID_VR_BODY_OFFSETS = ((0.18, -0.025, 0.0), (0.18, 0.025, 0.0), (0.0, 0.0, 0.35))
+HYBRID_LEG_JOINTS = (
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+)
+HYBRID_LEG_POLICY_INDICES = tuple(G1_SONIC_JOINTS.index(name) for name in HYBRID_LEG_JOINTS)
+# Upstream teleop encoder input width: a multi-future lower-body block (12
+# joint positions + velocities per G1-stride frame) followed by a
+# current-frame tail of 3 vr point positions (9), 3 vr point quaternions
+# xyzw (12), and the anchor orientation 6D.
+HYBRID_LOWER_BODY_PER_FRAME = 2 * len(HYBRID_LEG_POLICY_INDICES)
+HYBRID_TAIL_DIM = (
+    len(HYBRID_VR_BODY_INDICES) * SONIC_VECTOR_DIM + len(HYBRID_VR_BODY_INDICES) * 4 + SONIC_ROTATION_REPRESENTATION_DIM
+)
+# Upstream ``teleop_sample_prob_when_smpl`` (release value): smpl-native rows
+# also activate the teleop encoder with this probability.
+HYBRID_TELEOP_PROB_WHEN_SMPL = 0.5
 SONIC_ROOT_BODY_INDEX = 0  # ``pelvis`` is the first tracked body in SONIC order.
 # Upstream SONIC stride contract (50 Hz references, one clip frame per ctrl step):
 # the G1 encoder samples sparsely (0.1 s apart, ~1 s horizon) while the SMPL
-# encoder samples densely (0.02 s apart, ~0.2 s horizon).
+# encoder samples densely (0.02 s apart, ~0.2 s horizon); the hybrid stream's
+# lower-body block shares the G1 grid.
 G1_FUTURE_STRIDE = 5
 SMPL_FUTURE_STRIDE = 1
-# Temporal depths are independent: future frames size the G1/SMPL reference
-# encoders, while history frames size actor proprioception and critic history.
-# Both must stay aligned with the SONIC policy model recipe.
+# Temporal depths are independent: future frames size the G1/SMPL/teleop
+# reference encoders, while history frames size actor proprioception and critic
+# history. Both must stay aligned with the SONIC policy model recipe.
 SONIC_DEFAULT_NUM_FUTURE_FRAMES = 5
 SONIC_DEFAULT_NUM_HISTORY_FRAMES = 5
-# encoder_sampling modes: 0 = mixed (50/50 per reset), 1 = g1, 2 = smpl.
-ENCODER_SAMPLING_MODES = ("mixed", "g1", "smpl")
+# encoder_sampling modes select the *native* encoder per reset: 0 = mixed
+# (uniform draw over the three streams), then one id per encoder_index
+# column — 1 = g1, 2 = teleop, 3 = smpl — so a pinned mode maps directly
+# onto its mask column. The legacy upstream multi-hot expansion then applies
+# on top: smpl-native rows also activate g1 and, with probability 0.5, teleop.
+ENCODER_SAMPLING_MODES = ("mixed", "g1", "teleop", "smpl")
 
 
 @njit(inline="always")
@@ -211,24 +210,27 @@ def _smpl_reference_frame_dim(joint_count: int) -> int:
     return joint_count * SONIC_VECTOR_DIM + SONIC_ROTATION_REPRESENTATION_DIM + len(SONIC_WRIST_POLICY_INDICES)
 
 
-def _sonic_action_scale(base_scale: float) -> np.ndarray:
-    """Apply the WBT effort-limit-over-gain action scaling in policy order."""
-    if not np.isfinite(base_scale) or base_scale <= 0.0:
-        raise ValueError("SONIC base action scale must be positive and finite")
-    return np.asarray(
-        [base_scale * _SONIC_ACTUATOR_PARAMETERS[n][2] / _SONIC_ACTUATOR_PARAMETERS[n][0] for n in G1_SONIC_JOINTS],
-        dtype=np.float32,
-    )
+def _hybrid_reference_width(num_future_frames: int) -> int:
+    """Upstream teleop encoder input width: lower-body block plus static tail."""
+    return num_future_frames * HYBRID_LOWER_BODY_PER_FRAME + HYBRID_TAIL_DIM
 
 
 @njit(inline="always")
-def _sample_encoder_use_smpl(rng_state: np.ndarray, mode: np.int64) -> bool:
-    """Resolve the encoder selector for one reset from the sampling mode."""
-    if mode == 1:
-        return False
-    if mode == 2:
-        return True
-    return (next_uniform(rng_state) + np.float32(1.0)) * np.float32(0.5) < np.float32(0.5)
+def _sample_encoder_slot(rng_state: np.ndarray, mode: np.int64) -> np.int64:
+    """Resolve the native encoder slot for one reset.
+
+    Column order mirrors upstream ``encoder_sample_probs``: 0 = g1,
+    1 = teleop, 2 = smpl. A pinned mode id maps one-to-one onto its column;
+    mixed mode draws uniformly over the three streams.
+    """
+    if mode > 0:
+        return mode - np.int64(1)
+    unit = (next_uniform(rng_state) + np.float32(1.0)) * np.float32(0.5)
+    if unit < np.float32(1.0 / 3.0):
+        return np.int64(0)
+    if unit < np.float32(2.0 / 3.0):
+        return np.int64(1)
+    return np.int64(2)
 
 
 def _adaptive_sampling_probabilities(
@@ -311,6 +313,7 @@ class SonicMotionCommand(CommandTerm):
     kernel_lambda: np.float32
     encoder_index: np.ndarray
     encoder_sampling_mode: np.int64
+    running_ref_height: np.ndarray
     running_ref_height: np.ndarray
     low_reference: np.ndarray
     low_reference_height_threshold: np.float32
@@ -426,9 +429,19 @@ class SonicMotionCommand(CommandTerm):
         for i in range(self.foot_joint_policy_indices.shape[0]):
             self.previous_foot_joint_velocity[i] = self.clip.joint_vel[step, self.foot_joint_policy_indices[i]]
         self.foot_joint_acceleration[:] = 0.0
-        use_smpl = _sample_encoder_use_smpl(ctx.rand.state, self.encoder_sampling_mode)
-        self.encoder_index[0] = 0.0 if use_smpl else 1.0
-        self.encoder_index[1] = 1.0 if use_smpl else 0.0
+        slot = _sample_encoder_slot(ctx.rand.state, self.encoder_sampling_mode)
+        # ``self.encoder_index`` is the lane's writable 1-D row view.
+        for encoder in range(self.encoder_index.shape[0]):
+            self.encoder_index[encoder] = 1.0 if encoder == slot else 0.0
+        # Upstream legacy multi-hot: smpl-native rows also activate g1 (the
+        # alignment losses then see real g1 latents on smpl data) and with
+        # probability ``HYBRID_TELEOP_PROB_WHEN_SMPL`` also teleop, creating
+        # the tri-hot rows the g1-teleop / teleop-smpl losses train on.
+        if slot == 2:
+            self.encoder_index[0] = 1.0
+            unit = (next_uniform(ctx.rand.state) + np.float32(1.0)) * np.float32(0.5)
+            if unit < np.float32(HYBRID_TELEOP_PROB_WHEN_SMPL):
+                self.encoder_index[1] = 1.0
         self.running_ref_height[0] = self.clip.reference_body_pos_w[self.steps[0], 2]
         self.low_reference[0] = self.running_ref_height[0] < self.low_reference_height_threshold
 
@@ -483,17 +496,9 @@ class SonicMotionCommandCfg(CommandCfg):
     # wrist points and both ankle points.  Wrist offsets target the forearm
     # points used by the upstream reward; ankle points add an explicit
     # foot-stability signal on top of the generic body rewards.
-    reward_point_body_names: tuple[str, ...] = (
-        "pelvis",
-        "left_wrist_yaw_link",
-        "right_wrist_yaw_link",
-        "left_ankle_roll_link",
-        "right_ankle_roll_link",
-    )
+    reward_point_body_names: tuple[str, ...] = ("torso_link", "left_wrist_yaw_link", "right_wrist_yaw_link")
     reward_point_body_offsets: tuple[tuple[float, float, float], ...] = (
-        (0.0, 0.0, 0.0),
-        (0.18, -0.025, 0.0),
-        (0.18, 0.025, 0.0),
+        (0.0, 0.0, 0.5),
         (0.0, 0.0, 0.0),
         (0.0, 0.0, 0.0),
     )
@@ -542,9 +547,11 @@ class SonicMotionCommandCfg(CommandCfg):
             reset_counter=np.zeros((env.num_envs, 1), np.int64),
             previous_foot_joint_velocity=np.zeros((env.num_envs, 4), np.float32),
             foot_joint_acceleration=np.zeros((env.num_envs, 4), np.float32),
-            foot_joint_policy_indices=np.asarray((13, 14, 17, 18), dtype=np.int64),
+            foot_joint_policy_indices=np.asarray(
+                [G1_SONIC_JOINTS.index(name) for name in SONIC_FOOT_JOINTS], dtype=np.int64
+            ),
             step_dt=np.float32(env.cfg.ctrl_dt),
-            encoder_index=np.tile(np.asarray((1.0, 0.0), np.float32), (env.num_envs, 1)),
+            encoder_index=np.tile(np.asarray((1.0, 0.0, 0.0), np.float32), (env.num_envs, 1)),
             encoder_sampling_mode=np.int64(ENCODER_SAMPLING_MODES.index(self.encoder_sampling)),
             running_ref_height=np.zeros((env.num_envs, 1), np.float32),
             low_reference=np.zeros((env.num_envs, 1), bool),
@@ -561,119 +568,6 @@ class SonicMotionCommandCfg(CommandCfg):
             kernel_size=np.int64(self.kernel_size),
             kernel_lambda=np.float32(self.kernel_lambda),
             num_future_frames=np.int64(self.num_future_frames),
-        )
-
-
-@kernel_data
-class SonicJointPositionAction(ActionTerm):
-    current: np.ndarray
-    previous: np.ndarray
-    default_angles: SharedArray
-    joint_lower: SharedArray
-    joint_upper: SharedArray
-    action_scales: SharedArray
-    processed: np.ndarray
-    simulate_action_latency: bool
-
-    def action_space(self, env: ManagerEnv, actuators) -> gym.spaces.Box:
-        return joint_position_action_space_from_ctrl_ranges(
-            np.stack((self.joint_lower, self.joint_upper), axis=1),
-            self.default_angles,
-            self.action_scales,
-        )
-
-    def process(self, actions: np.ndarray) -> np.ndarray:
-        np.copyto(self.previous, self.current)
-        np.copyto(self.current, actions, casting="unsafe")
-        executed = self.previous if self.simulate_action_latency else self.current
-        np.multiply(executed, self.action_scales, out=self.processed)
-        np.add(self.processed, self.default_angles, out=self.processed)
-        return self.processed
-
-    def reset(self, env_ids: np.ndarray) -> None:
-        self.current[env_ids] = 0.0
-        self.previous[env_ids] = 0.0
-
-
-@dispatch
-def _reset_sonic_actuator_dynamics(
-    ctx: ManagerContext,
-    sim_writes: Map[np.ndarray],
-    kp: tuple[np.float32, ...],
-    damping: tuple[np.float32, ...],
-) -> None:
-    kp_out = sim_writes["kp"]
-    damping_out = sim_writes["damping"]
-    for index in range(len(kp)):
-        kp_out[index] = kp[index]
-        damping_out[index] = damping[index]
-
-
-@configclass(kw_only=True)
-class SonicActuatorDynamicsResetCfg(ResetTermCfg):
-    """Apply the official SONIC PPO actuator gains on every simulator reset."""
-
-    def __call__(self, env: ManagerEnv) -> ResetTerm:
-        model_names = tuple(actuator.name for actuator in env.model.actuators)
-        missing = tuple(name for name in G1_SONIC_JOINTS if name not in model_names)
-        if missing:
-            raise ValueError(f"SONIC actuator dynamics targets are missing: {missing}")
-        return ResetTerm(
-            _reset_sonic_actuator_dynamics,
-            tuple(np.float32(_SONIC_ACTUATOR_PARAMETERS[name][0]) for name in G1_SONIC_JOINTS),
-            tuple(np.float32(_SONIC_ACTUATOR_PARAMETERS[name][1]) for name in G1_SONIC_JOINTS),
-            writes={
-                "kp": ActuatorKpWrite(G1_SONIC_JOINTS),
-                "damping": ActuatorDampingWrite(G1_SONIC_JOINTS),
-            },
-        )
-
-
-@configclass(kw_only=True)
-class SonicJointPositionActionCfg(ActionCfg):
-    scale: float = G1_SONIC_ACTION_SCALE
-    simulate_action_latency: bool = False
-    use_default_offset: bool = True
-
-    def __call__(self, env: ManagerEnv, actuators) -> ActionTerm:
-        assert actuators is not None
-        robot = cast(RobotCfg, env.cfg.scene.objs.robot)
-        limits = env.model.others["robot_joint_position_limits"]
-        lower_all, upper_all = limits
-        names = tuple(a.name for a in actuators)
-        model_names = tuple(a.name for a in env.model.actuators)
-        if any(n not in _SONIC_ACTUATOR_PARAMETERS for n in names):
-            raise ValueError("SONIC actuator set is missing a parameter contract entry")
-        if names != G1_SONIC_JOINTS:
-            raise ValueError("SONIC action actuators must preserve G1 policy joint order")
-        # The official checkpoint was trained with gear_sonic's actuator
-        # contract.  Do not rederive this from the generic G1 XML: its two
-        # hip-pitch actuators intentionally use different gains/limits.
-        scales = _sonic_action_scale(self.scale)
-        index = np.asarray([model_names.index(n) for n in names], dtype=np.int64)
-        lower = np.asarray(lower_all, dtype=np.float32)[index]
-        upper = np.asarray(upper_all, dtype=np.float32)[index]
-        defaults = dict(
-            zip(
-                (robot.resolve_name(n) for n in robot.key_pose.joint_names),
-                robot.key_pose.poses["default"],
-                strict=True,
-            )
-        )
-        default = (
-            np.asarray([defaults[n] for n in names], np.float32)
-            if self.use_default_offset
-            else np.zeros(len(names), np.float32)
-        )
-        return SonicJointPositionAction(
-            current=np.zeros((env.num_envs, len(names)), np.float32),
-            previous=np.zeros((env.num_envs, len(names)), np.float32),
-            default_angles=default,
-            joint_lower=lower,
-            joint_upper=upper,
-            action_scales=scales,
-            processed=np.zeros((env.num_envs, len(names)), np.float32),
-            simulate_action_latency=self.simulate_action_latency,
         )
 
 
@@ -848,6 +742,93 @@ class SonicSmplReferenceObservationCfg(ObservationTermCfg):
 
 
 @kernel_data
+class SonicHybridReferenceObservation:
+    """Third reference stream: the hybrid (upstream "teleop") channel.
+
+    Flat upstream release layout: a multi-future lower-body block — the 12
+    leg joint positions over the G1-stride future frames, then the same
+    frames' velocities — followed by a current-frame tail: the vr 3-point
+    targets (both wrists plus a torso offset standing in for the head) as
+    positions and xyzw quaternions canonicalized in the current
+    reference-anchor local frame, and the motion anchor orientation
+    relative to the robot root. Everything derives from the standard corpus
+    arrays, so the stream needs no extra data channels; hybrid-disabled
+    tasks build a zero-width term and keep the legacy observation contract
+    untouched.
+    """
+
+    @staticmethod
+    @dispatch
+    def compute(ctx: ManagerContext, out: np.ndarray) -> None:
+        m = ctx.commands["motion"]
+        clip = m.clip
+        n = int(m.num_future_frames)
+        point_count = len(HYBRID_VR_BODY_INDICES)
+        leg_count = len(HYBRID_LEG_POLICY_INDICES)
+        now = int(m.steps[0])
+        last = clip.frame_clip_end[now]
+        # Lower-body reference on the G1 stride grid: all position frames
+        # first, then all velocity frames, matching the upstream concat order.
+        velocity_offset = n * leg_count
+        for i in range(n):
+            step = min(now + i * G1_FUTURE_STRIDE, last)
+            position_start = i * leg_count
+            for leg in range(leg_count):
+                policy_index = HYBRID_LEG_POLICY_INDICES[leg]
+                out[position_start + leg] = clip.joint_pos[step, policy_index]
+                out[velocity_offset + position_start + leg] = clip.joint_vel[step, policy_index]
+        # Current-frame vr targets canonicalized in the reference-anchor
+        # (pelvis) local frame: body position plus the body-local offset.
+        tail = velocity_offset + n * leg_count
+        anchor_quat = clip.tracked_bodies_quat_w[now, SONIC_ROOT_BODY_INDEX]
+        anchor_pos = clip.tracked_bodies_pos_w[now, SONIC_ROOT_BODY_INDEX]
+        inverse_anchor = np.empty(4, np.float32)
+        quat_inverse(anchor_quat, inverse_anchor)
+        relative_quat = np.empty(4, np.float32)
+        offset_world = np.empty(3, np.float32)
+        target_world = np.empty(3, np.float32)
+        for point in range(point_count):
+            body = HYBRID_VR_BODY_INDICES[point]
+            rotate_vector(
+                clip.tracked_bodies_quat_w[now, body],
+                HYBRID_VR_BODY_OFFSETS[point],
+                offset_world,
+            )
+            target_world[0] = clip.tracked_bodies_pos_w[now, body, 0] + offset_world[0] - anchor_pos[0]
+            target_world[1] = clip.tracked_bodies_pos_w[now, body, 1] + offset_world[1] - anchor_pos[1]
+            target_world[2] = clip.tracked_bodies_pos_w[now, body, 2] + offset_world[2] - anchor_pos[2]
+            pos_start = tail + point * SONIC_VECTOR_DIM
+            rotate_vector(
+                inverse_anchor,
+                (target_world[0], target_world[1], target_world[2]),
+                out[pos_start : pos_start + SONIC_VECTOR_DIM],
+            )
+        quat_start = tail + point_count * SONIC_VECTOR_DIM
+        for point in range(point_count):
+            body = HYBRID_VR_BODY_INDICES[point]
+            quat_mul(inverse_anchor, clip.tracked_bodies_quat_w[now, body], relative_quat)
+            start = quat_start + point * 4
+            out[start] = relative_quat[0]
+            out[start + 1] = relative_quat[1]
+            out[start + 2] = relative_quat[2]
+            out[start + 3] = relative_quat[3]
+        # Motion anchor orientation relative to the robot's live anchor.
+        anchor_start = quat_start + point_count * 4
+        inverse_robot_root = np.empty(4, np.float32)
+        quat_inverse(ctx.sim["tracked_body_quat"][SONIC_ROOT_BODY_INDEX], inverse_robot_root)
+        quat_mul(inverse_robot_root, clip.tracked_bodies_quat_w[now, SONIC_ROOT_BODY_INDEX], relative_quat)
+        to_matrix_first_two_columns(relative_quat, out[anchor_start : anchor_start + SONIC_ROTATION_REPRESENTATION_DIM])
+
+
+@configclass(kw_only=True)
+class SonicHybridReferenceObservationCfg(ObservationTermCfg):
+    def __call__(self, env: ManagerEnv) -> ObsTerm:
+        motion = env.command_terms["motion"]
+        size = _hybrid_reference_width(int(motion.num_future_frames))
+        return ObsTerm(size, SonicHybridReferenceObservation.compute)
+
+
+@kernel_data
 class SonicEncoderIndexObservation:
     @staticmethod
     @dispatch
@@ -858,8 +839,8 @@ class SonicEncoderIndexObservation:
 @configclass(kw_only=True)
 class SonicEncoderIndexObservationCfg(ObservationTermCfg):
     def __call__(self, env: ManagerEnv) -> ObsTerm:
-        del env
-        return ObsTerm(SONIC_ENCODER_COUNT, SonicEncoderIndexObservation.compute)
+        motion = env.command_terms["motion"]
+        return ObsTerm(motion.encoder_index.shape[1], SonicEncoderIndexObservation.compute)
 
 
 @kernel_data

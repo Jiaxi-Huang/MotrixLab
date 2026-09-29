@@ -109,15 +109,17 @@ def test_sonic_canonical_variant_builds_actor() -> None:
     torch.testing.assert_close(actor.policy_head.action_scale, torch.ones(act_dim))
     torch.testing.assert_close(actor.policy_head.action_bias, torch.zeros(act_dim))
     observations = torch.zeros(2, obs_dim)
-    observations[:, -2] = 1.0
+    observations[:, -3] = 1.0
     actions, log_probs, variant_loss, metrics = variant.policy_update(actor, observations, config.algo)
     assert actions.shape == (2, act_dim)
     assert log_probs.shape == (2,)
     assert torch.isfinite(variant_loss)
     assert set(metrics) == {
-        "aux_reconstruction",
-        "aux_latent_alignment",
-        "aux_cycle_consistency",
+        "aux_g1_recon",
+        "aux_g1_smpl_latent",
+        "aux_reencoded_smpl_g1_latent",
+        "aux_g1_teleop_latent",
+        "aux_teleop_smpl_latent",
         "aux_loss",
     }
     mirror = make_actor(
@@ -167,7 +169,10 @@ def test_sonic_split_reproduces_upstream_tokenizer_flat_order() -> None:
     proprioceptive = 3 * act_dim + 6
     g1_frame = 2 * act_dim + 6
     smpl_frame = 24 * 3 + 6 + 2 * 3
-    obs_dim = history_frames * proprioceptive + future_frames * (g1_frame + smpl_frame) + SONIC_ENCODER_COUNT
+    teleop_width = future_frames * 24 + 27
+    obs_dim = (
+        history_frames * proprioceptive + future_frames * (g1_frame + smpl_frame) + teleop_width + SONIC_ENCODER_COUNT
+    )
     config = SonicModelConfig(
         num_future_frames=future_frames,
         num_history_frames=history_frames,
@@ -188,20 +193,27 @@ def test_sonic_split_reproduces_upstream_tokenizer_flat_order() -> None:
     obs = torch.randn(batch, obs_dim)
     g1_start = history_frames * proprioceptive
     smpl_start = g1_start + future_frames * g1_frame
+    teleop_start = smpl_start + future_frames * smpl_frame
     positions = torch.arange(future_frames * act_dim, dtype=torch.float32)
     velocities = torch.arange(future_frames * act_dim, dtype=torch.float32) + 100.0
     rotations = torch.arange(future_frames * 6, dtype=torch.float32) + 200.0
     obs[:, g1_start : g1_start + future_frames * act_dim] = positions
     obs[:, g1_start + future_frames * act_dim : smpl_start - future_frames * 6] = velocities
     obs[:, smpl_start - future_frames * 6 : smpl_start] = rotations
+    teleop_values = torch.arange(teleop_width, dtype=torch.float32) + 300.0
+    obs[:, teleop_start : teleop_start + teleop_width] = teleop_values
 
-    _, g1, _, _ = actor._split(obs)
+    _, g1, _, teleop, _ = actor._split(obs)
 
     pv = torch.cat((positions, velocities)).reshape(future_frames, 2 * act_dim)
     rot = rotations.reshape(future_frames, 6)
     expected = torch.cat((pv, rot), dim=-1).flatten()
     torch.testing.assert_close(g1[0].flatten(), expected)
     torch.testing.assert_close(g1[1].flatten(), expected)
+    # The teleop stream is flat by construction (lower-body block plus
+    # current-frame tail): ``_split`` must pass it through unchanged.
+    torch.testing.assert_close(teleop[0], teleop_values)
+    torch.testing.assert_close(teleop[1], teleop_values)
 
 
 def _tiny_sonic_config() -> TrainConfig:
@@ -229,6 +241,7 @@ def _tiny_sonic_config() -> TrainConfig:
             "algo.variant.model.action_dim=7",
             "algo.variant.model.g1_encoder_hidden_dims=[32,16]",
             "algo.variant.model.smpl_encoder_hidden_dims=[32,16]",
+            "algo.variant.model.teleop_encoder_hidden_dims=[32,16]",
             "algo.variant.model.g1_motion_decoder_hidden_dims=[32,16]",
         ],
     )
@@ -240,14 +253,20 @@ def _sonic_obs_dim(config: TrainConfig) -> int:
     proprioceptive = 3 * action_dim + 6
     g1_reference = 2 * action_dim + 6
     smpl_reference = 24 * 3 + 6 + 2 * 3
+    teleop_reference = model["num_future_frames"] * 24 + 27
     return (
-        model["num_history_frames"] * proprioceptive + model["num_future_frames"] * (g1_reference + smpl_reference) + 2
+        model["num_history_frames"] * proprioceptive
+        + model["num_future_frames"] * (g1_reference + smpl_reference)
+        + teleop_reference
+        + 3
     )
 
 
 def _packed(obs_dim: int, count: int) -> torch.Tensor:
     observations = torch.randn(count, obs_dim)
-    observations[:, -2] = 1.0
+    # Encoder mask columns are [g1, teleop, smpl].
+    observations[:, -3] = 1.0
+    observations[:, -2] = 0.0
     observations[:, -1] = 0.0
     return observations
 
@@ -285,10 +304,19 @@ def test_agent_weights_and_logs_sonic_auxiliary_losses() -> None:
 
     metrics = agent.update(1)
 
-    assert set(metrics) >= {"aux_reconstruction", "aux_latent_alignment", "aux_cycle_consistency", "aux_loss"}
-    assert torch.isfinite(metrics["aux_reconstruction"])
-    assert torch.isfinite(metrics["aux_latent_alignment"])
-    assert torch.isfinite(metrics["aux_cycle_consistency"])
+    assert set(metrics) >= {
+        "aux_g1_recon",
+        "aux_g1_smpl_latent",
+        "aux_reencoded_smpl_g1_latent",
+        "aux_g1_teleop_latent",
+        "aux_teleop_smpl_latent",
+        "aux_loss",
+    }
+    assert torch.isfinite(metrics["aux_g1_recon"])
+    assert torch.isfinite(metrics["aux_g1_smpl_latent"])
+    assert torch.isfinite(metrics["aux_reencoded_smpl_g1_latent"])
+    assert torch.isfinite(metrics["aux_g1_teleop_latent"])
+    assert torch.isfinite(metrics["aux_teleop_smpl_latent"])
     assert torch.isfinite(metrics["aux_loss"])
 
 
