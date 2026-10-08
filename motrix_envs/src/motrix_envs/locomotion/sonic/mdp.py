@@ -247,10 +247,7 @@ def _adaptive_sampling_probabilities(
         kernel = np.asarray([kernel_lambda**i for i in range(kernel_size)], dtype=np.float32)
         kernel /= np.sum(kernel)
         padded = np.pad(probability, (0, kernel_size - 1), mode="edge")
-        probability = np.asarray(
-            [np.sum(padded[index : index + kernel_size] * kernel) for index in range(num_bins)],
-            dtype=np.float32,
-        )
+        probability = np.correlate(padded, kernel, mode="valid")
     total = np.sum(probability)
     if total <= 0.0:
         return np.full((num_bins,), 1.0 / num_bins, dtype=np.float32)
@@ -269,9 +266,17 @@ def _sample_motion_step_from_cdf(
     if sampling_cdf.size == 0:
         step_value = unit * np.float32(num_frames - 1)
     else:
-        bin_id = np.int64(0)
-        while bin_id + 1 < sampling_cdf.size and unit > sampling_cdf[bin_id]:
-            bin_id += 1
+        # Leftmost bin whose CDF mass reaches ``unit``; the CDF is non-decreasing
+        # and ends at 1.0, so the search always terminates inside the array.
+        low = np.int64(0)
+        high = np.int64(sampling_cdf.size) - 1
+        while low < high:
+            mid = (low + high) // np.int64(2)
+            if unit > sampling_cdf[mid]:
+                low = mid + 1
+            else:
+                high = mid
+        bin_id = low
         bin_unit = (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5)
         phase = (np.float32(bin_id) + bin_unit) / np.float32(sampling_cdf.size)
         step_value = phase * np.float32(num_frames)

@@ -744,6 +744,67 @@ def test_sonic_critic_observes_robot_state_and_resets_history() -> None:
     np.testing.assert_array_equal(term.history[1], 0)
 
 
+def test_sonic_adaptive_kernel_matches_reference_smoothing() -> None:
+    """Vectorized kernel smoothing keeps the per-bin probabilities of the loop form."""
+    rng = np.random.default_rng(3)
+    for num_bins, kernel_size in ((1, 3), (4, 3), (30, 1), (30, 2), (30, 7), (500, 3)):
+        for failed in (rng.random(num_bins).astype(np.float32) * 10.0, np.zeros(num_bins, np.float32)):
+            got = mdp._adaptive_sampling_probabilities(
+                failed,
+                np.float32(0.2),
+                np.int64(kernel_size),
+                np.float32(0.8),
+            )
+            kernel = np.asarray([0.8**i for i in range(kernel_size)], np.float32)
+            kernel /= np.sum(kernel)
+            base = failed + np.float32(0.2) / num_bins
+            padded = np.pad(base, (0, kernel_size - 1), mode="edge")
+            want = np.asarray([np.sum(padded[i : i + kernel_size] * kernel) for i in range(num_bins)], np.float32)
+            want = (want / np.sum(want)).astype(np.float32)
+            np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
+            np.testing.assert_allclose(got.sum(), 1.0, rtol=1e-6)
+
+
+def test_sonic_cdf_sampling_matches_linear_walk_reference() -> None:
+    """Binary-search bin selection reproduces the linear walk draw for draw."""
+    from motrix_env_core.numba.manager.rand import initialize_rand_states, next_uniform
+
+    def reference(state, cdf, num_frames, zero_prob):
+        unit = (next_uniform(state) + np.float32(1.0)) * np.float32(0.5)
+        if cdf.size == 0:
+            step_value = unit * np.float32(num_frames - 1)
+        else:
+            bin_id = 0
+            while bin_id + 1 < cdf.size and unit > cdf[bin_id]:
+                bin_id += 1
+            bin_unit = (next_uniform(state) + np.float32(1.0)) * np.float32(0.5)
+            step_value = (np.float32(bin_id) + bin_unit) / np.float32(cdf.size) * np.float32(num_frames)
+        step_value = min(max(step_value, np.float32(0.0)), np.float32(num_frames - 2))
+        step = np.int64(step_value)
+        if (next_uniform(state) + np.float32(1.0)) * np.float32(0.5) < zero_prob:
+            step = np.int64(0)
+        return int(step)
+
+    rng = np.random.default_rng(5)
+    cases = [
+        np.cumsum(np.asarray([0.1, 0.1, 0.6, 0.2], np.float32)),
+        np.ones(1, np.float32),
+        np.full(64, np.float32(1.0 / 64)).cumsum(),  # plateau boundaries
+        rng.dirichlet(np.ones(100_000)).astype(np.float32).cumsum(),
+        np.empty(0, np.float32),  # adaptive sampling disabled
+    ]
+    for cdf in cases:
+        cdf = cdf.astype(np.float32)
+        if cdf.size:
+            cdf[-1] = 1.0
+        for seed in range(300):
+            got = mdp._sample_motion_step_from_cdf(
+                initialize_rand_states(1, seed)[0], cdf, np.int64(2000), np.float32(0.1)
+            )
+            want = reference(initialize_rand_states(1, seed)[0], cdf, 2000, np.float32(0.1))
+            assert got == want, f"cdf size {cdf.size} seed {seed}: {got} != {want}"
+
+
 def test_sonic_dof_vel_divergence_termination() -> None:
     state = mdp.SonicDofVelDivergenceTermination(np.float32(50.0))
     velocity = np.zeros(len(mdp.G1_SONIC_JOINTS), np.float32)
