@@ -25,6 +25,8 @@
   SONIC Manager 环境、packed motion store、专用 FastSAC actor、官方 checkpoint 回放边界、MotrixSim 兼容依据与数据发布门禁。
 - [SONIC BONES-SEED NPZ 语料设计](./sonic-bones-seed-corpus.md)
   SONIC 直接从 NPZ 语料目录训练：`MotionLibrary`（multi-clip infra）拼接带 `ext_smpl_*` 通道的 schema v1 clip，BONES-SEED 发布的 G1 CSV + SMPL PKL 经 `download_bone_seed.py` 流式子集下载与 converter 转换，不经 packed store。
+- [SONIC LAFAN4SONIC NPZ 语料设计](./sonic-lafan4sonic-corpus.md)
+  LAFAN1 → SONIC 语料的独立通路：retarget CSV 与原始 BVH 双通路汇成与 BONES-SEED 同构的 NPZ 语料，bvh→smpl 流程按 xyzw 契约自 UniLab 移植，不改原有 LaFan 路径。
 - [Framework / Task 配置分离设计](./framework-task-split.md)
   训练入口通过 Hydra task group 直接组合环境、算法与运行配置；外部应用使用自己的 Hydra config root，不维护 Python task registry 或额外 config-root 状态。
 - [ConfigClass 配置装饰器设计](./configclass.md)

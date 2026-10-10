@@ -67,6 +67,18 @@ acrobatics such as handstands; the list mirrors gear_sonic, and
 buffer; existing outputs are skipped, so an interrupted run resumes. No
 motion data is bundled with the repository.
 
+LAFAN1 motion-capture data builds an equivalent corpus (a retarget-CSV pathway
+plus a bvh→smpl pathway over the raw BVHs; ~40 public pairs):
+
+```bash
+python scripts/motion/download_lafan4sonic.py   # raw pairs -> ~/.cache/motrixlab/lafan4sonic
+python scripts/motion/convert_lafan4sonic.py    # corpus -> ~/.cache/motrixlab/lafan4sonic_npz
+```
+
+Train with `SONIC_MOTION_DIR=~/.cache/motrixlab/lafan4sonic_npz`; `:`-joined
+paths mix it with a BONES-SEED corpus. This pathway is independent of the
+single-clip LAFAN baking used by WBT.
+
 ## Small-scale validation
 
 Build a tiny corpus first (a couple of pairs land in minutes), then run the

@@ -50,6 +50,17 @@ python scripts/motion/convert_bones_seed.py --workers 8  # 语料 -> ~/.cache/mo
 （`--filter-keywords=` 关闭）。`--workers N` 起 N 个转换进程，各持一份模型与
 FK buffer；已存在的输出自动跳过，中断后可直接续跑。仓库不捆绑任何动作数据。
 
+也可以用 LAFAN1 动捕数据构建同构语料（retarget CSV 通路 + 原始 BVH 的 bvh→smpl 通路，
+约 40 对公开数据）：
+
+```bash
+python scripts/motion/download_lafan4sonic.py   # 原始对 -> ~/.cache/motrixlab/lafan4sonic
+python scripts/motion/convert_lafan4sonic.py    # 语料 -> ~/.cache/motrixlab/lafan4sonic_npz
+```
+
+随后以 `SONIC_MOTION_DIR=~/.cache/motrixlab/lafan4sonic_npz` 训练；`:` 拼接多个目录可与
+BONES-SEED 语料混用。该路径独立于 WBT 所用的 LaFan 单 clip 烘焙，互不影响。
+
 ## 小规模验证
 
 先构建一个小语料（小预算几分钟即可拿到少量配对），再用同一个 `g1-sonic` 配置，
