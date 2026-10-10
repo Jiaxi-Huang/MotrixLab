@@ -312,9 +312,7 @@ class SonicActor(nn.Module):
     def action_bias(self) -> torch.Tensor:
         return self.policy_head.action_bias
 
-    def _split(
-        self, obs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _split(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Slice the packed observation ``[actor history | g1 | smpl | teleop | mask]``.
 
         The G1 and SMPL command terms are emitted feature-major ([all joint
@@ -338,7 +336,7 @@ class SonicActor(nn.Module):
         actor_obs = obs[:, :g1_start]
         g1_flat = obs[:, g1_start:smpl_start]
         smpl_flat = obs[:, smpl_start:teleop_start]
-        teleop = obs[:, teleop_start:teleop_start + cfg.teleop_input_dim]
+        teleop = obs[:, teleop_start : teleop_start + cfg.teleop_input_dim]
         encoder_index = obs[:, teleop_start + cfg.teleop_input_dim :]
         g1_command_frame_dim = cfg.g1_frame_dim - SONIC_ROTATION_REPRESENTATION_DIM
         g1_command_width = cfg.num_future_frames * g1_command_frame_dim

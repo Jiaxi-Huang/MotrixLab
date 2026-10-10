@@ -320,6 +320,15 @@ def test_agent_weights_and_logs_sonic_auxiliary_losses() -> None:
     assert torch.isfinite(metrics["aux_loss"])
 
 
+def test_sonic_task_disables_observation_normalization() -> None:
+    # Upstream raw-input contract (gear_sonic ``running_mean_std: false``;
+    # UniLab flashsac ``obs_normalization: false``): the canonical sonic task
+    # feeds packed observations to the tokenizer and critic unnormalized so
+    # the auxiliary losses live in raw units.
+    config = _compose("g1-sonic/motrix.fastsac", [])
+    assert config.algo.agent.obs_normalization is False
+
+
 def test_default_variant_has_no_auxiliary_metrics() -> None:
     from motrix_rl.fastsac.agent import FastSacAgent
 

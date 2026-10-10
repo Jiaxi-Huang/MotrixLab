@@ -39,6 +39,10 @@ algo:
       teleop_smpl_latent: 1.0
       reencoded_smpl_g1_latent: 1.0
   agent:
+    # Upstream raw-input contract (gear_sonic ``running_mean_std: false``,
+    # UniLab ``obs_normalization: false``): aux losses and FSQ latents live in
+    # raw units. Keep off unless deviating from upstream on purpose.
+    obs_normalization: false
     # Keep the generic FastSAC contract aligned with g1-wbt-dance. SONIC only
     # owns its policy variant and the resource-constrained batch size below.
     target_entropy_ratio: 0.5
