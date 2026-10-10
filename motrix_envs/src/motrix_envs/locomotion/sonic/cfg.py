@@ -127,13 +127,6 @@ class SonicResetCfg(ManagerResetCfg):
 class SonicManagerEnvCfg(ManagerBasedEnvCfg):
     ctrl_dt: float = 0.02
     max_episode_seconds: float | None = 10.0
-    # MotrixSim has no IsaacLab-style per-joint velocity clamp, so a diverged
-    # constraint solve can emit astronomical single-step penalties (observed
-    # 1e10-scale anti_shake / feet_acc / dof-limit spikes) before the
-    # dof-velocity termination cuts the episode. Bounding the summed reward
-    # keeps those garbage transitions out of the replay buffer and the return
-    # logs; sane per-step rewards stay below ~0.2.
-    reward_clip: float = 1.0
     queries: SimQueriesCfg = SimQueriesCfg(
         model={
             "actuator_kp": ActuatorKpQuery(),

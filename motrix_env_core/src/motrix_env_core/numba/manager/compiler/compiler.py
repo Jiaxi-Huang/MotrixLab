@@ -164,13 +164,6 @@ class NumbaKernelCompiler:
         command_resets = self._resolve_command_hooks("reset_env")
         observation_terms, observation_layout = self._resolve_observations(observation_groups)
         reward_invocations, reward_layout, reward_weights = self._resolve_rewards(self._env.cfg, reward_terms)
-        reward_clip = self._env.cfg.reward_clip
-        if reward_clip is not None and (not np.isfinite(reward_clip) or reward_clip <= 0.0):
-            raise ValueError(f"Manager reward_clip must be a positive finite number or None, got {reward_clip!r}.")
-        # The clip is baked into the generated evaluate kernel as a literal,
-        # so it must participate in the evaluate plan key: a stale cached
-        # kernel would silently keep the previous bound.
-        self._evaluate_parts.append(("rewards", "reward_clip", reward_clip))
         termination_invocations, termination_layout = self._resolve_terminations(termination_terms)
         reset_invocations = self._resolve_resets()
         per_env_metric_layout = tuple(
@@ -212,7 +205,6 @@ class NumbaKernelCompiler:
             command_advances,
             command_resets,
             reset_invocations,
-            reward_clip=reward_clip,
         )
         kernels: dict[str, Any] = {}
         generated_filenames: dict[str, str] = {}

@@ -470,33 +470,6 @@ def test_reset_descriptor_is_part_of_numba_kernel_cache_key(_isolated_numba_cach
     assert first.manager_layout.plan_keys == second.manager_layout.plan_keys
 
 
-def test_reward_clip_bounds_diverged_step_totals() -> None:
-    cfg = _ManagerEnvCfg(
-        rewards=_ManagerRewardsCfg(source=_InjectedRewardCfg(weight=1e12)),
-        reward_clip=1.0,
-    )
-    env = ManagerEnv(cfg, num_envs=2)
-    state = env.step(np.ones((env.num_envs, 1), dtype=np.float32))
-
-    # The summed per-step reward is clamped to the configured bound while the
-    # per-term buffer keeps the unclamped value for observability.
-    np.testing.assert_allclose(state.reward, 1.0)
-    assert np.all(state.reward_terms["source"] > 1e6)
-
-    # The clip is baked into the evaluate kernel as a literal, so changing it
-    # must change the evaluate plan key; a stale cached kernel would keep the
-    # previous bound.
-    other = ManagerEnv(
-        _ManagerEnvCfg(
-            rewards=_ManagerRewardsCfg(source=_InjectedRewardCfg(weight=1e12)),
-            reward_clip=2.0,
-        ),
-        num_envs=1,
-    )
-    other.init_state()
-    assert env.manager_layout.plan_keys[0] != other.manager_layout.plan_keys[0]
-
-
 @njit(inline="always")
 def _fingerprint_helper(x):
     return x + 1.0
