@@ -133,6 +133,11 @@ class ManagerBasedEnvCfg(EnvCfg):
     observations: dict[str, dict[str, ObservationTermCfg]] = field(default_factory=dict)
     rewards: dict[str, RewardTermCfg] = field(default_factory=dict)
     terminations: dict[str, TerminationTermCfg] = field(default_factory=dict)
+    # Optional bound on the per-step summed reward magnitude. Simulator
+    # divergence can emit astronomical single-step penalties before a
+    # termination cuts the episode; clamping the total keeps those garbage
+    # transitions out of replay buffers and return logs. None disables it.
+    reward_clip: float | None = None
 
     def command_cfgs(self) -> dict[str, CommandCfg]:
         return _manager_group_to_dict(self.commands, ManagerCommandsCfg, CommandCfg, label="command")

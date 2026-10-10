@@ -29,6 +29,7 @@ class KernelSourceGenerator:
         command_advances: tuple[PreparedInvocation, ...],
         command_resets: tuple[PreparedInvocation, ...],
         reset: tuple[ResolvedSimReset, ...],
+        reward_clip: float | None = None,
     ) -> tuple[str, str, str]:
         evaluate_lane_body, observe_lane_body = self._generate_lane_bodies(
             observations,
@@ -37,6 +38,7 @@ class KernelSourceGenerator:
             terminations,
             command_updates,
             command_advances,
+            reward_clip,
         )
         evaluate_source = self._evaluate_module(evaluate_lane_body, context)
         observe_source = self._observe_module(observe_lane_body, context)
@@ -138,6 +140,7 @@ class KernelSourceGenerator:
         terminations: tuple[PreparedInvocation, ...],
         command_updates: tuple[PreparedInvocation, ...],
         command_advances: tuple[PreparedInvocation, ...],
+        reward_clip: float | None = None,
     ) -> tuple[list[str], list[str]]:
         """Emit straight-line local helpers that Numba inlines during the kernel frontend pass.
 
@@ -158,7 +161,14 @@ class KernelSourceGenerator:
                     f"total_reward += weighted_reward_{index}",
                 ]
             )
-        evaluate_lines.append("reward[env_id] = total_reward")
+        if reward_clip is None:
+            evaluate_lines.append("reward[env_id] = total_reward")
+        else:
+            # Bound the summed per-step reward so a diverged simulator step
+            # cannot inject astronomical penalties downstream; the per-term
+            # buffers above stay unclamped for observability.
+            bound = repr(float(reward_clip))
+            evaluate_lines.append(f"reward[env_id] = min(max(total_reward, -{bound}), {bound})")
         evaluate_lines.append("is_terminated = False")
         for index, term in enumerate(terminations):
             evaluate_lines.extend(
