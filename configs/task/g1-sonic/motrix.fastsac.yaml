@@ -43,8 +43,15 @@ algo:
     # UniLab ``obs_normalization: false``): aux losses and FSQ latents live in
     # raw units. Keep off unless deviating from upstream on purpose.
     obs_normalization: false
-    # Keep the generic FastSAC contract aligned with g1-wbt-dance. SONIC only
-    # owns its policy variant and the resource-constrained batch size below.
+    # Upstream control trunks are 6-layer wide MLPs ([2048,2048,1024,1024,512,512],
+    # ~10M params; UniLab flashsac ~5M). The generic fast_sac 3-layer funnel head
+    # at 512 is ~0.44M — an order of magnitude smaller. Widen both for the
+    # capacity experiment; revert if tracking stays flat (points to exploration
+    # instead).
+    actor_hidden_dim: 2048
+    critic_hidden_dim: 2048
+    # Beyond the trunk widths above, SONIC only owns its policy variant and the
+    # resource-constrained batch size below.
     target_entropy_ratio: 0.5
     num_atoms: 501
     gamma: 0.99
