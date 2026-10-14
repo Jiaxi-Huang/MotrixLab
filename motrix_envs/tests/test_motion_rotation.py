@@ -128,7 +128,11 @@ def test_rotation_serves_each_clip_once_per_pass(corpus):
     clip, rotator = _build(corpus)
     term = _term(clip, rotator)
     all_tags = {float(index + 1) for index in range(len(_FRAMES))}
-    seen: set[float] = set()
+    corpus_size = len(_FRAMES)
+    # Window 0 is part of the pass: the next window must not repeat it (the
+    # permutation cursor starts past the build-time prefix).
+    assert rotator.pass_coverage == pytest.approx(2 / corpus_size)
+    seen: set[float] = _active_tags(clip, rotator)
     for target in range(1, 12):
         term.steps[:] = rotator.active_base
         _drive(rotator, term, until_window=target)
@@ -288,6 +292,8 @@ def test_sonic_env_rotates_windows_while_stepping(tmp_path):
         assert np.isfinite(state.obs.value).all()
         assert float(np.max(state.metrics["motion_step"])) < capacity
     assert rotator.window_index >= 2
+    assert 0.0 < state.metrics["motion_rotation_coverage"] <= 1.0
+    assert state.metrics["motion_rotation_window"] >= 2
     base, frames = int(motion.window_range[0]), int(motion.window_range[1])
     assert 0 <= base and base + frames <= capacity
     assert motion.clip.frame_clip_end[base] <= base + frames - 1

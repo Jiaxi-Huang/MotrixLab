@@ -48,7 +48,12 @@ class SonicManagerEnv(ManagerEnv):
     def step(self, actions):
         result = super().step(actions)
         if self._motion_rotation is not None:
-            self._motion_rotation[1].tick(self._motion_rotation[0])
+            term, rotator = self._motion_rotation
+            rotator.tick(term)
+            # Scalars ride the step metrics into the trainer's
+            # ``metrics/*`` TensorBoard curves.
+            result.metrics["motion_rotation_window"] = float(rotator.window_index)
+            result.metrics["motion_rotation_coverage"] = rotator.pass_coverage
         return result
 
 

@@ -96,7 +96,11 @@ class CorpusRotator:
         self._entries = entries
         self._order = order
         self._rng = rng
-        self._cursor = 0
+        # Window 0 already consumed the permutation prefix during build.
+        self._cursor = window_clips
+        # Entries consumed from the permutation within the current pass;
+        # resets when the permutation wraps and reshuffles.
+        self._pass_consumed = window_clips
         self._frame_budget = frame_budget
         self._window_clips = window_clips
         self._period = period
@@ -222,6 +226,11 @@ class CorpusRotator:
         """Number of published rotations; the first resident window is 0."""
         return self._window_index
 
+    @property
+    def pass_coverage(self) -> float:
+        """Fraction of the corpus consumed in the current permutation pass."""
+        return self._pass_consumed / len(self._entries)
+
     # ------------------------------------------------------------------
     # Per-step driver
     # ------------------------------------------------------------------
@@ -301,11 +310,13 @@ class CorpusRotator:
     def _next_entry(self) -> Path:
         entry = self._entries[int(self._order[self._cursor])]
         self._cursor += 1
+        self._pass_consumed += 1
         if self._cursor >= len(self._order):
             # One pass over the corpus is complete; reshuffle and start the
             # next pass from the continuing seeded stream.
             self._order = self._rng.permutation(len(self._entries))
             self._cursor = 0
+            self._pass_consumed = 0
         return entry
 
     def _retired_half_drained(self, steps: np.ndarray) -> bool:
@@ -345,13 +356,14 @@ class CorpusRotator:
         self._last_swap_tick = self._ticks
         logger.info(
             "Motion rotation: window %d published (%d clips, %d frames at base %d; "
-            "decode+stage %d ticks, drain %d ticks).",
+            "decode+stage %d ticks, drain %d ticks, pass coverage %.1f%%).",
             self._window_index,
             self._pending_clips,
             frames,
             base,
             self._staging_started_tick - self._decode_started_tick,
             self._ticks - self._staging_started_tick,
+            100.0 * self.pass_coverage,
         )
 
     def _decode_or_skip(self, path: Path) -> WbtMotionClip | None:
