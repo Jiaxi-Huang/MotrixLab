@@ -49,11 +49,11 @@ algo:
     num_atoms: 501
     #max_grad_norm: 1.0
     #learning_starts: 100
-    buffer_size: 4096
+    buffer_size: 2048
   trainer:
     num_learning_iterations: 500000
     async_options:
-      utd_mode: strict
+      utd_mode: learner_bound
       num_collectors: 4
       num_learners: 2
       ring_capacity: 128

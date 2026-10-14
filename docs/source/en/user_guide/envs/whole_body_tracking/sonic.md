@@ -29,9 +29,17 @@ policy head.
 The `g1-sonic` policy observation has width 1355 (with `num_future_frames=5`;
 the G1/SMPL blocks scale linearly with that value and the teleop block adds a
 constant 27-wide current-frame tail) and the privileged value observation has
-width 890. Actions are 29 normalized joint-position targets; the environment
-action term owns action scaling and offsets, so the FastSAC actor keeps an
-identity action affine.
+width 1220. The value observation merges the gear_sonic and MimicLite critic
+contracts: per-future-frame reference joint positions and velocities plus the
+reference root pose in the robot root frame (MimicLite
+`ref_root_*_future_b`), MimicLite-style per-body reference-minus-actual
+differences (position, 6D orientation, and world-frame linear/angular
+velocities over all tracked bodies at diff steps `[0, 1]`, each side
+canonicalized in the projected-yaw frame of its own pelvis anchor), and the
+windowed proprioception history (`lin_vel | ang_vel | joint_pos | joint_vel |
+action` per frame). Actions are 29 normalized joint-position targets; the
+environment action term owns action scaling and offsets, so the FastSAC actor
+keeps an identity action affine.
 
 ## Data and execution
 

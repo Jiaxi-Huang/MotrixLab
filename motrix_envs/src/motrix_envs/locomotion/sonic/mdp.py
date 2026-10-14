@@ -182,6 +182,10 @@ SONIC_ROOT_BODY_INDEX = 0  # ``pelvis`` is the first tracked body in SONIC order
 # lower-body block shares the G1 grid.
 G1_FUTURE_STRIDE = 5
 SMPL_FUTURE_STRIDE = 1
+# Critic body-diff steps (MimicLite ``diff_future_steps`` release value): the
+# current frame and the next clip frame (one 50 Hz control step, clip-frame
+# granularity — not the G1-stride reference grid).
+SONIC_CRITIC_DIFF_STEPS = (0, 1)
 # Temporal depths are independent: future frames size the G1/SMPL/teleop
 # reference encoders, while history frames size actor proprioception and critic
 # history. Both must stay aligned with the SONIC policy model recipe.
@@ -939,8 +943,50 @@ class SonicEncoderIndexObservationCfg(ObservationTermCfg):
         return ObsTerm(motion.encoder_index.shape[1], SonicEncoderIndexObservation.compute)
 
 
+@njit(inline="always")
+def _projected_yaw_quat(quaternion: np.ndarray, out: np.ndarray, x_axis: np.ndarray, z_axis: np.ndarray) -> None:
+    """Build a level yaw-only quaternion from a full orientation.
+
+    Port of MimicLite ``projected_yaw_quat``: the heading comes from the x-axis
+    world projection, falling back to the z-axis projection (sign-flipped when
+    the x-axis points downward) so the heading stays continuous near-vertical.
+    Both scratch vectors are caller-owned to keep the fused-kernel lane
+    allocation-free.
+    """
+    rotate_vector(quaternion, (1.0, 0.0, 0.0), x_axis)
+    rotate_vector(quaternion, (0.0, 0.0, 1.0), z_axis)
+    heading_x = x_axis[0]
+    heading_y = x_axis[1]
+    if heading_x * heading_x + heading_y * heading_y <= 0.01:
+        heading_x = z_axis[0]
+        heading_y = z_axis[1]
+        if x_axis[2] < 0.0:
+            heading_x = -heading_x
+            heading_y = -heading_y
+    yaw = math.atan2(heading_y, heading_x)
+    out[0] = 0.0
+    out[1] = 0.0
+    out[2] = math.sin(yaw * 0.5)
+    out[3] = math.cos(yaw * 0.5)
+
+
 @kernel_data
 class SonicCriticObservation:
+    """Merged gear_sonic/MimicLite critic contract.
+
+    Layout (feature-grouped): [future reference on the G1-stride grid —
+    joint pos, joint vel, and the MimicLite ref-root channel (position plus 6D
+    orientation in the robot root frame) per frame | MimicLite body-diff terms
+    — per body and diff step: ref-minus-actual position, 6D orientation,
+    world-frame linear and angular velocity | proprioception history
+    (``lin_vel | ang_vel | joint_pos | joint_vel | action`` per frame)].
+
+    The diff terms canonicalize each side in the projected-yaw frame of its own
+    pelvis anchor (z-zeroed origin), mirroring MimicLite
+    ``_compute_body_diff_obs``; the 6D flattening keeps this repo's
+    first-two-columns convention rather than MimicLite's first-two-rows.
+    """
+
     history: np.ndarray
     seen_reset: np.ndarray
 
@@ -954,42 +1000,93 @@ class SonicCriticObservation:
         step = int(motion.steps[0])
         num_future_frames = int(motion.num_future_frames)
         width = num_future_frames * joint_count
-        for i in range(num_future_frames):
-            future = min(step + G1_FUTURE_STRIDE * i, clip.frame_clip_end[step])
-            start = i * joint_count
-            out[start : start + joint_count] = clip.joint_pos[future]
-            out[width + start : width + start + joint_count] = clip.joint_vel[future]
-        offset = 2 * width
         root_pos = ctx.sim["tracked_body_pos"][motion.reference_index]
         root_quat = ctx.sim["tracked_body_quat"][motion.reference_index]
         inverse = np.empty(4, np.float32)
         relative = np.empty(4, np.float32)
         quat_inverse(root_quat, inverse)
-        # Component tuples avoid one Numba array allocation per subtraction
-        # inside the fused kernel lane.
-        ref_root_pos = clip.reference_body_pos_w[step]
-        rotate_vector(
-            inverse,
-            (ref_root_pos[0] - root_pos[0], ref_root_pos[1] - root_pos[1], ref_root_pos[2] - root_pos[2]),
-            out[offset : offset + 3],
-        )
-        quat_mul(inverse, clip.reference_body_quat_w[step], relative)
-        to_matrix_first_two_columns(relative, out[offset + 3 : offset + 9])
-        offset += 9
-        body_count = clip.tracked_bodies_pos_w.shape[1]
-        tracked_body_pos = ctx.sim["tracked_body_pos"]
-        for i in range(body_count):
-            body_pos = tracked_body_pos[i]
-            start = offset + 3 * i
+        for i in range(num_future_frames):
+            future = min(step + G1_FUTURE_STRIDE * i, clip.frame_clip_end[step])
+            start = i * joint_count
+            out[start : start + joint_count] = clip.joint_pos[future]
+            out[width + start : width + start + joint_count] = clip.joint_vel[future]
+            root_start = 2 * width + i * (SONIC_VECTOR_DIM + SONIC_ROTATION_REPRESENTATION_DIM)
+            # Component tuples avoid one Numba array allocation per subtraction
+            # inside the fused kernel lane.
+            ref_root_pos = clip.reference_body_pos_w[future]
             rotate_vector(
                 inverse,
-                (body_pos[0] - root_pos[0], body_pos[1] - root_pos[1], body_pos[2] - root_pos[2]),
-                out[start : start + 3],
+                (ref_root_pos[0] - root_pos[0], ref_root_pos[1] - root_pos[1], ref_root_pos[2] - root_pos[2]),
+                out[root_start : root_start + SONIC_VECTOR_DIM],
             )
-            start = offset + 3 * body_count + 6 * i
-            quat_mul(inverse, ctx.sim["tracked_body_quat"][i], relative)
-            to_matrix_first_two_columns(relative, out[start : start + 6])
-        offset += 9 * body_count
+            quat_mul(inverse, clip.reference_body_quat_w[future], relative)
+            to_matrix_first_two_columns(
+                relative,
+                out[root_start + SONIC_VECTOR_DIM : root_start + SONIC_VECTOR_DIM + SONIC_ROTATION_REPRESENTATION_DIM],
+            )
+        offset = 2 * width + num_future_frames * (SONIC_VECTOR_DIM + SONIC_ROTATION_REPRESENTATION_DIM)
+        body_count = clip.tracked_bodies_pos_w.shape[1]
+        tracked_body_pos = ctx.sim["tracked_body_pos"]
+        tracked_body_quat = ctx.sim["tracked_body_quat"]
+        ref_yaw = np.empty(4, np.float32)
+        robot_yaw = np.empty(4, np.float32)
+        x_axis = np.empty(3, np.float32)
+        z_axis = np.empty(3, np.float32)
+        _projected_yaw_quat(clip.tracked_bodies_quat_w[step, SONIC_ROOT_BODY_INDEX], ref_yaw, x_axis, z_axis)
+        _projected_yaw_quat(tracked_body_quat[SONIC_ROOT_BODY_INDEX], robot_yaw, x_axis, z_axis)
+        inverse_ref_yaw = np.empty(4, np.float32)
+        inverse_robot_yaw = np.empty(4, np.float32)
+        quat_inverse(ref_yaw, inverse_ref_yaw)
+        quat_inverse(robot_yaw, inverse_robot_yaw)
+        # Each anchor frame keeps its own yaw but zeroes the anchor height,
+        # so the diffs are invariant to global position and heading.
+        ref_anchor_pos = clip.tracked_bodies_pos_w[step, SONIC_ROOT_BODY_INDEX]
+        robot_anchor_pos = tracked_body_pos[SONIC_ROOT_BODY_INDEX]
+        ref_local_pos = np.empty(3, np.float32)
+        ref_local_quat = np.empty(4, np.float32)
+        robot_local_pos = np.empty(3, np.float32)
+        robot_local_quat = np.empty(4, np.float32)
+        inverse_robot_local = np.empty(4, np.float32)
+        num_diff_steps = len(SONIC_CRITIC_DIFF_STEPS)
+        pos_base = offset
+        ori_base = pos_base + SONIC_VECTOR_DIM * num_diff_steps * body_count
+        lin_base = ori_base + SONIC_ROTATION_REPRESENTATION_DIM * num_diff_steps * body_count
+        ang_base = lin_base + SONIC_VECTOR_DIM * num_diff_steps * body_count
+        last = clip.frame_clip_end[step]
+        for k in range(body_count):
+            body_pos = tracked_body_pos[k]
+            rotate_vector(
+                inverse_robot_yaw,
+                (body_pos[0] - robot_anchor_pos[0], body_pos[1] - robot_anchor_pos[1], body_pos[2]),
+                robot_local_pos,
+            )
+            quat_mul(inverse_robot_yaw, tracked_body_quat[k], robot_local_quat)
+            quat_inverse(robot_local_quat, inverse_robot_local)
+            for diff_index in range(num_diff_steps):
+                future = min(step + SONIC_CRITIC_DIFF_STEPS[diff_index], last)
+                ref_pos = clip.tracked_bodies_pos_w[future, k]
+                rotate_vector(
+                    inverse_ref_yaw,
+                    (ref_pos[0] - ref_anchor_pos[0], ref_pos[1] - ref_anchor_pos[1], ref_pos[2]),
+                    ref_local_pos,
+                )
+                quat_mul(inverse_ref_yaw, clip.tracked_bodies_quat_w[future, k], ref_local_quat)
+                index = diff_index * body_count + k
+                for c in range(SONIC_VECTOR_DIM):
+                    out[pos_base + index * SONIC_VECTOR_DIM + c] = ref_local_pos[c] - robot_local_pos[c]
+                    out[lin_base + index * SONIC_VECTOR_DIM + c] = (
+                        clip.tracked_bodies_lin_vel_w[future, k, c] - ctx.sim["tracked_body_linear_velocity"][k, c]
+                    )
+                    out[ang_base + index * SONIC_VECTOR_DIM + c] = (
+                        clip.tracked_bodies_ang_vel_w[future, k, c] - ctx.sim["tracked_body_angular_velocity"][k, c]
+                    )
+                quat_mul(inverse_robot_local, ref_local_quat, relative)
+                ori_start = ori_base + index * SONIC_ROTATION_REPRESENTATION_DIM
+                to_matrix_first_two_columns(
+                    relative,
+                    out[ori_start : ori_start + SONIC_ROTATION_REPRESENTATION_DIM],
+                )
+        offset = ang_base + SONIC_VECTOR_DIM * num_diff_steps * body_count
         history = state.history[ctx.env_id]
         num_history_frames = history.shape[0]
         reset = state.seen_reset[ctx.env_id] != motion.reset_counter[0]
@@ -1026,11 +1123,13 @@ class SonicCriticObservationCfg(ObservationTermCfg):
         joint_count = motion.clip.joint_pos.shape[1]
         body_count = motion.clip.tracked_bodies_pos_w.shape[1]
         actor_frame_dim = _sonic_actor_frame_dim(joint_count)
-        current_frame_dim = 9 + body_count * 9
-        future_reference_frame_dim = 2 * joint_count
+        future_reference_frame_dim = 2 * joint_count + SONIC_VECTOR_DIM + SONIC_ROTATION_REPRESENTATION_DIM
+        body_diff_frame_dim = (
+            len(SONIC_CRITIC_DIFF_STEPS) * body_count * (3 * SONIC_VECTOR_DIM + SONIC_ROTATION_REPRESENTATION_DIM)
+        )
         size = (
-            current_frame_dim
-            + int(motion.num_future_frames) * future_reference_frame_dim
+            int(motion.num_future_frames) * future_reference_frame_dim
+            + body_diff_frame_dim
             + self.num_history_frames * actor_frame_dim
         )
         state = SonicCriticObservation(

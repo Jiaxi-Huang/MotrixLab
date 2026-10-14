@@ -19,9 +19,13 @@ decoder，并用 FastSAC policy head 替代它。
 ## 观察与动作
 
 `g1-sonic` 的 policy observation 宽度为 1355（`num_future_frames=5` 时；G1/SMPL 块随该值
-线性缩放，teleop 块另加 27 维常量当前帧尾部），privileged value observation 宽度为 890。
-动作是 29 维归一化关节位置目标，动作缩放和偏置在环境 action term 内完成；FastSAC actor
-保持 identity action affine。
+线性缩放，teleop 块另加 27 维常量当前帧尾部），privileged value observation 宽度为 1220。
+value observation 合并了 gear_sonic 与 MimicLite 的 critic 契约：逐未来帧的参考关节位置与
+速度加上机器人根系下的参考根位姿（对应 MimicLite `ref_root_*_future_b`）、MimicLite 式逐
+身体"参考−实际"差分（位置、6D 朝向与世界系线/角速度，覆盖全部 tracked 身体，diff 步为
+`[0, 1]`，两侧各在自身 pelvis 锚的投影-yaw 系下规范化），以及滑窗本体感知历史（每帧
+`lin_vel | ang_vel | joint_pos | joint_vel | action`）。动作是 29 维归一化关节位置目标，动作
+缩放和偏置在环境 action term 内完成；FastSAC actor 保持 identity action affine。
 
 ## 数据与运行
 
