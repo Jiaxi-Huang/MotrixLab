@@ -74,10 +74,13 @@ def _make_g1_sonic_cfg() -> SonicManagerEnvCfg:
                 motion_files=motion_files,
                 num_future_frames=num_future_frames,
                 # Stream the full corpus (100k+ clips) through the resident
-                # window: one swap per ~buffer_size control steps keeps the
-                # replay mixture smooth, and the whole corpus is covered once
-                # every ceil(corpus/num_motions) swaps.
-                rotation_period=2048,
+                # window. One swap per 2x buffer_size control steps: every
+                # window's data churns out of the replay buffer before the
+                # next swap arrives (per-transition ~16 draws at UTD 4), and
+                # the ~470 MB window decode fits its period with headroom on
+                # 16 background threads.
+                rotation_period=4096,
+                rotation_workers=16,
             )
         ),
         actions=SonicActionsCfg(

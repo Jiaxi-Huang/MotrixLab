@@ -42,16 +42,19 @@ SONIC_MOTION_DIR=$PWD/data/bones_seed_npz \
 ## 语料轮换
 
 完整语料（10 万+ clip）无法全部常驻内存，因此 `g1-sonic` 通过固定的双窗口帧轴流式消化语料
-（`SonicMotionCommandCfg.rotation_period`，默认 2048 控制步；设 `rotation_period: null` 关闭）。
+（`SonicMotionCommandCfg.rotation_period`，默认 4096 控制步、16 个解码线程；设
+`rotation_period: null` 关闭）。
 每个窗口持有从 seeded 无放回置换中取出的 `num_motions` 个 clip，遍历一遍完整语料需要
 `ceil(语料规模 / num_motions)` 次换窗。窗口解码在后台线程中写入私有 staging 缓冲；发布只是对
 预分配 clip 数组中退役半区的一次原地拷贝——每次换窗一次有界 memcpy，步进路径上没有任何其他开销。
 
 换窗从不强制重置 env：重置采样与 clip 末帧重锚立刻使用新窗口，仍在跟踪旧窗口的 lane 会跑到
 其自然的 episode 结束，且退役半区仅在没有 lane 再引用它之后才会被覆写。对 off-policy replay 而言，
-这使每次换窗都成为平缓的混合比变化——一个好的默认值是每 `buffer_size` 控制步换窗一次，使
-replay 分布的更替速度与常驻窗口一致。adaptive sampling 的失败率 bin 是窗口局部的，每次换窗清零。
-小于一个窗口的语料根会回退到普通的常驻加载，冒烟语料不受影响。
+这使每次换窗都成为平缓的混合比变化——一个好的默认值是每 1–2 个 `buffer_size` 控制步换窗一次：
+取 `buffer_size` 时 buffer 永远混合两个窗口，取 `2 × buffer_size`（`g1-sonic` 默认）时每个窗口的
+数据在下次换窗前完整离开 buffer，每窗都能得到完整的消化。根据 publish 日志校准：窗口解码耗时应
+明显小于 period，排空等待应低于 episode 长度上界。adaptive sampling 的失败率 bin 是窗口局部的，
+每次换窗清零。小于一个窗口的语料根会回退到普通的常驻加载，冒烟语料不受影响。
 
 ## 构建语料
 
