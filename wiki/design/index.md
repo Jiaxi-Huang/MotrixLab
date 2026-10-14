@@ -22,7 +22,13 @@
 - [FastSAC 异构（Collector/Learner 分进程）训练器设计](./fastsac-async-heterogeneous-trainer.md)
   把仿真采样与网络训练拆到两进程、经共享内存交换数据的异构 FastSAC 训练器：统一注册为 `motrix.fastsac`，由 `algo.asynchronous` 选择执行拓扑，并包含 SPSC 有界背压 replay 环、update-to-data 比例治理、seqlock 双缓冲权重/normalizer 快照，以及进程生命周期与 checkpoint 兼容。
 - [训练实时指标（Live Metrics）设计](./live-metrics.md)
-  设置 `MOTRIX_METRICS_URL` 后训练进程把 `motrix.metrics/v1` 记录同时写入 `run_dir/metrics.jsonl` 并批量推送给兼容的 ingest 服务：公开协议（环境变量、记录格式、状态机、幂等、重试规则）、规范 key 与 FastSAC/SKRL/RSLRL 映射、控制平面 `MetricsLogger` 与生命周期接入、失败语义与测试策略。
+  设置 `MOTRIX_METRICS_URL` 后训练进程通过 HTTP 推送 `motrix.metrics/v1` 记录；设置 `MOTRIX_METRICS_JSONL=1` 时另写入 `run_dir/metrics.jsonl`。涵盖协议、FastSAC 接入、失败语义与测试策略。
+- [SONIC G1 任务迁移设计](./sonic-g1-task.md)
+  SONIC Manager 环境、NPZ 动作语料、专用 FastSAC actor、checkpoint 回放边界、MotrixSim 兼容依据与数据发布门禁。
+- [SONIC BONES-SEED NPZ 语料设计](./sonic-bones-seed-corpus.md)
+  SONIC 直接从 NPZ 语料目录训练：`MotionLibrary`（multi-clip infra）拼接带 `ext_smpl_*` 通道的 schema v1 clip，BONES-SEED 发布的 G1 CSV + SMPL PKL 经 `download_bones_seed.py` 流式子集下载与 converter 转换，不经 packed store。
+- [SONIC LAFAN4SONIC NPZ 语料设计](./sonic-lafan4sonic-corpus.md)
+  LAFAN1 → SONIC 语料的独立通路：retarget CSV 与原始 BVH 双通路汇成与 BONES-SEED 同构的 NPZ 语料，bvh→smpl 流程按 xyzw 契约自 UniLab 移植，不改原有 LaFan 路径。
 - [Framework / Task 配置分离设计](./framework-task-split.md)
   训练入口通过 Hydra task group 直接组合环境、算法与运行配置；外部应用使用自己的 Hydra config root，不维护 Python task registry 或额外 config-root 状态。
 - [ConfigClass 配置装饰器设计](./configclass.md)

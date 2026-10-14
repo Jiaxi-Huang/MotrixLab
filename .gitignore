@@ -1,6 +1,8 @@
 __pycache__
 runs
 outputs
+/artifacts/
+/data/sonic/lafan1-packed/
 .pdm-python
 logs
 .idea

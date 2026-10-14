@@ -127,6 +127,51 @@ def test_library_directory_expands_npz_in_sorted_order(tmp_path):
     np.testing.assert_array_equal(clip.frame_clip_end, [4] * 5 + [7] * 3)
 
 
+def test_library_num_motions_draws_deterministic_sorted_subsample(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for i in range(6):
+        _write_motion_npz(corpus / f"clip_{i}.npz", num_frames=3 + i)
+
+    subsampled = MotionLibrary([corpus], num_motions=3, **_TASK_ORDER)
+    again = MotionLibrary([corpus], num_motions=3, **_TASK_ORDER)
+    names = [entry.name for entry in subsampled.entries]
+    assert names == [entry.name for entry in again.entries]
+    # The draw matches the seeded reference and keeps the corpus sort order.
+    picked = sorted(np.random.default_rng(0).choice(6, size=3, replace=False))
+    assert names == [f"clip_{i}.npz" for i in picked]
+    assert names == sorted(names)
+    # Boundaries of the assembled clip reflect only the selected files, whose
+    # frame counts grow with their index (clip_i has 3 + i frames).
+    boundaries = []
+    offset = 0
+    for i in picked:
+        boundaries += [offset + 3 + i - 1] * (3 + i)
+        offset += 3 + i
+    np.testing.assert_array_equal(subsampled.assemble().frame_clip_end, boundaries)
+
+
+def test_library_num_motions_at_or_above_corpus_size_loads_all(tmp_path):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name in ("a.npz", "b.npz", "c.npz"):
+        _write_motion_npz(corpus / name, num_frames=4)
+    exact = MotionLibrary([corpus], num_motions=3, **_TASK_ORDER)
+    larger = MotionLibrary([corpus], num_motions=10, **_TASK_ORDER)
+    assert [entry.name for entry in exact.entries] == ["a.npz", "b.npz", "c.npz"]
+    assert [entry.name for entry in larger.entries] == ["a.npz", "b.npz", "c.npz"]
+    assert exact.assemble().joint_pos.shape == (12, 2)
+
+
+@pytest.mark.parametrize("num_motions", [0, -2])
+def test_library_rejects_non_positive_num_motions(tmp_path, num_motions):
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    _write_motion_npz(corpus / "a.npz", num_frames=4)
+    with pytest.raises(ValueError, match="num_motions must be a positive integer"):
+        MotionLibrary([corpus], num_motions=num_motions, **_TASK_ORDER)
+
+
 def test_library_loads_only_declared_extension_channels(tmp_path):
     _write_motion_npz(
         tmp_path / "a.npz",

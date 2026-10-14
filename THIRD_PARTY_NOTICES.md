@@ -30,7 +30,8 @@ separately downloaded optional asset.
 The following are installed from external distributions and remain under their
 own licenses: MotrixSim, MuJoCo, Gymnasium, NumPy, Numba, nvidia-ml-py (NVML
 bindings used for training-panel GPU metrics), Hydra/OmegaConf,
-SKRL, RSL-RL, PyTorch/JAX, ONNX Runtime, TensorBoard, and the Unitree SDK2
+SKRL, RSL-RL, PyTorch/JAX, ONNX Runtime, TensorBoard, vector-quantize-pytorch,
+and the Unitree SDK2
 Python package. Their licenses are not replaced by the MotrixLab license.
 The release process should generate a dependency license report from the final
 lock file (for example with `pip-licenses`) and attach it to each release.

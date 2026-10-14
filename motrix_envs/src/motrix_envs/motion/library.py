@@ -64,6 +64,8 @@ class MotionLibrary:
         root_body_name: str,
         fps: int,
         extension_channels: tuple[str, ...] = (),
+        num_motions: int | None = None,
+        sample_seed: int = 0,
     ) -> None:
         """Configure the corpus.
 
@@ -76,8 +78,13 @@ class MotionLibrary:
             fps: Control rate every clip must be recorded at.
             extension_channels: Names (without the ``ext_`` prefix) of channels
                 to load from every file; undeclared channels are not loaded.
+            num_motions: Randomly subsample the expanded corpus to this many
+                clips before loading; ``None`` loads everything. The draw is
+                deterministic for a fixed ``sample_seed``.
+            sample_seed: Seed driving the ``num_motions`` subsample.
         """
-        self.entries = expand_motion_paths(paths)
+        entries = expand_motion_paths(paths)
+        self.entries = subsample_motion_entries(entries, num_motions, sample_seed)
         self.joint_names = joint_names
         self.tracked_body_names = tracked_body_names
         self.reference_body_name = reference_body_name
@@ -163,6 +170,20 @@ def expand_motion_paths(paths: Sequence[str | Path]) -> tuple[Path, ...]:
     if not entries:
         raise ValueError("No motion files were found in the given sources.")
     return tuple(entries)
+
+
+def subsample_motion_entries(entries: tuple[Path, ...], num_motions: int | None, sample_seed: int) -> tuple[Path, ...]:
+    """Deterministically subsample the expanded corpus to ``num_motions`` clips.
+
+    The selected files keep the corpus's sorted order, so the assembled clip
+    and its ``frame_clip_end`` layout stay reproducible run to run.
+    """
+    if num_motions is None or num_motions >= len(entries):
+        return entries
+    if num_motions <= 0:
+        raise ValueError(f"num_motions must be a positive integer, got {num_motions}.")
+    picked = np.random.default_rng(sample_seed).choice(len(entries), size=num_motions, replace=False)
+    return tuple(entries[i] for i in sorted(picked))
 
 
 __all__ = ["MotionLibrary"]

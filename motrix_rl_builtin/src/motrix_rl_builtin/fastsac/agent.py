@@ -21,8 +21,9 @@ import torch.nn.functional as F
 from torch import nn, optim
 
 from motrix_rl_builtin.fastsac.buffer import EmpiricalNormalization, SimpleReplayBuffer
-from motrix_rl_builtin.fastsac.config import FastSacAgentCfg
-from motrix_rl_builtin.fastsac.networks import Actor, Critic
+from motrix_rl_builtin.fastsac.config import FastSacCfg
+from motrix_rl_builtin.fastsac.factory import make_actor, resolve_policy_variant
+from motrix_rl_builtin.fastsac.networks import Critic
 from motrix_rl_builtin.fastsac.window_metrics import WindowMetrics
 
 
@@ -33,7 +34,7 @@ class FastSacAgent:
         critic_obs_dim: int,
         act_dim: int,
         num_envs: int,
-        cfg: FastSacAgentCfg,
+        cfg: FastSacCfg,
         device: torch.device,
         action_scale: torch.Tensor | None = None,
         action_bias: torch.Tensor | None = None,
@@ -56,7 +57,8 @@ class FastSacAgent:
         ``final_obs_bootstrap`` enables the replay buffer's terminal-observation
         storage for time-limit-truncated bootstrapping.
         """
-        self.cfg = cfg
+        self.cfg = cfg.agent
+        self._provider_cfg = cfg
         self.device = device
         self.world_size = world_size
         self.obs_dim = obs_dim
@@ -64,6 +66,7 @@ class FastSacAgent:
         self.act_dim = act_dim
         self.num_envs = num_envs
         self.writer = writer
+        self.policy_variant = resolve_policy_variant(cfg.policy_variant)
         self.global_step = 0
         # Persistent gradient-update counter shared by all trainers. Used for
         # policy_frequency gating (so the actor/Q ratio is exactly 1/policy_freq
@@ -76,18 +79,14 @@ class FastSacAgent:
         # drains them at a logging boundary.
         self.window_metrics = WindowMetrics()
 
-        self.actor = Actor(
-            n_obs=obs_dim,
-            n_act=act_dim,
-            hidden_dim=cfg.actor_hidden_dim,
-            log_std_max=cfg.log_std_max,
-            log_std_min=cfg.log_std_min,
-            use_tanh=cfg.use_tanh,
-            use_layer_norm=cfg.use_layer_norm,
+        self.actor = make_actor(
+            cfg,
+            dims=(obs_dim, act_dim),
             action_scale=action_scale,
             action_bias=action_bias,
             device=device,
         )
+        cfg = self.cfg
         critic_kwargs = dict(
             n_obs=critic_obs_dim,
             n_act=act_dim,
@@ -124,7 +123,12 @@ class FastSacAgent:
         self.alpha_optimizer = optim.AdamW([self.log_alpha], lr=cfg.alpha_learning_rate, betas=(0.9, 0.95), fused=fused)
 
         if cfg.obs_normalization:
-            self.obs_normalizer: nn.Module = EmpiricalNormalization(shape=obs_dim, device=device)
+            selector_dims = self.policy_variant.passthrough_dims(self._provider_cfg)
+            self.obs_normalizer: nn.Module = EmpiricalNormalization(
+                shape=obs_dim, device=device, passthrough_dims=selector_dims
+            )
+            # The critic observes the same normalized world (its privileged obs
+            # mixes meter / rad / rad-s blocks, ~200x std spread).
             self.critic_obs_normalizer: nn.Module = EmpiricalNormalization(shape=critic_obs_dim, device=device)
         else:
             self.obs_normalizer = nn.Identity()
@@ -318,7 +322,11 @@ class FastSacAgent:
     def _actor_backward(self, b: dict):
         """Pure-compute half of the actor update: forward + backward only."""
         with self._autocast():
-            actions, log_probs = self._actor_runtime.get_actions_and_log_probs(b["obs"])
+            actions, log_probs, variant_loss, variant_metrics = self.policy_variant.policy_update(
+                self._actor_runtime,
+                b["obs"],
+                self._provider_cfg,
+            )
             q_outputs = self._qnet_runtime(b["critic_obs"], actions)
             q_values = self._qnet_runtime.get_value(F.softmax(q_outputs, dim=-1))
             # Use the minimum expected Q across critic heads rather than their
@@ -328,14 +336,14 @@ class FastSacAgent:
             # g1-wbt-dance Q-min + final-observation ablation was more stable
             # than Q-mean + final-observation, without a hard actor-mean clamp.
             qf_value = q_values.min(dim=0).values
-            actor_loss = (self.log_alpha.exp().detach() * log_probs - qf_value).mean()
+            actor_loss = (self.log_alpha.exp().detach() * log_probs - qf_value).mean() + variant_loss
 
         self.actor_optimizer.zero_grad(set_to_none=True)
         actor_loss.backward()
-        return actor_loss.detach().float().clone(), (-log_probs.mean()).detach().float().clone()
+        return actor_loss.detach().float().clone(), (-log_probs.mean()).detach().float().clone(), variant_metrics
 
     def _update_pol(self, b: dict):
-        actor_loss, neg_logp = self._actor_backward_runtime(b)
+        actor_loss, neg_logp, variant_metrics = self._actor_backward_runtime(b)
         # The policy loss backpropagates into BOTH the actor and the critic (the
         # critic's q_values feed the objective); averaging both keeps every
         # rank's parameters identical, matching what DDP would sync.
@@ -344,6 +352,8 @@ class FastSacAgent:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.window_metrics.add("policy_entropy", neg_logp, track_range=True)
         self.window_metrics.add("actor_loss", actor_loss)
+        for key, value in variant_metrics.items():
+            self.window_metrics.add(key, value)
         self.actor_optimizer.step()
         return actor_loss, neg_logp
 
@@ -465,6 +475,8 @@ class FastSacAgent:
             "alpha_optimizer": self.alpha_optimizer.state_dict(),
             "global_step": self.global_step,
             "update_idx": self.update_idx,
+            "policy_variant": self.policy_variant.name,
+            "policy_variant_metadata": self.policy_variant.checkpoint_metadata(self._provider_cfg),
         }
 
     def load_state_dict(self, ckpt: dict, load_optimizers: bool = True) -> None:
@@ -475,6 +487,15 @@ class FastSacAgent:
         serialization) the optimizer states are skipped — the mode for
         inference-only / play loads that don't resume training.
         """
+        self.policy_variant.validate_checkpoint(ckpt)
+        checkpoint_variant = ckpt.get("policy_variant", "default")
+        if not isinstance(checkpoint_variant, str):
+            raise ValueError("FastSAC checkpoint has an invalid policy_variant")
+        if checkpoint_variant != self.policy_variant.name:
+            raise ValueError(
+                f"FastSAC checkpoint policy variant {checkpoint_variant!r} does not match "
+                f"configured variant {self.policy_variant.name!r}"
+            )
         self.actor.load_state_dict(ckpt["actor"])
         self.qnet.load_state_dict(ckpt["qnet"])
         self.qnet_target.load_state_dict(ckpt["qnet_target"])
