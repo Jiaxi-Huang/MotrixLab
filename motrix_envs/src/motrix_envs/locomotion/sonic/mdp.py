@@ -64,6 +64,7 @@ from motrix_envs.locomotion.wbt.mdp.rewards import (
 from motrix_envs.locomotion.wbt.mdp.rewards import (
     UndesiredContactsRewardCfg as UndesiredContactsRewardCfg,
 )
+from motrix_envs.motion.rotation import CorpusRotator
 from motrix_envs.motion.sonic import SonicMotionClip
 
 # Policy joint order: the g1_sonic.xml actuator order (grouped by limb).
@@ -309,6 +310,11 @@ def _update_foot_joint_acceleration(
 @kernel_data
 class SonicMotionCommand(CommandTerm):
     clip: SonicMotionClip
+    # Active rotation window as ``[base, frames]``: reset and clip-end
+    # re-anchoring sample within ``[base, base + frames)`` of the frame axis.
+    # Without rotation this is ``[0, total_frames]`` and every code path is
+    # identical to a fully resident corpus.
+    window_range: SharedArray
     reference_index: np.int64
     target_body_position_relative: np.ndarray
     target_body_orientation_relative: np.ndarray
@@ -394,13 +400,19 @@ class SonicMotionCommand(CommandTerm):
             # With clip_end routing removed, every termination is a failure.
             episode_failed = ctx.terminated[env_ids]
             if np.any(episode_failed):
+                base = self.window_range[0]
+                frames = self.window_range[1]
                 failed_steps = self.steps[env_ids, 0][episode_failed]
-                num_bins = self.adaptive_bin_failed_count.size
-                failed_bins = (failed_steps.astype(np.int64) * num_bins) // max(self.clip.joint_pos.shape[0], 1)
-                failed_bins = np.clip(failed_bins, 0, num_bins - 1)
-                self.adaptive_current_bin_failed_count[:] += np.bincount(failed_bins, minlength=num_bins).astype(
-                    np.float32
-                )
+                # During a rotation swap, lanes still draining the retired
+                # window must not charge failures into the new window's bins.
+                failed_steps = failed_steps[(failed_steps >= base) & (failed_steps < base + frames)]
+                if failed_steps.size:
+                    num_bins = self.adaptive_bin_failed_count.size
+                    failed_bins = ((failed_steps - base) * num_bins) // max(int(frames), 1)
+                    failed_bins = np.clip(failed_bins, 0, num_bins - 1)
+                    self.adaptive_current_bin_failed_count[:] += np.bincount(failed_bins, minlength=num_bins).astype(
+                        np.float32
+                    )
             probabilities = self._sampling_probabilities()
             entropy = -float(np.sum(probabilities * np.log(probabilities + 1e-12)))
             ctx.metrics["adaptive_sampling_entropy"] = entropy / float(np.log(max(probabilities.size, 2)))
@@ -422,10 +434,10 @@ class SonicMotionCommand(CommandTerm):
 
     @dispatch
     def reset_env(self, ctx: ManagerContext) -> None:
-        self.steps[0] = _sample_motion_step_from_cdf(
+        self.steps[0] = self.window_range[0] + _sample_motion_step_from_cdf(
             ctx.rand.state,
             self.sampling_cdf,
-            np.int64(self.clip.joint_pos.shape[0]),
+            self.window_range[1],
             self.start_at_timestep_zero_prob,
         )
         # Seed the finite-difference velocity from the frame the sim reset
@@ -465,10 +477,10 @@ class SonicMotionCommand(CommandTerm):
             # authoritative, and the sim reset terms teleport the robot to the
             # new frame. Episode bookkeeping and action-term state stay
             # untouched, so the episode continues until time-out or failure.
-            self.steps[0] = _sample_motion_step_from_cdf(
+            self.steps[0] = self.window_range[0] + _sample_motion_step_from_cdf(
                 ctx.rand.state,
                 self.sampling_cdf,
-                np.int64(self.clip.joint_pos.shape[0]),
+                self.window_range[1],
                 self.start_at_timestep_zero_prob,
             )
             ctx.sim_reset_requested[0] = True
@@ -492,6 +504,14 @@ class SonicMotionCommandCfg(CommandCfg):
     # whole corpus; None loads everything. Full corpora (100k+ files) spend
     # many minutes in serial decompression, so training runs pin a subsample.
     num_motions: int | None = 1024
+    # Rotate the resident window of ``num_motions`` clips through the full
+    # corpus every this many control steps, for off-policy training where the
+    # whole corpus cannot stay resident. None keeps the startup subsample
+    # fixed for the whole run. The window swap never force-resets envs; lanes
+    # migrate through their natural resets and clip-end re-anchoring.
+    rotation_period: int | None = None
+    # Background decode threads used to prefetch the next rotation window.
+    rotation_workers: int = 8
     joint_names: tuple[str, ...] = G1_SONIC_JOINTS
     tracked_body_names: tuple[str, ...] = G1_SONIC_BODY_NAMES
     reference_body_name: str = "pelvis"
@@ -520,6 +540,12 @@ class SonicMotionCommandCfg(CommandCfg):
             raise ValueError("SONIC num_future_frames must be a positive integer")
         if isinstance(self.num_motions, bool) or (self.num_motions is not None and self.num_motions <= 0):
             raise ValueError("SONIC num_motions must be a positive integer or None")
+        if self.rotation_period is not None and (isinstance(self.rotation_period, bool) or self.rotation_period <= 0):
+            raise ValueError("SONIC rotation_period must be a positive integer or None")
+        if self.rotation_period is not None and self.num_motions is None:
+            raise ValueError("SONIC rotation needs num_motions to size the per-window clip count")
+        if isinstance(self.rotation_workers, bool) or self.rotation_workers < 2:
+            raise ValueError("SONIC rotation_workers must be an integer >= 2")
         if self.encoder_sampling not in ENCODER_SAMPLING_MODES:
             raise ValueError(f"SONIC encoder_sampling must be one of {ENCODER_SAMPLING_MODES}")
         if self.motion_files and not all(isinstance(path, str) and path for path in self.motion_files):
@@ -538,25 +564,43 @@ class SonicMotionCommandCfg(CommandCfg):
         robot = cast(RobotCfg, env.cfg.scene.objs.robot)
         if not self.motion_files:
             raise ValueError("SONIC motion_files must name at least one npz file or directory.")
-        clip = SonicMotionClip.from_corpus(
-            self.motion_files,
-            joint_names=self.joint_names,
-            tracked_body_names=self.tracked_body_names,
-            reference_body_name=self.reference_body_name,
-            root_body_name=robot.base_link_name,
-            num_motions=self.num_motions,
+        rotator: CorpusRotator | None = None
+        if self.rotation_period is None:
+            clip = SonicMotionClip.from_corpus(
+                self.motion_files,
+                joint_names=self.joint_names,
+                tracked_body_names=self.tracked_body_names,
+                reference_body_name=self.reference_body_name,
+                root_body_name=robot.base_link_name,
+                num_motions=self.num_motions,
+            )
+        else:
+            clip, rotator = CorpusRotator.build(
+                paths=self.motion_files,
+                window_clips=self.num_motions,
+                period=self.rotation_period,
+                workers=self.rotation_workers,
+                seed=env.seed,
+                joint_names=list(self.joint_names),
+                tracked_body_names=self.tracked_body_names,
+                reference_body_name=self.reference_body_name,
+                root_body_name=robot.base_link_name,
+            )
+        window_range = np.asarray(
+            [0, clip.joint_pos.shape[0] if rotator is None else rotator.active_frames], dtype=np.int64
         )
         reference_index = self.tracked_body_names.index(self.reference_body_name)
         nbin = (
-            clip.joint_pos.shape[0] // max(int(round(1.0 / env.cfg.ctrl_dt)), 1) + 1
+            int(window_range[1]) // max(int(round(1.0 / env.cfg.ctrl_dt)), 1) + 1
             if self.adaptive_sampling_enabled
             else 0
         )
         # Term builds run before the read program exists, so derive the
         # tracked-body layout statically instead of reading env.sim_data.
         shape = (len(self.tracked_body_names), 3)
-        return SonicMotionCommand(
+        command = SonicMotionCommand(
             clip=clip,
+            window_range=window_range,
             reference_index=np.int64(reference_index),
             steps=np.zeros((env.num_envs, 1), np.int64),
             reset_counter=np.zeros((env.num_envs, 1), np.int64),
@@ -584,6 +628,15 @@ class SonicMotionCommandCfg(CommandCfg):
             kernel_lambda=np.float32(self.kernel_lambda),
             num_future_frames=np.int64(self.num_future_frames),
         )
+        if rotator is not None:
+            # Kernel-data leaves are copied into env-owned arrays after this
+            # call, so the rotator itself must travel outside the command
+            # tree; the SONIC env subclass picks it up once construction
+            # finishes and ticks it every control step.
+            if not hasattr(env, "_pending_motion_rotation"):
+                raise ValueError("SONIC corpus rotation requires the SONIC manager env (rotation handoff missing).")
+            env._pending_motion_rotation = rotator
+        return command
 
 
 # Upstream observation-noise amplitudes (gear_sonic ``local_dir_hist.yaml``

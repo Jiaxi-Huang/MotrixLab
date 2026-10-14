@@ -55,6 +55,28 @@ SONIC_MOTION_DIR=$PWD/data/bones_seed_npz \
   python scripts/train.py task=g1-sonic/motrix.fastsac
 ```
 
+## Corpus rotation
+
+Full corpora (100k+ clips) cannot stay resident, so `g1-sonic` streams the
+corpus through a fixed two-window frame axis
+(`SonicMotionCommandCfg.rotation_period`, default 2048 control steps; disable
+with `rotation_period: null`). Each window holds `num_motions` clips drawn
+from a seeded without-replacement permutation, so one pass over the corpus
+takes `ceil(corpus_size / num_motions)` swaps. Window decode runs on
+background threads into private staging buffers; publishing is an in-place
+copy into the retiring half of the pre-allocated clip arrays, which costs one
+bounded memcpy per swap and nothing else on the stepping path.
+
+Swaps never force-reset envs: reset sampling and clip-end re-anchoring
+immediately use the new window, while lanes still tracking the old window run
+until their natural episode end, and the retired half is only overwritten
+once no lane references it. With off-policy replay this keeps each swap a
+gradual mixture shift — a good default is one swap per `buffer_size` control
+steps, so the replay distribution turns over about as fast as the resident
+window does. Adaptive-sampling failure bins are window-local and reset on
+each swap. Corpus roots smaller than one window fall back to the plain
+resident load, so smoke corpora are unaffected.
+
 ## Build a corpus
 
 Download a paired BONES-SEED subset (G1 retargeted CSVs + SMPL PKLs) from

@@ -22,7 +22,7 @@ from motrix_envs.motion.tracked import MotionChannel, WbtMotionClip
 
 # Per-frame array fields of :class:`WbtMotionClip` that concatenate along the
 # frame axis when clips are joined.
-_FRAME_AXIS_FIELDS = (
+FRAME_AXIS_FIELDS = (
     "joint_pos",
     "joint_vel",
     "tracked_bodies_pos_w",
@@ -94,64 +94,130 @@ class MotionLibrary:
 
     def assemble(self) -> WbtMotionClip:
         """Load, validate, and concatenate the corpus into one kernel-data clip."""
-        motions = [MotrixMotion(path) for path in self.entries]
-        self._validate_corpus(motions)
-        segments = [
-            WbtMotionClip.create(
-                motion,
-                self.joint_names,
-                self.tracked_body_names,
-                self.reference_body_name,
-                self.root_body_name,
-                self.extension_channels,
-            )
-            for motion in motions
-        ]
-        clip_lengths = np.asarray([segment.joint_pos.shape[0] for segment in segments], dtype=np.int64)
-        clip_offsets = np.zeros_like(clip_lengths)
-        np.cumsum(clip_lengths[:-1], out=clip_offsets[1:])
-        return WbtMotionClip(
-            **{
-                field: np.concatenate([getattr(segment, field) for segment in segments]) for field in _FRAME_AXIS_FIELDS
-            },
-            frame_clip_end=np.concatenate(
-                [segment.frame_clip_end + offset for segment, offset in zip(segments, clip_offsets)]
-            ),
-            extensions=Map(
-                {
-                    name: MotionChannel(np.concatenate([segment.extensions[name].data for segment in segments]))
-                    for name in self.extension_channels
-                }
-            ),
+        segments = load_motion_segments(
+            self.entries,
+            joint_names=self.joint_names,
+            tracked_body_names=self.tracked_body_names,
+            reference_body_name=self.reference_body_name,
+            root_body_name=self.root_body_name,
+            fps=self.fps,
+            extension_channels=self.extension_channels,
+        )
+        return assemble_segment_clip(segments, self.extension_channels)
+
+
+def load_motion_segments(
+    entries: Sequence[Path],
+    *,
+    joint_names: list[str],
+    tracked_body_names: tuple[str, ...],
+    reference_body_name: str,
+    root_body_name: str,
+    fps: int,
+    extension_channels: tuple[str, ...] = (),
+) -> list[WbtMotionClip]:
+    """Decode and validate corpus entries into per-file task-order segments.
+
+    Each entry is one schema v1 clip reindexed to the task joint/body order;
+    the corpus-level contracts (fps, name sets, finiteness, extension-channel
+    shapes) are enforced across the batch exactly like a full
+    :class:`MotionLibrary` load.
+    """
+    motions = [MotrixMotion(path) for path in entries]
+    reference: tuple[frozenset[str], frozenset[str], tuple[tuple[int, ...], ...], Path] | None = None
+    for motion in motions:
+        identity = motion_corpus_contract(motion, fps=fps, extension_channels=extension_channels)
+        if reference is None:
+            reference = identity
+        else:
+            check_motion_matches_corpus(motion, identity, reference)
+    return [
+        WbtMotionClip.create(
+            motion,
+            joint_names,
+            tracked_body_names,
+            reference_body_name,
+            root_body_name,
+            extension_channels,
+        )
+        for motion in motions
+    ]
+
+
+def motion_corpus_contract(
+    motion: MotrixMotion,
+    *,
+    fps: int,
+    extension_channels: tuple[str, ...] = (),
+) -> tuple[frozenset[str], frozenset[str], tuple[tuple[int, ...], ...], Path]:
+    """Validate one motion against the per-file corpus contract.
+
+    Returns the motion's identity tuple — (joint-name set, body-name set,
+    extension-channel trailing shapes, source path) — of which corpus members
+    must agree on the first three.
+    """
+    if motion.fps != fps:
+        raise ValueError(f"Motion fps must match the control rate {fps}: {motion.path} is recorded at {motion.fps}.")
+    for field in _REQUIRED_FRAME_ARRAYS:
+        if not np.all(np.isfinite(getattr(motion, field))):
+            raise ValueError(f"{field} in {motion.path} contains non-finite values.")
+    shapes = []
+    for name in extension_channels:
+        if name not in motion.extensions:
+            raise ValueError(f"Motion file {motion.path} does not provide declared extension channel 'ext_{name}'.")
+        shapes.append(motion.extensions[name].shape[1:])
+    return frozenset(motion.joint_names), frozenset(motion.body_names), tuple(shapes), motion.path
+
+
+def check_motion_matches_corpus(
+    motion: MotrixMotion,
+    identity: tuple[frozenset[str], frozenset[str], tuple[tuple[int, ...], ...], Path],
+    reference: tuple[frozenset[str], frozenset[str], tuple[tuple[int, ...], ...], Path],
+) -> None:
+    """Reject a decoded motion whose identity differs from the corpus reference."""
+    if identity[0] != reference[0]:
+        raise ValueError(f"Joint name set of {motion.path} differs from {reference[3]}.")
+    if identity[1] != reference[1]:
+        raise ValueError(f"Body name set of {motion.path} differs from {reference[3]}.")
+    if identity[2] != reference[2]:
+        raise ValueError(
+            f"Extension channel must keep one shape across the corpus; {motion.path} has trailing "
+            f"shapes {identity[2]}, reference {reference[3]} has {reference[2]}."
         )
 
-    def _validate_corpus(self, motions: list[MotrixMotion]) -> None:
-        first = motions[0]
-        for motion in motions:
-            if motion.fps != self.fps:
-                raise ValueError(
-                    f"Motion fps must match the control rate {self.fps}: {motion.path} is recorded at {motion.fps}."
-                )
-            if set(motion.joint_names) != set(first.joint_names):
-                raise ValueError(f"Joint name set of {motion.path} differs from {first.path}.")
-            if set(motion.body_names) != set(first.body_names):
-                raise ValueError(f"Body name set of {motion.path} differs from {first.path}.")
-            for field in _REQUIRED_FRAME_ARRAYS:
-                if not np.all(np.isfinite(getattr(motion, field))):
-                    raise ValueError(f"{field} in {motion.path} contains non-finite values.")
-        for name in self.extension_channels:
-            trailing_shapes = []
-            for motion in motions:
-                if name not in motion.extensions:
-                    raise ValueError(
-                        f"Motion file {motion.path} does not provide declared extension channel 'ext_{name}'."
-                    )
-                trailing_shapes.append(motion.extensions[name].shape[1:])
-            if any(shape != trailing_shapes[0] for shape in trailing_shapes):
-                raise ValueError(
-                    f"Extension channel 'ext_{name}' must keep one shape across the corpus; "
-                    f"got per-file trailing shapes {trailing_shapes}."
-                )
+
+def assemble_segment_clip(segments: list[WbtMotionClip], extension_channels: tuple[str, ...]) -> WbtMotionClip:
+    """Concatenate per-file segments into one kernel-data clip."""
+    fields, frame_clip_end, extensions = assemble_segment_arrays(segments, extension_channels)
+    return WbtMotionClip(
+        **fields,
+        frame_clip_end=frame_clip_end,
+        extensions=Map({name: MotionChannel(data) for name, data in extensions.items()}),
+    )
+
+
+def assemble_segment_arrays(
+    segments: list[WbtMotionClip],
+    extension_channels: tuple[str, ...],
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, np.ndarray]]:
+    """Concatenate segments into plain frame-axis arrays starting at frame 0.
+
+    Returns the per-field arrays (keys match :data:`FRAME_AXIS_FIELDS`), the
+    per-frame local clip-end boundaries, and the concatenated extension
+    channels. ``frame_clip_end`` values are local to the returned assembly; a
+    caller placing it at a nonzero base offset must add the base itself.
+    """
+    clip_lengths = np.asarray([segment.joint_pos.shape[0] for segment in segments], dtype=np.int64)
+    clip_offsets = np.zeros_like(clip_lengths)
+    np.cumsum(clip_lengths[:-1], out=clip_offsets[1:])
+    fields = {field: np.concatenate([getattr(segment, field) for segment in segments]) for field in FRAME_AXIS_FIELDS}
+    frame_clip_end = np.concatenate(
+        [segment.frame_clip_end + offset for segment, offset in zip(segments, clip_offsets)]
+    )
+    extensions = {
+        name: np.concatenate([segment.extensions[name].data for segment in segments]) for name in extension_channels
+    }
+    return fields, frame_clip_end, extensions
 
 
 def expand_motion_paths(paths: Sequence[str | Path]) -> tuple[Path, ...]:
@@ -186,4 +252,14 @@ def subsample_motion_entries(entries: tuple[Path, ...], num_motions: int | None,
     return tuple(entries[i] for i in sorted(picked))
 
 
-__all__ = ["MotionLibrary"]
+__all__ = [
+    "FRAME_AXIS_FIELDS",
+    "MotionLibrary",
+    "assemble_segment_arrays",
+    "assemble_segment_clip",
+    "check_motion_matches_corpus",
+    "expand_motion_paths",
+    "load_motion_segments",
+    "motion_corpus_contract",
+    "subsample_motion_entries",
+]

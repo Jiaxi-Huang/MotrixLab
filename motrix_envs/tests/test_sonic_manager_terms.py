@@ -96,6 +96,7 @@ def test_sonic_reset_expands_smpl_native_rows_multi_hot() -> None:
     )
     motion = SimpleNamespace(
         clip=clip,
+        window_range=np.asarray([0, 4], np.int64),
         steps=np.zeros(1, np.int64),
         sampling_cdf=np.ones(1, np.float32),
         start_at_timestep_zero_prob=np.float32(1.0),
@@ -185,6 +186,7 @@ def test_sonic_advance_switches_segment_at_clip_end() -> None:
 
     motion = SimpleNamespace(
         steps=np.asarray((5,), np.int64),
+        window_range=np.asarray([0, 10], np.int64),
         start_at_timestep_zero_prob=np.float32(0.0),
         sampling_cdf=np.linspace(0.1, 1.0, 10).astype(np.float32),
         clip=SimpleNamespace(

@@ -26,7 +26,30 @@ from motrix_envs.locomotion.sonic.cfg import (
 
 
 class SonicManagerEnv(ManagerEnv):
-    """Manager environment for the SONIC G1 motion-tracking task."""
+    """Manager environment for the SONIC G1 motion-tracking task.
+
+    Drives :class:`~motrix_envs.motion.rotation.CorpusRotator` when the motion
+    command enables corpus rotation: the command cfg publishes its rotator
+    into ``_pending_motion_rotation`` during construction (the canonical,
+    kernel-bound command terms only exist once ``super().__init__`` returns),
+    and each control step ticks the rotator against the canonical motion term.
+    """
+
+    def __init__(self, cfg, num_envs: int = 1, backend: str | None = None, seed: int | None = None):
+        self._pending_motion_rotation = None
+        super().__init__(cfg, num_envs=num_envs, backend=backend, seed=seed)
+        self._motion_rotation = (
+            (self._command_terms["motion"], self._pending_motion_rotation)
+            if self._pending_motion_rotation is not None
+            else None
+        )
+        self._pending_motion_rotation = None
+
+    def step(self, actions):
+        result = super().step(actions)
+        if self._motion_rotation is not None:
+            self._motion_rotation[1].tick(self._motion_rotation[0])
+        return result
 
 
 def _make_g1_sonic_cfg() -> SonicManagerEnvCfg:
@@ -50,6 +73,11 @@ def _make_g1_sonic_cfg() -> SonicManagerEnvCfg:
             motion=mdp.SonicMotionCommandCfg(
                 motion_files=motion_files,
                 num_future_frames=num_future_frames,
+                # Stream the full corpus (100k+ clips) through the resident
+                # window: one swap per ~buffer_size control steps keeps the
+                # replay mixture smooth, and the whole corpus is covered once
+                # every ceil(corpus/num_motions) swaps.
+                rotation_period=2048,
             )
         ),
         actions=SonicActionsCfg(

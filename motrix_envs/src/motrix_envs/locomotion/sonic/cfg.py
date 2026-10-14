@@ -184,6 +184,9 @@ class SonicManagerEnvCfg(ManagerBasedEnvCfg):
         cfg = deepcopy(self)
         cfg.max_episode_seconds = None
         cfg.commands.motion.adaptive_sampling_enabled = False
+        # Evaluation tracks the startup window; streaming in new clips mid-eval
+        # would change the task underneath the policy.
+        cfg.commands.motion.rotation_period = None
         # A corpus directory has no single head frame — forcing frame 0 would
         # loop the first clip forever, so starts and wrap-resamples draw over
         # the whole corpus. A lone file corpus keeps restarting from its head.
