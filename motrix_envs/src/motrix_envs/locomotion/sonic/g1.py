@@ -43,6 +43,9 @@ class SonicManagerEnv(ManagerEnv):
             if self._pending_motion_rotation is not None
             else None
         )
+        if self._motion_rotation is not None:
+            term, rotator = self._motion_rotation
+            rotator.attach(term)
         self._pending_motion_rotation = None
 
     def step(self, actions):
@@ -54,6 +57,11 @@ class SonicManagerEnv(ManagerEnv):
             # ``metrics/*`` TensorBoard curves.
             result.metrics["motion_rotation_window"] = float(rotator.window_index)
             result.metrics["motion_rotation_coverage"] = rotator.pass_coverage
+            if rotator.adaptive is not None:
+                result.metrics["adaptive_sampling_entropy"] = rotator.adaptive.entropy
+                result.metrics["adaptive_sampling_top1_prob"] = rotator.adaptive.top1_prob
+                result.metrics["adaptive_sampling_top1_bin"] = rotator.adaptive.top1_bin
+                result.metrics["adaptive_failure_mass"] = rotator.adaptive.failure_mass
         return result
 
 

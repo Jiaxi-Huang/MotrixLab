@@ -99,6 +99,7 @@ def test_sonic_reset_expands_smpl_native_rows_multi_hot() -> None:
         window_range=np.asarray([0, 4], np.int64),
         steps=np.zeros(1, np.int64),
         sampling_cdf=np.ones(1, np.float32),
+        adaptive_rotation_enabled=np.bool_(False),
         start_at_timestep_zero_prob=np.float32(1.0),
         foot_joint_policy_indices=np.asarray([mdp.G1_SONIC_JOINTS.index(n) for n in mdp.SONIC_FOOT_JOINTS], np.int64),
         previous_foot_joint_velocity=np.zeros(4, np.float32),
@@ -189,6 +190,7 @@ def test_sonic_advance_switches_segment_at_clip_end() -> None:
         window_range=np.asarray([0, 10], np.int64),
         start_at_timestep_zero_prob=np.float32(0.0),
         sampling_cdf=np.linspace(0.1, 1.0, 10).astype(np.float32),
+        adaptive_rotation_enabled=np.bool_(False),
         clip=SimpleNamespace(
             joint_pos=np.zeros((10, 2), np.float32),
             frame_clip_end=np.asarray([3, 3, 3, 3, 7, 7, 7, 7, 9, 9], np.int64),

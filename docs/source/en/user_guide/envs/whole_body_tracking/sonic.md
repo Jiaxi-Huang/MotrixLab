@@ -77,9 +77,17 @@ windows, while at `2 × buffer_size` (the `g1-sonic` default) each window's
 data fully churns out of the buffer before the next swap arrives, giving
 every window a complete digestion pass. Tune from the publish log: window
 decode should stay well under the period, and the drain wait under the
-episode-length bound. Adaptive-sampling failure bins are window-local and
-reset on each swap. Corpus roots smaller than one window fall back to the
-plain resident load, so smoke corpora are unaffected.
+episode-length bound. With adaptive sampling disabled (the default), rotation
+continues to use the original uniform frame sampler: it neither changes the
+random draw sequence nor allocates adaptive state. With adaptive sampling
+enabled, failure statistics belong to the original source clip and are
+restored when that clip returns in a later window. Statistics are created
+lazily as clips are decoded, split into 50-frame bins by default, and an old
+window's draining lanes still report failures to their own source clip. The
+active distribution reserves `uniform_ratio` (default 20%) for uniform
+exploration; the remainder follows source-local failure mass. Corpus roots
+smaller than one window fall back to the plain resident load, so smoke corpora
+are unaffected.
 
 ## Build a corpus
 

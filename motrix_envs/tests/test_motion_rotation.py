@@ -77,6 +77,19 @@ def _term(clip, rotator):
     return _FakeTerm(clip=clip, steps=np.zeros((4, 1), np.int64), window_range=np.asarray([0, rotator.active_frames]))
 
 
+def _adaptive_term(clip, rotator):
+    term = _term(clip, rotator)
+    capacity = rotator.max_adaptive_bins(2)
+    term.sampling_cdf = np.zeros(capacity, np.float32)
+    term.adaptive_active_bin_count = np.zeros(1, np.int64)
+    term.adaptive_bin_start = np.empty(capacity, np.int64)
+    term.adaptive_bin_end = np.empty(capacity, np.int64)
+    term.adaptive_failure_pending = np.zeros(term.steps.shape[0], bool)
+    term.adaptive_failure_source_id = np.full(term.steps.shape[0], -1, np.int64)
+    term.adaptive_failure_local_step = np.zeros(term.steps.shape[0], np.int64)
+    return term
+
+
 def _build(corpus_directory, **overrides):
     kwargs = {
         "paths": (corpus_directory,),
@@ -179,6 +192,76 @@ def test_publish_resets_adaptive_stats_and_flips_domain(corpus):
     assert window_ends[-1] == base + frames - 1
     assert np.all(np.diff(window_ends) >= 0)
     assert np.all((window_ends >= base) & (window_ends < base + frames))
+
+
+def test_rotation_adaptive_statistics_follow_source_clips_and_draining_lanes(corpus):
+    clip, rotator = _build(corpus, track_sources=True)
+    rotator.enable_adaptive(bin_size=2, alpha=1.0, uniform_ratio=0.2, kernel_size=1, kernel_lambda=0.8)
+    term = _adaptive_term(clip, rotator)
+    rotator.attach(term)
+
+    source_id = int(clip.frame_source_id[0])
+    term.adaptive_failure_source_id[0] = source_id
+    term.adaptive_failure_local_step[0] = 2
+    term.adaptive_failure_pending[0] = True
+    rotator.tick(term)
+    assert rotator.adaptive is not None
+    assert rotator.adaptive.source_failure_mass(source_id) == pytest.approx(1.0)
+
+    # Publish the next window, then report a delayed failure from a lane still
+    # draining the retired half.  It must return to the old source, not the
+    # new window's matching time bin.
+    _drive(rotator, term, until_window=1)
+    term.adaptive_failure_source_id[1] = source_id
+    term.adaptive_failure_local_step[1] = 3
+    term.adaptive_failure_pending[1] = True
+    rotator.tick(term)
+    assert rotator.adaptive.source_failure_mass(source_id) == pytest.approx(2.0)
+
+    # The source eventually returns in the seeded without-replacement pass;
+    # its learned bin must receive more than the fixed 20% uniform floor.
+    for _ in range(12):
+        if source_id in clip.frame_source_id[rotator.active_base : rotator.active_base + rotator.active_frames]:
+            break
+        _drive(rotator, term, until_window=rotator.window_index + 1)
+    else:
+        raise AssertionError("source clip did not return during the rotation pass")
+    count = int(term.adaptive_active_bin_count[0])
+    probabilities = np.diff(np.concatenate(([0.0], term.sampling_cdf[:count])))
+    assert np.all(probabilities >= 0.2 / count - 1e-7)
+    active_sources = clip.frame_source_id[rotator.active_base : rotator.active_base + rotator.active_frames]
+    source_start = rotator.active_base + int(np.flatnonzero(active_sources == source_id)[0])
+    target_bin = int(np.flatnonzero(term.adaptive_bin_start[:count] == source_start + 2)[0])
+    assert probabilities[target_bin] > 0.2 / count
+
+
+def test_rotation_adaptive_path_compiles_and_preserves_uniform_controller_absence(tmp_path):
+    corpus_directory = tmp_path / "corpus"
+    corpus_directory.mkdir()
+    for index in range(5):
+        _write_g1_clip(corpus_directory / f"clip_{index}.npz", num_frames=8)
+
+    uniform_cfg = registry.make_env_config("g1-sonic")
+    uniform_cfg.commands.motion.motion_files = (str(corpus_directory),)
+    uniform_cfg.commands.motion.num_motions = 2
+    uniform_cfg.commands.motion.rotation_period = 2
+    uniform_env = registry.resolve("g1-sonic", env_cfg=uniform_cfg).make(num_envs=2, seed=1)
+    assert uniform_env._motion_rotation[1].adaptive is None
+    uniform_motion = uniform_env._command_terms["motion"]
+    assert uniform_motion.sampling_cdf.size == 0
+    assert uniform_motion.clip.frame_source_id.size == 0
+    assert uniform_motion.clip.frame_source_start.size == 0
+    uniform_env.init_state()
+
+    adaptive_cfg = registry.make_env_config("g1-sonic")
+    adaptive_cfg.commands.motion.motion_files = (str(corpus_directory),)
+    adaptive_cfg.commands.motion.num_motions = 2
+    adaptive_cfg.commands.motion.rotation_period = 2
+    adaptive_cfg.commands.motion.adaptive_sampling_enabled = True
+    adaptive_env = registry.resolve("g1-sonic", env_cfg=adaptive_cfg).make(num_envs=2, seed=1)
+    assert adaptive_env._motion_rotation[1].adaptive is not None
+    adaptive_env.init_state()
+    adaptive_env.step(np.zeros((2, len(G1_SONIC_JOINTS)), np.float32))
 
 
 def test_budget_trim_keeps_coverage_via_carry(tmp_path):
@@ -292,7 +375,9 @@ def test_sonic_env_rotates_windows_while_stepping(tmp_path):
         assert np.isfinite(state.obs.value).all()
         assert float(np.max(state.metrics["motion_step"])) < capacity
     assert rotator.window_index >= 2
-    assert 0.0 < state.metrics["motion_rotation_coverage"] <= 1.0
+    # The final publish can coincide with a seeded permutation wrap, where a
+    # fresh pass has correctly consumed zero entries so far.
+    assert 0.0 <= state.metrics["motion_rotation_coverage"] <= 1.0
     assert state.metrics["motion_rotation_window"] >= 2
     base, frames = int(motion.window_range[0]), int(motion.window_range[1])
     assert 0 <= base and base + frames <= capacity

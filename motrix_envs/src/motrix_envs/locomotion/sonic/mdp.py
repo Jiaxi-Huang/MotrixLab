@@ -294,6 +294,35 @@ def _sample_motion_step_from_cdf(
 
 
 @njit(inline="always")
+def _sample_motion_step_from_active_bins(
+    rand_state,
+    sampling_cdf,
+    bin_start,
+    bin_end,
+    active_bin_count: np.int64,
+    window_base: np.int64,
+    start_at_timestep_zero_prob: np.float32,
+):
+    """Sample a source-stable adaptive bin without touching uniform RNG flow."""
+    unit = (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5)
+    low = np.int64(0)
+    high = active_bin_count - np.int64(1)
+    while low < high:
+        mid = (low + high) // np.int64(2)
+        if unit > sampling_cdf[mid]:
+            low = mid + 1
+        else:
+            high = mid
+    start = bin_start[low]
+    end = bin_end[low]
+    bin_unit = (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5)
+    step = start + np.int64(bin_unit * np.float32(end - start))
+    if (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5) < start_at_timestep_zero_prob:
+        step = window_base
+    return step
+
+
+@njit(inline="always")
 def _update_foot_joint_acceleration(
     joint_velocity: np.ndarray,
     foot_joint_policy_indices: np.ndarray,
@@ -321,6 +350,13 @@ class SonicMotionCommand(CommandTerm):
     adaptive_bin_failed_count: SharedArray
     adaptive_current_bin_failed_count: SharedArray
     sampling_cdf: SharedArray
+    adaptive_rotation_enabled: np.bool_
+    adaptive_active_bin_count: SharedArray
+    adaptive_bin_start: SharedArray
+    adaptive_bin_end: SharedArray
+    adaptive_failure_pending: np.ndarray
+    adaptive_failure_source_id: np.ndarray
+    adaptive_failure_local_step: np.ndarray
     start_at_timestep_zero_prob: np.float32
     uniform_ratio: np.float32
     alpha: np.float32
@@ -396,7 +432,16 @@ class SonicMotionCommand(CommandTerm):
 
     def reset(self, ctx: ResetContext) -> None:
         env_ids = ctx.env_ids
-        if self.sampling_cdf.size:
+        if self.adaptive_rotation_enabled:
+            failed_env_ids = env_ids[ctx.terminated[env_ids]]
+            if failed_env_ids.size:
+                failed_steps = self.steps[failed_env_ids, 0]
+                self.adaptive_failure_source_id[failed_env_ids] = self.clip.frame_source_id[failed_steps]
+                self.adaptive_failure_local_step[failed_env_ids] = (
+                    failed_steps - self.clip.frame_source_start[failed_steps]
+                )
+                self.adaptive_failure_pending[failed_env_ids] = True
+        elif self.sampling_cdf.size:
             # With clip_end routing removed, every termination is a failure.
             episode_failed = ctx.terminated[env_ids]
             if np.any(episode_failed):
@@ -434,12 +479,23 @@ class SonicMotionCommand(CommandTerm):
 
     @dispatch
     def reset_env(self, ctx: ManagerContext) -> None:
-        self.steps[0] = self.window_range[0] + _sample_motion_step_from_cdf(
-            ctx.rand.state,
-            self.sampling_cdf,
-            self.window_range[1],
-            self.start_at_timestep_zero_prob,
-        )
+        if self.adaptive_rotation_enabled:
+            self.steps[0] = _sample_motion_step_from_active_bins(
+                ctx.rand.state,
+                self.sampling_cdf,
+                self.adaptive_bin_start,
+                self.adaptive_bin_end,
+                self.adaptive_active_bin_count[0],
+                self.window_range[0],
+                self.start_at_timestep_zero_prob,
+            )
+        else:
+            self.steps[0] = self.window_range[0] + _sample_motion_step_from_cdf(
+                ctx.rand.state,
+                self.sampling_cdf,
+                self.window_range[1],
+                self.start_at_timestep_zero_prob,
+            )
         # Seed the finite-difference velocity from the frame the sim reset
         # teleports this env to (BodyDofPosReset writes clip.joint_vel[step]),
         # matching upstream's articulation layer seeding the previous velocity
@@ -477,12 +533,23 @@ class SonicMotionCommand(CommandTerm):
             # authoritative, and the sim reset terms teleport the robot to the
             # new frame. Episode bookkeeping and action-term state stay
             # untouched, so the episode continues until time-out or failure.
-            self.steps[0] = self.window_range[0] + _sample_motion_step_from_cdf(
-                ctx.rand.state,
-                self.sampling_cdf,
-                self.window_range[1],
-                self.start_at_timestep_zero_prob,
-            )
+            if self.adaptive_rotation_enabled:
+                self.steps[0] = _sample_motion_step_from_active_bins(
+                    ctx.rand.state,
+                    self.sampling_cdf,
+                    self.adaptive_bin_start,
+                    self.adaptive_bin_end,
+                    self.adaptive_active_bin_count[0],
+                    self.window_range[0],
+                    self.start_at_timestep_zero_prob,
+                )
+            else:
+                self.steps[0] = self.window_range[0] + _sample_motion_step_from_cdf(
+                    ctx.rand.state,
+                    self.sampling_cdf,
+                    self.window_range[1],
+                    self.start_at_timestep_zero_prob,
+                )
             ctx.sim_reset_requested[0] = True
 
     def _sampling_probabilities(self) -> np.ndarray:
@@ -521,6 +588,12 @@ class SonicMotionCommandCfg(CommandCfg):
     start_at_timestep_zero_prob: float = 0.0
     low_reference_height_threshold: float = 0.5
     uniform_ratio: float = 0.2
+    # One second at SONIC's 50 Hz source rate, matching gear_sonic.  Adaptive
+    # rotation stores these source-local bins lazily as clips are decoded.
+    adaptive_bin_size: int = 50
+    # Rebuild the host-side active-window CDF only after this many control steps
+    # with pending adaptive updates. Window publication still rebuilds eagerly.
+    adaptive_update_period: int = 128
     alpha: float = 0.001
     kernel_size: int = 3
     kernel_lambda: float = 0.8
@@ -546,6 +619,12 @@ class SonicMotionCommandCfg(CommandCfg):
             raise ValueError("SONIC rotation needs num_motions to size the per-window clip count")
         if isinstance(self.rotation_workers, bool) or self.rotation_workers < 2:
             raise ValueError("SONIC rotation_workers must be an integer >= 2")
+        if isinstance(self.adaptive_bin_size, bool) or self.adaptive_bin_size <= 0:
+            raise ValueError("SONIC adaptive_bin_size must be a positive integer")
+        if isinstance(self.adaptive_update_period, bool) or self.adaptive_update_period <= 0:
+            raise ValueError("SONIC adaptive_update_period must be a positive integer")
+        if not 0.0 <= self.uniform_ratio <= 1.0:
+            raise ValueError("SONIC uniform_ratio must be in [0, 1]")
         if self.encoder_sampling not in ENCODER_SAMPLING_MODES:
             raise ValueError(f"SONIC encoder_sampling must be one of {ENCODER_SAMPLING_MODES}")
         if self.motion_files and not all(isinstance(path, str) and path for path in self.motion_files):
@@ -585,15 +664,21 @@ class SonicMotionCommandCfg(CommandCfg):
                 tracked_body_names=self.tracked_body_names,
                 reference_body_name=self.reference_body_name,
                 root_body_name=robot.base_link_name,
+                track_sources=self.adaptive_sampling_enabled,
             )
         window_range = np.asarray(
             [0, clip.joint_pos.shape[0] if rotator is None else rotator.active_frames], dtype=np.int64
         )
         reference_index = self.tracked_body_names.index(self.reference_body_name)
+        adaptive_rotation = self.adaptive_sampling_enabled and rotator is not None
         nbin = (
-            int(window_range[1]) // max(int(round(1.0 / env.cfg.ctrl_dt)), 1) + 1
-            if self.adaptive_sampling_enabled
-            else 0
+            rotator.max_adaptive_bins(self.adaptive_bin_size)
+            if adaptive_rotation
+            else (
+                int(window_range[1]) // max(int(round(1.0 / env.cfg.ctrl_dt)), 1) + 1
+                if self.adaptive_sampling_enabled
+                else 0
+            )
         )
         # Term builds run before the read program exists, so derive the
         # tracked-body layout statically instead of reading env.sim_data.
@@ -621,6 +706,13 @@ class SonicMotionCommandCfg(CommandCfg):
             adaptive_bin_failed_count=np.zeros(nbin, np.float32),
             adaptive_current_bin_failed_count=np.zeros(nbin, np.float32),
             sampling_cdf=np.ones(nbin, np.float32) if nbin else np.empty((0,), np.float32),
+            adaptive_rotation_enabled=np.bool_(adaptive_rotation),
+            adaptive_active_bin_count=np.zeros(1, np.int64),
+            adaptive_bin_start=np.empty(nbin, np.int64) if adaptive_rotation else np.empty((0,), np.int64),
+            adaptive_bin_end=np.empty(nbin, np.int64) if adaptive_rotation else np.empty((0,), np.int64),
+            adaptive_failure_pending=np.zeros(env.num_envs, bool),
+            adaptive_failure_source_id=np.full(env.num_envs, -1, np.int64),
+            adaptive_failure_local_step=np.zeros(env.num_envs, np.int64),
             start_at_timestep_zero_prob=np.float32(self.start_at_timestep_zero_prob),
             uniform_ratio=np.float32(self.uniform_ratio),
             alpha=np.float32(self.alpha),
@@ -635,6 +727,15 @@ class SonicMotionCommandCfg(CommandCfg):
             # finishes and ticks it every control step.
             if not hasattr(env, "_pending_motion_rotation"):
                 raise ValueError("SONIC corpus rotation requires the SONIC manager env (rotation handoff missing).")
+            if adaptive_rotation:
+                rotator.enable_adaptive(
+                    bin_size=self.adaptive_bin_size,
+                    alpha=self.alpha,
+                    uniform_ratio=self.uniform_ratio,
+                    kernel_size=self.kernel_size,
+                    kernel_lambda=self.kernel_lambda,
+                    update_period=self.adaptive_update_period,
+                )
             env._pending_motion_rotation = rotator
         return command
 

@@ -17,6 +17,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+import numpy as np
+
 from motrix_env_core.numba.kernel_data import Map, SharedArray, kernel_data
 from motrix_envs.motion.library import MotionLibrary
 from motrix_envs.motion.tracked import WbtMotionClip
@@ -33,6 +35,12 @@ class SonicMotionClip(WbtMotionClip):
 
     smpl_joints: SharedArray
     smpl_root_quat: SharedArray
+    # Rotation fills these two sidecars with stable corpus-entry provenance.
+    # They are inert for resident corpora and never participate in uniform
+    # sampling; adaptive rotation uses them to return failure evidence to the
+    # clip that produced it after the frame window has moved on.
+    frame_source_id: SharedArray
+    frame_source_start: SharedArray
 
     @classmethod
     def from_corpus(
@@ -70,6 +78,16 @@ class SonicMotionClip(WbtMotionClip):
             raise ValueError(f"ext_smpl_joints must have trailing shape (24, 3), got {smpl_joints.shape[1:]}")
         if smpl_root_quat.shape[1:] != (4,):
             raise ValueError(f"ext_smpl_root_quat must have trailing shape (4,), got {smpl_root_quat.shape[1:]}")
+        frame_source_id = np.empty(base.frame_clip_end.shape[0], dtype=np.int64)
+        frame_source_start = np.empty(base.frame_clip_end.shape[0], dtype=np.int64)
+        start = 0
+        source_id = 0
+        while start < base.frame_clip_end.size:
+            end = int(base.frame_clip_end[start]) + 1
+            frame_source_id[start:end] = source_id
+            frame_source_start[start:end] = start
+            start = end
+            source_id += 1
         return cls(
             joint_pos=base.joint_pos,
             joint_vel=base.joint_vel,
@@ -87,6 +105,8 @@ class SonicMotionClip(WbtMotionClip):
             extensions=Map({}),
             smpl_joints=smpl_joints,
             smpl_root_quat=smpl_root_quat,
+            frame_source_id=frame_source_id,
+            frame_source_start=frame_source_start,
         )
 
 
