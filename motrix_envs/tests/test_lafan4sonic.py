@@ -178,10 +178,11 @@ def test_converter_rejects_misaligned_sources(tmp_path):
     _write_lafan_bvh(bvh / "clip.bvh", 60)
     _write_human_info_pkl(tmp_path / "human_joints_info.pkl")
 
+    from motrix_robots.unitree import UNITREE_G1_ASSET_DIR
+
     from motrix_envs.motion.lafan4sonic import retarget as retarget_path
     from motrix_envs.motion.lafan4sonic.converter import convert_lafan4sonic_pair
     from motrix_envs.motion.lafan4sonic.smpl import load_smpl_skeleton
-    from motrix_robots.unitree import UNITREE_G1_ASSET_DIR
 
     model, fk_data = retarget_path.load_fk_model(UNITREE_G1_ASSET_DIR / "g1_29dof.xml")
     skeleton = load_smpl_skeleton(tmp_path / "human_joints_info.pkl")

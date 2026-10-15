@@ -25,6 +25,7 @@ import re
 from pathlib import Path
 
 import numpy as np
+from motrix_robots.unitree import UNITREE_G1_ASSET_DIR
 
 from motrix_envs.motion.lafan4sonic import retarget as _retarget
 from motrix_envs.motion.lafan4sonic._math import (
@@ -35,7 +36,6 @@ from motrix_envs.motion.lafan4sonic._math import (
 from motrix_envs.motion.lafan4sonic.bvh import load_bvh, smpl_pose_from_bvh
 from motrix_envs.motion.lafan4sonic.smpl import load_smpl_skeleton, materialize_smpl_channels
 from motrix_envs.motion.schema import SCHEMA_VERSION
-from motrix_robots.unitree import UNITREE_G1_ASSET_DIR
 
 SONIC_FPS = 50
 # SONIC observations read 10 future reference frames; shorter clips cannot
@@ -155,9 +155,7 @@ def convert_lafan4sonic_dataset(
         pairs = pairs[:max_clips]
     output_dir = Path(output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_path = (
-        Path(model_file).expanduser() if model_file is not None else UNITREE_G1_ASSET_DIR / "g1_29dof.xml"
-    )
+    model_path = Path(model_file).expanduser() if model_file is not None else UNITREE_G1_ASSET_DIR / "g1_29dof.xml"
 
     info_path = Path(human_joints_info).expanduser()
     if not info_path.is_file():

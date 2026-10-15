@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import replace
 
 import torch
-
 from motrix_rl_builtin.fastsac.buffer import EmpiricalNormalization
 from motrix_rl_builtin.fastsac.sonic import SonicActor, SonicModelConfig
 
