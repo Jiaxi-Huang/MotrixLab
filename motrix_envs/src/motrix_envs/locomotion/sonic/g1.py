@@ -58,10 +58,7 @@ class SonicManagerEnv(ManagerEnv):
             result.metrics["motion_rotation_window"] = float(rotator.window_index)
             result.metrics["motion_rotation_coverage"] = rotator.pass_coverage
             if rotator.adaptive is not None:
-                result.metrics["adaptive_sampling_entropy"] = rotator.adaptive.entropy
-                result.metrics["adaptive_sampling_top1_prob"] = rotator.adaptive.top1_prob
-                result.metrics["adaptive_sampling_top1_bin"] = rotator.adaptive.top1_bin
-                result.metrics["adaptive_failure_mass"] = rotator.adaptive.failure_mass
+                result.metrics.update(rotator.adaptive_metrics())
         return result
 
 

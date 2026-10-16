@@ -47,6 +47,7 @@ from motrix_envs.motion.library import (
     motion_corpus_contract,
 )
 from motrix_envs.motion.loader import MotrixMotion
+from motrix_envs.motion.sampler import adaptive_sampling_metrics
 from motrix_envs.motion.sonic import SonicMotionClip
 from motrix_envs.motion.tracked import WbtMotionClip
 
@@ -109,6 +110,8 @@ class AdaptiveRotationSampler:
         uniform_ratio: float,
         kernel_size: int,
         kernel_lambda: float,
+        failure_rate_max_over_mean: float = 5.0,
+        max_prob_multiplier: float = 5.0,
         update_period: int = 128,
     ):
         self._bin_size = bin_size
@@ -116,6 +119,8 @@ class AdaptiveRotationSampler:
         self._uniform_ratio = np.float32(uniform_ratio)
         self._kernel_size = kernel_size
         self._kernel_lambda = np.float32(kernel_lambda)
+        self._failure_rate_max_over_mean = np.float32(failure_rate_max_over_mean)
+        self._max_prob_multiplier = np.float32(max_prob_multiplier)
         self._kernel = np.asarray([kernel_lambda**i for i in range(max(kernel_size, 1))], dtype=np.float32)
         self._kernel /= np.sum(self._kernel)
         self._update_period = update_period
@@ -127,6 +132,7 @@ class AdaptiveRotationSampler:
         self.top1_prob = 0.0
         self.top1_bin = 0.0
         self.failure_mass = 0.0
+        self._probabilities = np.empty((0,), dtype=np.float32)
 
     def attach(self, term) -> None:
         self._write_active_distribution(term)
@@ -163,6 +169,10 @@ class AdaptiveRotationSampler:
                 self._write_active_distribution(term)
                 self._steps_since_update = 0
                 self._dirty = False
+
+    @property
+    def probabilities(self) -> np.ndarray:
+        return self._probabilities
 
     def source_failure_mass(self, source_id: int) -> float:
         """Return source-local state for rotation tests and diagnostics."""
@@ -213,22 +223,32 @@ class AdaptiveRotationSampler:
         if not count:
             return
         adaptive = np.concatenate(values)
+        mean_adaptive = float(np.mean(adaptive))
+        if mean_adaptive > 0.0 and self._failure_rate_max_over_mean > 0.0:
+            adaptive = np.minimum(adaptive, mean_adaptive * self._failure_rate_max_over_mean)
         total = float(np.sum(adaptive))
-        if total > 0.0:
+        if total > 0.0 and np.isfinite(total):
             adaptive /= total
         else:
             adaptive.fill(1.0 / count)
-        probabilities = (np.float32(1.0) - self._uniform_ratio) * adaptive + self._uniform_ratio / count
+        uniform = np.full(count, 1.0 / count, dtype=np.float32)
+        probabilities = (np.float32(1.0) - self._uniform_ratio) * adaptive + self._uniform_ratio * uniform
+        if self._max_prob_multiplier > 0.0:
+            probabilities = np.minimum(probabilities, self._max_prob_multiplier / count)
+            probabilities /= np.sum(probabilities)
         term.sampling_cdf[:count] = np.cumsum(probabilities, dtype=np.float32)
         term.sampling_cdf[count - 1] = 1.0
         term.adaptive_bin_start[:count] = starts
         term.adaptive_bin_end[:count] = ends
-        entropy = -float(np.sum(probabilities * np.log(probabilities + 1e-12)))
-        self.entropy = entropy / float(np.log(max(count, 2)))
-        top = int(np.argmax(probabilities))
-        self.top1_prob = float(probabilities[top])
-        self.top1_bin = float(top) / float(count)
-        self.failure_mass = float(sum(np.sum(value) for value in self._history.values()))
+        self._probabilities = probabilities
+        metrics = adaptive_sampling_metrics(
+            probabilities,
+            float(sum(np.sum(value) for value in self._history.values())),
+        )
+        self.entropy = metrics["adaptive_sampling_entropy"]
+        self.top1_prob = metrics["adaptive_sampling_top1_prob"]
+        self.top1_bin = metrics["adaptive_sampling_top1_bin"]
+        self.failure_mass = metrics["adaptive_failure_mass"]
 
 
 class CorpusRotator:
@@ -419,6 +439,8 @@ class CorpusRotator:
         uniform_ratio: float,
         kernel_size: int,
         kernel_lambda: float,
+        failure_rate_max_over_mean: float = 5.0,
+        max_prob_multiplier: float = 5.0,
         update_period: int = 128,
     ) -> None:
         self._adaptive = AdaptiveRotationSampler(
@@ -427,6 +449,8 @@ class CorpusRotator:
             uniform_ratio=uniform_ratio,
             kernel_size=kernel_size,
             kernel_lambda=kernel_lambda,
+            failure_rate_max_over_mean=failure_rate_max_over_mean,
+            max_prob_multiplier=max_prob_multiplier,
             update_period=update_period,
         )
 
@@ -438,6 +462,14 @@ class CorpusRotator:
     @property
     def adaptive(self) -> AdaptiveRotationSampler | None:
         return self._adaptive
+
+    def adaptive_metrics(self) -> dict[str, float]:
+        """Return the common metrics for the currently published CDF."""
+        assert self._adaptive is not None
+        return adaptive_sampling_metrics(
+            self._adaptive.probabilities,
+            self._adaptive.failure_mass,
+        )
 
     # ------------------------------------------------------------------
     # Per-step driver

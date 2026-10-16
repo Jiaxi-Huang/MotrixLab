@@ -65,6 +65,7 @@ from motrix_envs.locomotion.wbt.mdp.rewards import (
     UndesiredContactsRewardCfg as UndesiredContactsRewardCfg,
 )
 from motrix_envs.motion.rotation import CorpusRotator
+from motrix_envs.motion.sampler import adaptive_sampling_metrics
 from motrix_envs.motion.sonic import SonicMotionClip
 
 # Policy joint order: the g1_sonic.xml actuator order (grouped by limb).
@@ -243,20 +244,53 @@ def _adaptive_sampling_probabilities(
     uniform_ratio: np.float32,
     kernel_size: np.int64,
     kernel_lambda: np.float32,
+    exposure: np.ndarray | None = None,
+    failure_rate_max_over_mean: np.float32 = np.float32(5.0),
+    max_prob_multiplier: np.float32 = np.float32(5.0),
 ) -> np.ndarray:
-    """Build SONIC frame-bin probabilities with edge-extended smoothing."""
+    """Build a bounded failure-rate/uniform mixture for the frame-bin CDF."""
     num_bins = failed_count.size
-    probability = failed_count + uniform_ratio / num_bins
+    if num_bins == 0:
+        return np.empty((0,), dtype=np.float32)
+
+    # Keep the old helper call contract for standalone callers/tests. Runtime
+    # sampling passes exposure explicitly and uses a failure rate instead of a
+    # raw failure count.
+    if exposure is None:
+        failure_rate = failed_count + uniform_ratio / num_bins
+        legacy_mode = True
+    else:
+        # Use a Beta(1, 1) prior so unseen bins start at the same neutral rate
+        # as all other bins, while sampled successful bins become easier.
+        failure_rate = (failed_count + np.float32(1.0)) / (exposure + np.float32(1.0))
+        legacy_mode = False
+    mean_rate = float(np.mean(failure_rate))
+    if not legacy_mode and mean_rate > 0.0 and failure_rate_max_over_mean > 0.0:
+        failure_rate = np.minimum(failure_rate, mean_rate * failure_rate_max_over_mean)
+
     kernel_size = max(kernel_size, 1)
     if kernel_size > 1:
         kernel = np.asarray([kernel_lambda**i for i in range(kernel_size)], dtype=np.float32)
         kernel /= np.sum(kernel)
-        padded = np.pad(probability, (0, kernel_size - 1), mode="edge")
-        probability = np.correlate(padded, kernel, mode="valid")
-    total = np.sum(probability)
-    if total <= 0.0:
-        return np.full((num_bins,), 1.0 / num_bins, dtype=np.float32)
-    return (probability / total).astype(np.float32)
+        padded = np.pad(failure_rate, (0, kernel_size - 1), mode="edge")
+        failure_rate = np.correlate(padded, kernel, mode="valid")
+
+    total = float(np.sum(failure_rate))
+    uniform = np.full((num_bins,), 1.0 / num_bins, dtype=np.float32)
+    if total <= 0.0 or not np.isfinite(total):
+        return uniform
+    if legacy_mode:
+        probability = failure_rate / total
+    else:
+        adaptive = failure_rate / total
+        probability = (np.float32(1.0) - uniform_ratio) * adaptive + uniform_ratio * uniform
+
+        # Limit the concentration relative to a uniform bin before the final
+        # normalization.  This prevents one bad bin from monopolising resets.
+        if max_prob_multiplier > 0.0:
+            probability = np.minimum(probability, max_prob_multiplier / num_bins)
+            probability /= np.sum(probability)
+    return probability.astype(np.float32)
 
 
 @njit(inline="always")
@@ -349,6 +383,8 @@ class SonicMotionCommand(CommandTerm):
     target_body_orientation_relative: np.ndarray
     adaptive_bin_failed_count: SharedArray
     adaptive_current_bin_failed_count: SharedArray
+    adaptive_bin_exposure: SharedArray
+    adaptive_current_bin_exposure: SharedArray
     sampling_cdf: SharedArray
     adaptive_rotation_enabled: np.bool_
     adaptive_active_bin_count: SharedArray
@@ -359,6 +395,8 @@ class SonicMotionCommand(CommandTerm):
     adaptive_failure_local_step: np.ndarray
     start_at_timestep_zero_prob: np.float32
     uniform_ratio: np.float32
+    failure_rate_max_over_mean: np.float32
+    max_prob_multiplier: np.float32
     alpha: np.float32
     kernel_size: np.int64
     kernel_lambda: np.float32
@@ -444,27 +482,32 @@ class SonicMotionCommand(CommandTerm):
         elif self.sampling_cdf.size:
             # With clip_end routing removed, every termination is a failure.
             episode_failed = ctx.terminated[env_ids]
-            if np.any(episode_failed):
-                base = self.window_range[0]
-                frames = self.window_range[1]
-                failed_steps = self.steps[env_ids, 0][episode_failed]
-                # During a rotation swap, lanes still draining the retired
-                # window must not charge failures into the new window's bins.
-                failed_steps = failed_steps[(failed_steps >= base) & (failed_steps < base + frames)]
+            base = self.window_range[0]
+            frames = self.window_range[1]
+            episode_steps = self.steps[env_ids, 0]
+            # During a rotation swap, lanes still draining the retired
+            # window must not charge exposure or failures into the new
+            # window's bins.
+            in_window = episode_failed & (episode_steps >= base) & (episode_steps < base + frames)
+            observed_steps = episode_steps[in_window]
+            if observed_steps.size:
+                num_bins = self.adaptive_bin_failed_count.size
+                observed_bins = ((observed_steps - base) * num_bins) // max(int(frames), 1)
+                observed_bins = np.clip(observed_bins, 0, num_bins - 1)
+                self.adaptive_current_bin_exposure[:] += np.bincount(
+                    observed_bins, minlength=num_bins
+                ).astype(np.float32)
+                failed_steps = episode_steps[episode_failed & in_window]
                 if failed_steps.size:
-                    num_bins = self.adaptive_bin_failed_count.size
                     failed_bins = ((failed_steps - base) * num_bins) // max(int(frames), 1)
                     failed_bins = np.clip(failed_bins, 0, num_bins - 1)
-                    self.adaptive_current_bin_failed_count[:] += np.bincount(failed_bins, minlength=num_bins).astype(
-                        np.float32
-                    )
+                    self.adaptive_current_bin_failed_count[:] += np.bincount(
+                        failed_bins, minlength=num_bins
+                    ).astype(np.float32)
             probabilities = self._sampling_probabilities()
-            entropy = -float(np.sum(probabilities * np.log(probabilities + 1e-12)))
-            ctx.metrics["adaptive_sampling_entropy"] = entropy / float(np.log(max(probabilities.size, 2)))
-            top_bin = int(np.argmax(probabilities))
-            ctx.metrics["adaptive_sampling_top1_prob"] = float(probabilities[top_bin])
-            ctx.metrics["adaptive_sampling_top1_bin"] = float(top_bin) / float(probabilities.size)
-            ctx.metrics["adaptive_failure_mass"] = float(np.sum(self.adaptive_bin_failed_count))
+            ctx.metrics.update(
+                adaptive_sampling_metrics(probabilities, float(np.sum(self.adaptive_bin_failed_count)))
+            )
             self.sampling_cdf[:] = np.cumsum(probabilities, dtype=np.float32)
             self.sampling_cdf[-1] = 1.0
         self.reset_counter[ctx.env_ids] += 1
@@ -475,7 +518,12 @@ class SonicMotionCommand(CommandTerm):
                 self.alpha * self.adaptive_current_bin_failed_count
                 + (np.float32(1.0) - self.alpha) * self.adaptive_bin_failed_count
             )
+            self.adaptive_bin_exposure[:] = (
+                self.alpha * self.adaptive_current_bin_exposure
+                + (np.float32(1.0) - self.alpha) * self.adaptive_bin_exposure
+            )
             self.adaptive_current_bin_failed_count.fill(0.0)
+            self.adaptive_current_bin_exposure.fill(0.0)
 
     @dispatch
     def reset_env(self, ctx: ManagerContext) -> None:
@@ -558,6 +606,9 @@ class SonicMotionCommand(CommandTerm):
             self.uniform_ratio,
             self.kernel_size,
             self.kernel_lambda,
+            exposure=self.adaptive_bin_exposure,
+            failure_rate_max_over_mean=self.failure_rate_max_over_mean,
+            max_prob_multiplier=self.max_prob_multiplier,
         )
 
 
@@ -588,6 +639,9 @@ class SonicMotionCommandCfg(CommandCfg):
     start_at_timestep_zero_prob: float = 0.0
     low_reference_height_threshold: float = 0.5
     uniform_ratio: float = 0.2
+    # Bound the feedback loop so one anomalous bin cannot dominate resets.
+    failure_rate_max_over_mean: float = 5.0
+    max_prob_multiplier: float = 5.0
     # One second at SONIC's 50 Hz source rate, matching gear_sonic.  Adaptive
     # rotation stores these source-local bins lazily as clips are decoded.
     adaptive_bin_size: int = 50
@@ -625,6 +679,10 @@ class SonicMotionCommandCfg(CommandCfg):
             raise ValueError("SONIC adaptive_update_period must be a positive integer")
         if not 0.0 <= self.uniform_ratio <= 1.0:
             raise ValueError("SONIC uniform_ratio must be in [0, 1]")
+        if self.failure_rate_max_over_mean <= 0.0:
+            raise ValueError("SONIC failure_rate_max_over_mean must be positive")
+        if self.max_prob_multiplier <= 0.0:
+            raise ValueError("SONIC max_prob_multiplier must be positive")
         if self.encoder_sampling not in ENCODER_SAMPLING_MODES:
             raise ValueError(f"SONIC encoder_sampling must be one of {ENCODER_SAMPLING_MODES}")
         if self.motion_files and not all(isinstance(path, str) and path for path in self.motion_files):
@@ -705,6 +763,8 @@ class SonicMotionCommandCfg(CommandCfg):
             target_body_orientation_relative=np.empty((env.num_envs, shape[0], 4), np.float32),
             adaptive_bin_failed_count=np.zeros(nbin, np.float32),
             adaptive_current_bin_failed_count=np.zeros(nbin, np.float32),
+            adaptive_bin_exposure=np.zeros(nbin, np.float32),
+            adaptive_current_bin_exposure=np.zeros(nbin, np.float32),
             sampling_cdf=np.ones(nbin, np.float32) if nbin else np.empty((0,), np.float32),
             adaptive_rotation_enabled=np.bool_(adaptive_rotation),
             adaptive_active_bin_count=np.zeros(1, np.int64),
@@ -715,6 +775,8 @@ class SonicMotionCommandCfg(CommandCfg):
             adaptive_failure_local_step=np.zeros(env.num_envs, np.int64),
             start_at_timestep_zero_prob=np.float32(self.start_at_timestep_zero_prob),
             uniform_ratio=np.float32(self.uniform_ratio),
+            failure_rate_max_over_mean=np.float32(self.failure_rate_max_over_mean),
+            max_prob_multiplier=np.float32(self.max_prob_multiplier),
             alpha=np.float32(self.alpha),
             kernel_size=np.int64(self.kernel_size),
             kernel_lambda=np.float32(self.kernel_lambda),
@@ -734,6 +796,8 @@ class SonicMotionCommandCfg(CommandCfg):
                     uniform_ratio=self.uniform_ratio,
                     kernel_size=self.kernel_size,
                     kernel_lambda=self.kernel_lambda,
+                    failure_rate_max_over_mean=self.failure_rate_max_over_mean,
+                    max_prob_multiplier=self.max_prob_multiplier,
                     update_period=self.adaptive_update_period,
                 )
             env._pending_motion_rotation = rotator
