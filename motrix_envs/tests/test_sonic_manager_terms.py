@@ -1129,10 +1129,16 @@ def test_sonic_adaptive_kernel_matches_reference_smoothing() -> None:
             )
             kernel = np.asarray([0.8**i for i in range(kernel_size)], np.float32)
             kernel /= np.sum(kernel)
-            base = failed + np.float32(0.2) / num_bins
-            padded = np.pad(base, (0, kernel_size - 1), mode="edge")
-            want = np.asarray([np.sum(padded[i : i + kernel_size] * kernel) for i in range(num_bins)], np.float32)
-            want = (want / np.sum(want)).astype(np.float32)
+            padded = np.pad(failed, (0, kernel_size - 1), mode="edge")
+            adaptive = np.asarray(
+                [np.sum(padded[i : i + kernel_size] * kernel) for i in range(num_bins)], np.float32
+            )
+            if np.sum(adaptive) <= 0.0:
+                adaptive.fill(1.0 / num_bins)
+            else:
+                adaptive /= np.sum(adaptive)
+            uniform = np.full(num_bins, 1.0 / num_bins, np.float32)
+            want = (0.8 * adaptive + 0.2 * uniform).astype(np.float32)
             np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
             np.testing.assert_allclose(got.sum(), 1.0, rtol=1e-6)
 

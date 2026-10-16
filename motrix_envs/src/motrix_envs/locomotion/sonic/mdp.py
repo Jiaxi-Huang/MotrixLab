@@ -244,52 +244,38 @@ def _adaptive_sampling_probabilities(
     uniform_ratio: np.float32,
     kernel_size: np.int64,
     kernel_lambda: np.float32,
-    exposure: np.ndarray | None = None,
-    failure_rate_max_over_mean: np.float32 = np.float32(5.0),
-    max_prob_multiplier: np.float32 = np.float32(5.0),
+    failure_rate_max_over_mean: np.float32 = np.float32(0.0),
+    max_prob_multiplier: np.float32 = np.float32(0.0),
 ) -> np.ndarray:
-    """Build a bounded failure-rate/uniform mixture for the frame-bin CDF."""
+    """Build a bounded failure-weight/uniform mixture for the frame-bin CDF."""
     num_bins = failed_count.size
     if num_bins == 0:
         return np.empty((0,), dtype=np.float32)
 
-    # Keep the old helper call contract for standalone callers/tests. Runtime
-    # sampling passes exposure explicitly and uses a failure rate instead of a
-    # raw failure count.
-    if exposure is None:
-        failure_rate = failed_count + uniform_ratio / num_bins
-        legacy_mode = True
-    else:
-        # Use a Beta(1, 1) prior so unseen bins start at the same neutral rate
-        # as all other bins, while sampled successful bins become easier.
-        failure_rate = (failed_count + np.float32(1.0)) / (exposure + np.float32(1.0))
-        legacy_mode = False
-    mean_rate = float(np.mean(failure_rate))
-    if not legacy_mode and mean_rate > 0.0 and failure_rate_max_over_mean > 0.0:
-        failure_rate = np.minimum(failure_rate, mean_rate * failure_rate_max_over_mean)
+    failure_weight = failed_count.astype(np.float32, copy=True)
+    mean_weight = float(np.mean(failure_weight))
+    if mean_weight > 0.0 and failure_rate_max_over_mean > 0.0:
+        failure_weight = np.minimum(failure_weight, mean_weight * failure_rate_max_over_mean)
 
     kernel_size = max(kernel_size, 1)
     if kernel_size > 1:
         kernel = np.asarray([kernel_lambda**i for i in range(kernel_size)], dtype=np.float32)
         kernel /= np.sum(kernel)
-        padded = np.pad(failure_rate, (0, kernel_size - 1), mode="edge")
-        failure_rate = np.correlate(padded, kernel, mode="valid")
+        padded = np.pad(failure_weight, (0, kernel_size - 1), mode="edge")
+        failure_weight = np.correlate(padded, kernel, mode="valid")
 
-    total = float(np.sum(failure_rate))
+    total = float(np.sum(failure_weight))
     uniform = np.full((num_bins,), 1.0 / num_bins, dtype=np.float32)
     if total <= 0.0 or not np.isfinite(total):
         return uniform
-    if legacy_mode:
-        probability = failure_rate / total
-    else:
-        adaptive = failure_rate / total
-        probability = (np.float32(1.0) - uniform_ratio) * adaptive + uniform_ratio * uniform
+    adaptive = failure_weight / total
+    probability = (np.float32(1.0) - uniform_ratio) * adaptive + uniform_ratio * uniform
 
-        # Limit the concentration relative to a uniform bin before the final
-        # normalization.  This prevents one bad bin from monopolising resets.
-        if max_prob_multiplier > 0.0:
-            probability = np.minimum(probability, max_prob_multiplier / num_bins)
-            probability /= np.sum(probability)
+    # Limit the concentration relative to a uniform bin before the final
+    # normalization.  This prevents one bad bin from monopolising resets.
+    if max_prob_multiplier > 0.0:
+        probability = np.minimum(probability, max_prob_multiplier / num_bins)
+        probability /= np.sum(probability)
     return probability.astype(np.float32)
 
 
@@ -383,8 +369,6 @@ class SonicMotionCommand(CommandTerm):
     target_body_orientation_relative: np.ndarray
     adaptive_bin_failed_count: SharedArray
     adaptive_current_bin_failed_count: SharedArray
-    adaptive_bin_exposure: SharedArray
-    adaptive_current_bin_exposure: SharedArray
     sampling_cdf: SharedArray
     adaptive_rotation_enabled: np.bool_
     adaptive_active_bin_count: SharedArray
@@ -494,9 +478,6 @@ class SonicMotionCommand(CommandTerm):
                 num_bins = self.adaptive_bin_failed_count.size
                 observed_bins = ((observed_steps - base) * num_bins) // max(int(frames), 1)
                 observed_bins = np.clip(observed_bins, 0, num_bins - 1)
-                self.adaptive_current_bin_exposure[:] += np.bincount(
-                    observed_bins, minlength=num_bins
-                ).astype(np.float32)
                 failed_steps = episode_steps[episode_failed & in_window]
                 if failed_steps.size:
                     failed_bins = ((failed_steps - base) * num_bins) // max(int(frames), 1)
@@ -518,12 +499,7 @@ class SonicMotionCommand(CommandTerm):
                 self.alpha * self.adaptive_current_bin_failed_count
                 + (np.float32(1.0) - self.alpha) * self.adaptive_bin_failed_count
             )
-            self.adaptive_bin_exposure[:] = (
-                self.alpha * self.adaptive_current_bin_exposure
-                + (np.float32(1.0) - self.alpha) * self.adaptive_bin_exposure
-            )
             self.adaptive_current_bin_failed_count.fill(0.0)
-            self.adaptive_current_bin_exposure.fill(0.0)
 
     @dispatch
     def reset_env(self, ctx: ManagerContext) -> None:
@@ -606,7 +582,6 @@ class SonicMotionCommand(CommandTerm):
             self.uniform_ratio,
             self.kernel_size,
             self.kernel_lambda,
-            exposure=self.adaptive_bin_exposure,
             failure_rate_max_over_mean=self.failure_rate_max_over_mean,
             max_prob_multiplier=self.max_prob_multiplier,
         )
@@ -763,8 +738,6 @@ class SonicMotionCommandCfg(CommandCfg):
             target_body_orientation_relative=np.empty((env.num_envs, shape[0], 4), np.float32),
             adaptive_bin_failed_count=np.zeros(nbin, np.float32),
             adaptive_current_bin_failed_count=np.zeros(nbin, np.float32),
-            adaptive_bin_exposure=np.zeros(nbin, np.float32),
-            adaptive_current_bin_exposure=np.zeros(nbin, np.float32),
             sampling_cdf=np.ones(nbin, np.float32) if nbin else np.empty((0,), np.float32),
             adaptive_rotation_enabled=np.bool_(adaptive_rotation),
             adaptive_active_bin_count=np.zeros(1, np.int64),
