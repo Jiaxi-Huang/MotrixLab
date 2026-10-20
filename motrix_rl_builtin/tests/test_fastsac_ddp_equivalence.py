@@ -14,6 +14,7 @@ log_alpha averaging and optimizer stepping, without any environment.
 from __future__ import annotations
 
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -49,7 +50,7 @@ def _make_agent(world_size: int, seed: int) -> object:
         critic_obs_dim=COBS,
         act_dim=ACT,
         num_envs=8,
-        cfg=cfg,
+        cfg=SimpleNamespace(policy_variant="default", agent=cfg),
         device=torch.device("cpu"),
         action_scale=torch.ones(ACT),
         action_bias=torch.zeros(ACT),

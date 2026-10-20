@@ -12,6 +12,36 @@ from __future__ import annotations
 import numpy as np
 
 
+def adaptive_sampling_metrics(probabilities: np.ndarray, failure_mass: float) -> dict[str, float]:
+    """Return the common metrics for one adaptive sampling distribution.
+
+    ``probabilities`` must be the normalized CDF masses used by the command for
+    the next reset.  Both resident-corpus and rotated-window samplers use this
+    helper so their TensorBoard metrics have identical definitions.
+    """
+    num_bins = probabilities.size
+    if num_bins == 0:
+        return {
+            "adaptive_sampling_entropy": 1.0,
+            "adaptive_sampling_top1_prob": 0.0,
+            "adaptive_sampling_top1_bin": 0.0,
+            "adaptive_failure_mass": float(failure_mass),
+        }
+    total = float(np.sum(probabilities))
+    if total <= 0.0 or not np.isfinite(total):
+        probabilities = np.full(num_bins, 1.0 / num_bins, dtype=np.float32)
+    elif not np.isclose(total, 1.0):
+        probabilities = probabilities / total
+    entropy = -float(np.sum(probabilities * np.log(probabilities + 1e-12)))
+    top_bin = int(np.argmax(probabilities))
+    return {
+        "adaptive_sampling_entropy": entropy / float(np.log(max(num_bins, 2))),
+        "adaptive_sampling_top1_prob": float(probabilities[top_bin]),
+        "adaptive_sampling_top1_bin": float(top_bin) / float(num_bins),
+        "adaptive_failure_mass": float(failure_mass),
+    }
+
+
 class AdaptiveTimestepsSampler:
     """Curriculum sampler that biases motion-clip start frames toward harder regions.
 

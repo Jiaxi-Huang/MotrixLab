@@ -34,7 +34,7 @@ def test_sync_train_closes_tensorboard_writer_when_training_fails(tmp_path, monk
         num_envs=1,
         play_num_envs=1,
         seed=None,
-        rl_cfg=SimpleNamespace(trainer=SimpleNamespace(num_learning_iterations=1)),
+        rl_cfg=SimpleNamespace(trainer=SimpleNamespace(num_learning_iterations=1), policy_variant="default"),
         logging=LoggingConfig(backend="tensorboard", interval=1),
         checkpoint=CheckpointConfig(interval=0),
     )

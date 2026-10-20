@@ -464,6 +464,11 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         )
         self._observation_space = ObsSpace(policy=policy_space, value=value_space)
 
+    @property
+    def seed(self) -> int:
+        """Base RNG seed this env was constructed with (1 when unspecified)."""
+        return self._rand_seed
+
     def create_renderer(self, config: RenderConfig) -> SimRenderer:
         return self.sim.create_renderer(
             config,

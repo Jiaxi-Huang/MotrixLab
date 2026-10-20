@@ -272,7 +272,7 @@ def _train_sync(tmp_path, monkeypatch, *, resume_from=None, diverge_at=None):
     num_envs = 3
     monkeypatch.setattr(Trainer, "_make_env", lambda self, *args, **kwargs: _SyncEnv(num_envs, diverge_at))
     monkeypatch.setattr(Trainer, "_make_agent", lambda self, env: _SyncAgent(num_envs, learning_starts=3))
-    rl_cfg = SimpleNamespace(trainer=SimpleNamespace(num_learning_iterations=8))
+    rl_cfg = SimpleNamespace(policy_variant="default", trainer=SimpleNamespace(num_learning_iterations=8))
     metrics, sink = _logger(tmp_path)
     context = _context(
         tmp_path, rl_cfg, metrics, num_envs=num_envs, logging_interval=2, save_interval=4, resume_from=resume_from
@@ -538,6 +538,7 @@ def _train_async(tmp_path, monkeypatch, workers: _Workers, *, num_iterations: in
     monkeypatch.setattr(async_train.Trainer, "_make_env", lambda self, *args, **kwargs: _ProbeEnv())
     (tmp_path / "metadata.json").write_text("{}")
     rl_cfg = SimpleNamespace(
+        policy_variant="default",
         device="cpu",
         agent=SimpleNamespace(batch_size=8, learning_starts=LEARNING_STARTS),
         trainer=SimpleNamespace(

@@ -15,6 +15,7 @@ dependencies = [
     "gymnasium==1.1.1",
     "numpy>=1.26",
     "torch>=2.7,<3",
+    "vector-quantize-pytorch===1.31.4",
 ]
 
 [project.entry-points."motrix_rl.frameworks"]

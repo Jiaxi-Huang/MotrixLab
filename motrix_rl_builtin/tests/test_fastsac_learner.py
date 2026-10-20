@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 
 def _tiny_agent_cfg(**overrides):
-    """Minimal valid FastSacAgentCfg namespace for a real (tiny) CUDA agent."""
+    """Minimal provider-level FastSac namespace for a real (tiny) CUDA agent."""
     values = dict(
         actor_hidden_dim=16,
         critic_hidden_dim=16,
@@ -42,7 +42,7 @@ def _tiny_agent_cfg(**overrides):
         device=None,
     )
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return SimpleNamespace(agent=SimpleNamespace(**values), policy_variant="default")
 
 
 def test_policy_frequency_gating_spans_update_calls() -> None:
