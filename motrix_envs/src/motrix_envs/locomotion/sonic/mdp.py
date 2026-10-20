@@ -64,8 +64,8 @@ from motrix_envs.locomotion.wbt.mdp.rewards import (
 from motrix_envs.locomotion.wbt.mdp.rewards import (
     UndesiredContactsRewardCfg as UndesiredContactsRewardCfg,
 )
+from motrix_envs.motion.adaptive import AdaptiveMotionSampler, clip_segment_bounds, count_segment_bins
 from motrix_envs.motion.rotation import CorpusRotator
-from motrix_envs.motion.sampler import adaptive_sampling_metrics
 from motrix_envs.motion.sonic import SonicMotionClip
 
 # Policy joint order: the g1_sonic.xml actuator order (grouped by limb).
@@ -239,90 +239,6 @@ def _sample_encoder_slot(rng_state: np.ndarray, mode: np.int64) -> np.int64:
     return np.int64(2)
 
 
-def _cap_per_bin_probability(probability: np.ndarray, max_prob_per_bin: np.float32) -> np.ndarray:
-    """Cap every bin at ``max_prob_per_bin / num_bins`` via water-filling.
-
-    Clipping plus a single renormalization cannot hold the bound — the mass
-    pushed off the capped bins inflates the remaining ones back above the cap
-    (the flaw in the previous sampler). Iteratively clip and redistribute the
-    surplus over the uncapped bins until every bin sits at or below its
-    fair-share multiple. Requires ``max_prob_per_bin >= 1`` so the cap is at
-    or above the uniform level and the final normalization preserves it.
-    """
-    num_bins = probability.size
-    if num_bins == 0:
-        return probability
-    cap = max_prob_per_bin / np.float32(num_bins)
-    p = probability.astype(np.float32, copy=True)
-    for _ in range(32):
-        over = p > cap
-        if not over.any():
-            break
-        surplus = float(np.sum(p[over] - cap))
-        p[over] = cap
-        free = ~over
-        free_mass = float(np.sum(p[free]))
-        if free_mass <= 0.0:
-            p[:] = cap
-            break
-        p[free] *= np.float32((free_mass + surplus) / free_mass)
-        if not np.any(p > cap):
-            break
-    total = float(np.sum(p))
-    if total > 0.0 and abs(total - 1.0) > 1e-6:
-        p *= np.float32(1.0 / total)
-    return p
-
-
-def _adaptive_rate_probabilities(
-    failures: np.ndarray,
-    exposure: np.ndarray,
-    bin_weights: np.ndarray,
-    uniform_ratio: np.float32,
-    failure_rate_max_over_mean: np.float32,
-    max_prob_per_bin: np.float32,
-) -> np.ndarray:
-    """Build per-bin start probabilities from cumulative failure rates.
-
-    Port of gear_sonic ``update_adaptive_sampling_probabilities``. The signal
-    is the per-bin failure rate ``failures / exposure`` — both counters start
-    at one and accumulate for the lifetime of the collector, so the estimate
-    is exposure-normalized and cannot self-reinforce through sampling volume
-    alone. The rate is clipped at ``mean(rate) * failure_rate_max_over_mean``,
-    blended with a uniform floor, and shaped by ``bin_weights`` (which
-    equalize the total probability mass of every motion clip). A final
-    water-filled cap bounds any single bin at ``max_prob_per_bin`` times the
-    uniform level — upstream ships this as ``max_prob_per_bin`` (their large-
-    corpus recipe uses a conservative 2x, since unconstrained rates
-    over-sample one hard moment indefinitely). There is intentionally no EMA
-    and no spatial kernel: cumulative counters are already smooth, and
-    upstream ships neither.
-    """
-    num_bins = failures.size
-    if num_bins == 0:
-        return np.empty((0,), dtype=np.float32)
-
-    rate = failures / np.maximum(exposure, np.float32(1e-6))
-    mean_rate = float(np.mean(rate))
-    if mean_rate > 0.0 and failure_rate_max_over_mean > 0.0:
-        rate = np.clip(rate, np.float32(0.0), np.float32(mean_rate * failure_rate_max_over_mean))
-
-    total = float(np.sum(rate))
-    uniform = np.full((num_bins,), 1.0 / num_bins, dtype=np.float32)
-    if total <= 0.0 or not np.isfinite(total):
-        return uniform
-    failure_based = rate / total
-    probability = (np.float32(1.0) - uniform_ratio) * failure_based + uniform_ratio * uniform
-    probability = probability * bin_weights
-    total = float(np.sum(probability))
-    if total <= 0.0 or not np.isfinite(total):
-        return uniform
-    probability = probability / total
-    if max_prob_per_bin > 0.0:
-        probability = _cap_per_bin_probability(probability, max_prob_per_bin)
-    return probability.astype(np.float32)
-
-
 @njit(inline="always")
 def _sample_motion_step_from_cdf(
     rand_state,
@@ -417,10 +333,19 @@ def _sample_motion_step_from_active_bins(
     bin_start,
     bin_end,
     active_bin_count: np.int64,
-    window_base: np.int64,
+    frame_source_start,
     start_at_timestep_zero_prob: np.float32,
+    pre_failure_sample_window: np.int64,
 ):
-    """Sample a source-stable adaptive bin without touching uniform RNG flow."""
+    """Draw one start frame from the per-source adaptive bin table.
+
+    Port of gear_sonic ``sample_motion_ids_and_time_steps``: pick a bin from
+    the CDF, draw a uniform frame inside it, then shift the start back by a
+    uniform offset of up to ``pre_failure_sample_window`` frames so the
+    episode practices the approach into the hard segment instead of
+    teleporting into a cold-start failure. Clamping is to the source clip's
+    head frame — upstream's ``clamp_min(0)`` on the motion-local timeline.
+    """
     unit = (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5)
     low = np.int64(0)
     high = active_bin_count - np.int64(1)
@@ -434,8 +359,14 @@ def _sample_motion_step_from_active_bins(
     end = bin_end[low]
     bin_unit = (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5)
     step = start + np.int64(bin_unit * np.float32(end - start))
+    clip_start = frame_source_start[step]
+    if pre_failure_sample_window > 0:
+        offset_unit = (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5)
+        step -= np.int64(offset_unit * np.float32(pre_failure_sample_window))
+        if step < clip_start:
+            step = clip_start
     if (next_uniform(rand_state) + np.float32(1.0)) * np.float32(0.5) < start_at_timestep_zero_prob:
-        step = window_base
+        step = clip_start
     return step
 
 
@@ -464,22 +395,19 @@ class SonicMotionCommand(CommandTerm):
     reference_index: np.int64
     target_body_position_relative: np.ndarray
     target_body_orientation_relative: np.ndarray
-    adaptive_bin_failed_count: SharedArray
-    adaptive_bin_exposure: SharedArray
-    adaptive_bin_weights: SharedArray
+    # Adaptive sampling tables, republished host-side by AdaptiveMotionSampler:
+    # the CDF over active per-source bins plus each bin's frame range.
     sampling_cdf: SharedArray
-    adaptive_rotation_enabled: np.bool_
     adaptive_active_bin_count: SharedArray
     adaptive_bin_start: SharedArray
     adaptive_bin_end: SharedArray
+    # Host-side failure handoff: reset marks terminated lanes with their
+    # source clip and source-local frame; the sampler drains them per tick.
     adaptive_failure_pending: np.ndarray
     adaptive_failure_source_id: np.ndarray
     adaptive_failure_local_step: np.ndarray
     start_at_timestep_zero_prob: np.float32
-    uniform_ratio: np.float32
-    failure_rate_max_over_mean: np.float32
     pre_failure_sample_window: np.int64
-    max_prob_per_bin: np.float32
     clip_round_robin: np.bool_
     rr_cursor: SharedArray
     rr_clip_start: SharedArray
@@ -554,8 +482,16 @@ class SonicMotionCommand(CommandTerm):
             quat_mul(out_quat, motion_tracked_bodies_quat_w[body_id], out_quat)
 
     def reset(self, ctx: ResetContext) -> None:
+        """Mark terminated lanes for the adaptive sampler.
+
+        Every termination is a failure (gear_sonic ``update_adaptive_sampling``
+        credits the bin where the episode ended): the lane records its source
+        clip and source-local frame, and the host sampler folds the failure
+        into that clip's per-bin statistics on its next tick. Lanes still
+        draining a retired rotation window keep reporting to their own source.
+        """
         env_ids = ctx.env_ids
-        if self.adaptive_rotation_enabled:
+        if self.sampling_cdf.size:
             failed_env_ids = env_ids[ctx.terminated[env_ids]]
             if failed_env_ids.size:
                 failed_steps = self.steps[failed_env_ids, 0]
@@ -564,60 +500,20 @@ class SonicMotionCommand(CommandTerm):
                     failed_steps - self.clip.frame_source_start[failed_steps]
                 )
                 self.adaptive_failure_pending[failed_env_ids] = True
-        elif self.sampling_cdf.size:
-            # Every termination is a failure: credit the bin where the episode
-            # ended. Port of gear_sonic ``update_adaptive_sampling``; exposure
-            # is accumulated separately in ``on_transition`` so the CDF is
-            # driven by the per-bin failure RATE, never by raw counts.
-            episode_failed = ctx.terminated[env_ids]
-            base = self.window_range[0]
-            frames = self.window_range[1]
-            episode_steps = self.steps[env_ids, 0]
-            # During a rotation swap, lanes still draining the retired
-            # window must not charge exposure or failures into the new
-            # window's bins.
-            in_window = episode_failed & (episode_steps >= base) & (episode_steps < base + frames)
-            failed_steps = episode_steps[in_window]
-            if failed_steps.size:
-                num_bins = self.adaptive_bin_failed_count.size
-                failed_bins = ((failed_steps - base) * num_bins) // max(int(frames), 1)
-                failed_bins = np.clip(failed_bins, 0, num_bins - 1)
-                self.adaptive_bin_failed_count[:] += np.bincount(failed_bins, minlength=num_bins).astype(np.float32)
-            probabilities = self._sampling_probabilities()
-            ctx.metrics.update(adaptive_sampling_metrics(probabilities, float(np.sum(self.adaptive_bin_failed_count))))
-            self.sampling_cdf[:] = np.cumsum(probabilities, dtype=np.float32)
-            self.sampling_cdf[-1] = 1.0
         self.reset_counter[ctx.env_ids] += 1
-
-    def on_transition(self) -> None:
-        """Accumulate per-bin exposure for every lane (gear_sonic parity).
-
-        Called once per control step: every lane contributes one exposure unit
-        to the bin it currently occupies, so ``failures / exposure`` is a true
-        per-bin termination rate instead of a sampling-volume-biased count.
-        Cumulative counters — no EMA — mirrored upstream's checkpointed
-        statistics.
-        """
-        num_bins = self.adaptive_bin_exposure.size
-        if num_bins == 0:
-            return
-        base = self.window_range[0]
-        frames = self.window_range[1]
-        bins = ((self.steps[:, 0] - base) * num_bins) // max(int(frames), 1)
-        bins = np.clip(bins, 0, num_bins - 1)
-        self.adaptive_bin_exposure[:] += np.bincount(bins, minlength=num_bins).astype(np.float32)
 
     @dispatch
     def reset_env(self, ctx: ManagerContext) -> None:
-        if self.adaptive_rotation_enabled:
+        if self.sampling_cdf.size:
             self.steps[0] = _sample_motion_step_from_active_bins(
                 ctx.rand.state,
                 self.sampling_cdf,
                 self.adaptive_bin_start,
                 self.adaptive_bin_end,
                 self.adaptive_active_bin_count[0],
-                self.window_range[0],
+                self.clip.frame_source_start,
                 self.start_at_timestep_zero_prob,
+                self.pre_failure_sample_window,
             )
         elif self.clip_round_robin:
             self.steps[0] = _draw_round_robin_start_step(
@@ -673,15 +569,16 @@ class SonicMotionCommand(CommandTerm):
             # authoritative, and the sim reset terms teleport the robot to the
             # new frame. Episode bookkeeping and action-term state stay
             # untouched, so the episode continues until time-out or failure.
-            if self.adaptive_rotation_enabled:
+            if self.sampling_cdf.size:
                 self.steps[0] = _sample_motion_step_from_active_bins(
                     ctx.rand.state,
                     self.sampling_cdf,
                     self.adaptive_bin_start,
                     self.adaptive_bin_end,
                     self.adaptive_active_bin_count[0],
-                    self.window_range[0],
+                    self.clip.frame_source_start,
                     self.start_at_timestep_zero_prob,
+                    self.pre_failure_sample_window,
                 )
             elif self.clip_round_robin:
                 self.steps[0] = _draw_round_robin_start_step(
@@ -701,16 +598,6 @@ class SonicMotionCommand(CommandTerm):
                     self.pre_failure_sample_window,
                 )
             ctx.sim_reset_requested[0] = True
-
-    def _sampling_probabilities(self) -> np.ndarray:
-        return _adaptive_rate_probabilities(
-            self.adaptive_bin_failed_count,
-            self.adaptive_bin_exposure,
-            self.adaptive_bin_weights,
-            self.uniform_ratio,
-            self.failure_rate_max_over_mean,
-            self.max_prob_per_bin,
-        )
 
 
 @configclass(kw_only=True)
@@ -736,44 +623,58 @@ class SonicMotionCommandCfg(CommandCfg):
     reference_body_name: str = "pelvis"
     num_future_frames: int = SONIC_DEFAULT_NUM_FUTURE_FRAMES
     encoder_sampling: str = "mixed"
-    adaptive_sampling_enabled: bool = False  # True
+    # gear_sonic ``adaptive_sampling.enable`` (upstream release: true): every
+    # adaptive default below mirrors the upstream release values, so the
+    # default sampling behavior is equivalent. ``for_play()`` disables it for
+    # evaluation and ``clip_round_robin`` replaces it.
+    adaptive_sampling_enabled: bool = True
     start_at_timestep_zero_prob: float = 0.0
     low_reference_height_threshold: float = 0.5
-    # Uniform floor blended into the per-bin sampling distribution; guards
-    # every clip region against starvation.
-    uniform_ratio: float = 0.2
-    # Clip the per-bin failure RATE at this multiple of the mean rate (gear_sonic
-    # ``adp_samp_failure_rate_max_over_mean``; their release config uses 200).
-    failure_rate_max_over_mean: float = 5.0
-    # Episode starts drawn from a failure bin are shifted back by a uniform
-    # offset of up to this many frames (gear_sonic ``pre_failure_sample_window``),
+    # gear_sonic ``uniform_sampling_rate`` (upstream release: 0.1): uniform
+    # floor blended into the per-bin sampling distribution; guards every clip
+    # region against starvation.
+    uniform_ratio: float = 0.1
+    # gear_sonic ``adp_samp_failure_rate_max_over_mean`` (upstream release:
+    # 50): clip the per-bin failure RATE at this multiple of the mean rate.
+    failure_rate_max_over_mean: float = 50.0
+    # gear_sonic ``pre_failure_sample_window`` (upstream release: 200):
+    # episode starts shift back by a uniform offset of up to this many frames,
     # so the policy practices the approach into the hard segment instead of
     # teleporting straight into a cold-start failure.
     pre_failure_sample_window: int = 200
-    # Cap any single bin at this multiple of the uniform bin probability,
-    # enforced with water-filling so the bound survives normalization
-    # (gear_sonic ``max_prob_per_bin``; their large-corpus recipe uses a
-    # conservative 2x). Without it the failure-rate CDF over-samples one hard
-    # moment indefinitely.
-    max_prob_per_bin: float = 5.0
     # Balanced clip coverage: every reset claims the next clip in cyclic order
     # and a uniform frame inside it, so each clip receives the same number of
     # episode starts regardless of length. Replaces adaptive sampling (they
     # are mutually exclusive).
     clip_round_robin: bool = False
-    # One second at SONIC's 50 Hz source rate, matching gear_sonic.  Adaptive
-    # rotation stores these source-local bins lazily as clips are decoded.
+    # gear_sonic ``bin_size``: source-clip-local bin width in frames — one
+    # second at SONIC's 50 Hz source rate. Shared by the resident and rotated
+    # corpus paths; a bin never straddles two clips.
     adaptive_bin_size: int = 50
-    # Rebuild the host-side active-window CDF only after this many control steps
-    # with pending adaptive updates. Window publication still rebuilds eagerly.
+    # gear_sonic ``init_num_failures`` (upstream release: 1): failure and
+    # episode counters both start here, so the initial rate estimate is one
+    # everywhere and the initial distribution is clip-equalized uniform.
+    adaptive_init_count: float = 1.0
+    # gear_sonic ``sequence_length_agnostic`` (upstream release: true):
+    # equalize total probability mass across clips so long clips cannot
+    # dominate short ones purely through length.
+    adaptive_sequence_length_agnostic: bool = True
+    # Optional gear_sonic ``max_prob_per_bin``: cap any single bin at this
+    # multiple of the uniform bin probability, water-filled so the bound
+    # survives normalization. Upstream ships the knob but leaves it unset in
+    # the release config, so None disables it here too.
+    adaptive_max_prob_per_bin: float | None = None
+    # Republish the host-side active-window CDF after this many control steps
+    # with accumulated statistics. A window publication republishes eagerly.
     adaptive_update_period: int = 128
-    # Rotation-path sampler shaping: exponential spatial kernel and EMA rate of
-    # the per-window histogram, plus a per-bin probability cap. The resident
-    # (non-rotation) path uses the cumulative failure-rate mechanism instead.
-    alpha: float = 0.001
-    kernel_size: int = 3
-    kernel_lambda: float = 0.8
-    max_prob_multiplier: float = 5.0
+    # gear_sonic motion-level resample (``update_adaptive_sampling_motion_sequences``
+    # + ``ImResampleCallback``): fraction of each rotation window's clip slots
+    # drawn with replacement from the sampler's per-clip difficulty weights,
+    # deduplicated within the window. The remaining slots keep coming from the
+    # without-replacement coverage permutation, so every clip still rides the
+    # pass (off-policy buffer diversity) while hard clips reappear more often.
+    # Requires adaptive sampling; 0 disables and keeps pure coverage rotation.
+    rotation_difficulty_ratio: float = 0.5
     # gear_sonic ``tracking_local_vr_5point_error`` under the sonic_release
     # override: the release trains on three anchor-local points — torso_link
     # shifted 0.5 m up (standing in for the head) plus both wrists with zero
@@ -808,12 +709,14 @@ class SonicMotionCommandCfg(CommandCfg):
             raise ValueError("SONIC failure_rate_max_over_mean must be positive")
         if isinstance(self.pre_failure_sample_window, bool) or self.pre_failure_sample_window < 0:
             raise ValueError("SONIC pre_failure_sample_window must be a non-negative integer")
-        if self.max_prob_per_bin < 1.0:
-            raise ValueError("SONIC max_prob_per_bin must be >= 1 (cap below uniform is degenerate)")
+        if self.adaptive_init_count <= 0.0:
+            raise ValueError("SONIC adaptive_init_count must be positive")
+        if self.adaptive_max_prob_per_bin is not None and self.adaptive_max_prob_per_bin < 1.0:
+            raise ValueError("SONIC adaptive_max_prob_per_bin must be >= 1 (cap below uniform is degenerate)")
+        if not 0.0 <= self.rotation_difficulty_ratio <= 1.0:
+            raise ValueError("SONIC rotation_difficulty_ratio must be in [0, 1]")
         if not isinstance(self.clip_round_robin, bool):
             raise ValueError("SONIC clip_round_robin must be a boolean")
-        if self.max_prob_multiplier <= 0.0:
-            raise ValueError("SONIC max_prob_multiplier must be positive")
         if self.encoder_sampling not in ENCODER_SAMPLING_MODES:
             raise ValueError(f"SONIC encoder_sampling must be one of {ENCODER_SAMPLING_MODES}")
         if self.motion_files and not all(isinstance(path, str) and path for path in self.motion_files):
@@ -859,18 +762,18 @@ class SonicMotionCommandCfg(CommandCfg):
             [0, clip.joint_pos.shape[0] if rotator is None else rotator.active_frames], dtype=np.int64
         )
         reference_index = self.tracked_body_names.index(self.reference_body_name)
-        adaptive_rotation = self.adaptive_sampling_enabled and rotator is not None
         if self.clip_round_robin and self.adaptive_sampling_enabled:
             raise ValueError("clip_round_robin replaces adaptive sampling; enable only one")
-        nbin = (
-            rotator.max_adaptive_bins(self.adaptive_bin_size)
-            if adaptive_rotation
-            else (
-                int(window_range[1]) // max(int(round(1.0 / env.cfg.ctrl_dt)), 1) + 1
-                if self.adaptive_sampling_enabled
-                else 0
+        # Per-source bin capacity: the exact count for a resident corpus, the
+        # frame-budget bound for any rotated window.
+        if not self.adaptive_sampling_enabled:
+            nbin = 0
+        elif rotator is not None:
+            nbin = rotator.max_adaptive_bins(self.adaptive_bin_size)
+        else:
+            nbin = count_segment_bins(
+                clip_segment_bounds(clip.frame_clip_end, 0, int(window_range[1])), self.adaptive_bin_size
             )
-        )
         # Round-robin clip table: cyclic per-clip frame ranges over the resident
         # window, so every clip receives the same number of episode starts.
         rr_clip_start = np.empty(0, np.int64)
@@ -880,17 +783,6 @@ class SonicMotionCommandCfg(CommandCfg):
             starts = np.unique(source_starts)
             rr_clip_start = starts
             rr_clip_frames = np.append(starts[1:], source_starts.size) - starts
-        # Per-motion mass equalization (gear_sonic ``sequence_length_agnostic``):
-        # every clip receives the same total probability mass before failure-
-        # rate shaping, so long clips cannot dominate short ones purely through
-        # length. Bins inherit the motion of their first frame.
-        adaptive_bin_weights = np.ones(nbin, np.float32)
-        if nbin and not adaptive_rotation:
-            frames = int(window_range[1])
-            bin_start_frames = np.minimum(np.arange(nbin) * frames // nbin, frames - 1)
-            bin_motion = np.asarray(clip.frame_source_id)[bin_start_frames]
-            peers = np.bincount(bin_motion)
-            adaptive_bin_weights = (1.0 / peers[bin_motion]).astype(np.float32)
         # Term builds run before the read program exists, so derive the
         # tracked-body layout statically instead of reading env.sim_data.
         shape = (len(self.tracked_body_names), 3)
@@ -914,22 +806,15 @@ class SonicMotionCommandCfg(CommandCfg):
             command=np.empty((env.num_envs, 2 * len(self.joint_names)), np.float32),
             target_body_position_relative=np.empty((env.num_envs, *shape), np.float32),
             target_body_orientation_relative=np.empty((env.num_envs, shape[0], 4), np.float32),
-            adaptive_bin_failed_count=np.ones(nbin, np.float32) if nbin else np.empty((0,), np.float32),
-            adaptive_bin_exposure=np.ones(nbin, np.float32) if nbin else np.empty((0,), np.float32),
-            adaptive_bin_weights=adaptive_bin_weights if nbin else np.empty((0,), np.float32),
-            sampling_cdf=np.ones(nbin, np.float32) if nbin else np.empty((0,), np.float32),
-            adaptive_rotation_enabled=np.bool_(adaptive_rotation),
             adaptive_active_bin_count=np.zeros(1, np.int64),
-            adaptive_bin_start=np.empty(nbin, np.int64) if adaptive_rotation else np.empty((0,), np.int64),
-            adaptive_bin_end=np.empty(nbin, np.int64) if adaptive_rotation else np.empty((0,), np.int64),
+            sampling_cdf=np.ones(nbin, np.float32) if nbin else np.empty((0,), np.float32),
+            adaptive_bin_start=np.empty(nbin, np.int64) if nbin else np.empty((0,), np.int64),
+            adaptive_bin_end=np.empty(nbin, np.int64) if nbin else np.empty((0,), np.int64),
             adaptive_failure_pending=np.zeros(env.num_envs, bool),
             adaptive_failure_source_id=np.full(env.num_envs, -1, np.int64),
             adaptive_failure_local_step=np.zeros(env.num_envs, np.int64),
             start_at_timestep_zero_prob=np.float32(self.start_at_timestep_zero_prob),
-            uniform_ratio=np.float32(self.uniform_ratio),
-            failure_rate_max_over_mean=np.float32(self.failure_rate_max_over_mean),
             pre_failure_sample_window=np.int64(self.pre_failure_sample_window),
-            max_prob_per_bin=np.float32(self.max_prob_per_bin),
             clip_round_robin=np.bool_(self.clip_round_robin),
             rr_cursor=np.zeros(1, np.int64),
             rr_clip_start=rr_clip_start,
@@ -944,18 +829,25 @@ class SonicMotionCommandCfg(CommandCfg):
             # finishes and ticks it every control step.
             if not hasattr(env, "_pending_motion_rotation"):
                 raise ValueError("SONIC corpus rotation requires the SONIC manager env (rotation handoff missing).")
-            if adaptive_rotation:
-                rotator.enable_adaptive(
-                    bin_size=self.adaptive_bin_size,
-                    alpha=self.alpha,
-                    uniform_ratio=self.uniform_ratio,
-                    kernel_size=self.kernel_size,
-                    kernel_lambda=self.kernel_lambda,
-                    failure_rate_max_over_mean=self.failure_rate_max_over_mean,
-                    max_prob_multiplier=self.max_prob_multiplier,
-                    update_period=self.adaptive_update_period,
-                )
             env._pending_motion_rotation = rotator
+        if self.adaptive_sampling_enabled:
+            # Same handoff for the host-side sampler: it owns the per-source
+            # failure-rate statistics and republishes the command's sampling
+            # tables (CDF + active bin ranges) every tick.
+            if not hasattr(env, "_pending_motion_adaptive"):
+                raise ValueError("SONIC adaptive sampling requires the SONIC manager env (sampler handoff missing).")
+            sampler = AdaptiveMotionSampler(
+                bin_size=self.adaptive_bin_size,
+                init_count=self.adaptive_init_count,
+                uniform_ratio=self.uniform_ratio,
+                failure_rate_max_over_mean=self.failure_rate_max_over_mean,
+                sequence_length_agnostic=self.adaptive_sequence_length_agnostic,
+                max_prob_per_bin=self.adaptive_max_prob_per_bin,
+                update_period=self.adaptive_update_period,
+            )
+            env._pending_motion_adaptive = sampler
+            if rotator is not None and self.rotation_difficulty_ratio > 0.0:
+                rotator.enable_difficulty_sampling(sampler.source_sampling_weights, self.rotation_difficulty_ratio)
         return command
 
 

@@ -53,8 +53,28 @@ SONIC_MOTION_DIR=$PWD/data/bones_seed_npz \
 这使每次换窗都成为平缓的混合比变化——一个好的默认值是每 1–2 个 `buffer_size` 控制步换窗一次：
 取 `buffer_size` 时 buffer 永远混合两个窗口，取 `2 × buffer_size`（`g1-sonic` 默认）时每个窗口的
 数据在下次换窗前完整离开 buffer，每窗都能得到完整的消化。根据 publish 日志校准：窗口解码耗时应
-明显小于 period，排空等待应低于 episode 长度上界。adaptive sampling 的失败率 bin 是窗口局部的，
-每次换窗清零。小于一个窗口的语料根会回退到普通的常驻加载，冒烟语料不受影响。
+明显小于 period，排空等待应低于 episode 长度上界。adaptive sampling 默认开启（gear_sonic release
+`enable: true`；play/eval 配置经 `for_play()` 关闭，`clip_round_robin` 则取代它）。开启后，采样遵循
+gear_sonic 的 per-clip 失败率契约，常驻语料与轮换窗口共用同一实现：每条源 clip 按
+`adaptive_bin_size` 帧（50 Hz 下默认 1 秒）切 bin，每个 bin 维护累计的失败数与 episode 数
+（同初始化为 `adaptive_init_count`）；每个 lane-step 给当前所在 bin 记 `1 / bin_length`
+次 episode，每次终止给结束位置所在的 bin 记一次失败。采样概率由逐 bin 失败率（按均值 ×
+`failure_rate_max_over_mean` 截断）与 `uniform_ratio` 均匀下限混合，再经 sequence-length-agnostic
+的 per-clip 权重重塑，使每条 clip 携带相同的总质量。episode 起点最多回退
+`pre_failure_sample_window` 帧，让策略练习进入困难片段的过程而非直接传送进去。统计属于源
+clip 并跨窗口保留：排空中的 lane 仍向其退役 clip 上报，clip 回归时学到的 bin 分布随之恢复。
+活跃窗口的 CDF 每 `adaptive_update_period` 控制步重发布一次，窗口发布时立即重发布。
+`adaptive_failure_rate` 步级指标报告策略在 adaptive sampling 当前分发内容上的真实失败率
+（失败数 / episode 曝光量，指数衰减，半衰期约 7k 控制步）：将它与
+`adaptive_sampling_entropy` / `adaptive_sampling_top1_prob` 对照阅读，可以区分策略进步与
+分布偏移——采样器收敛的同时该比率下降，说明策略正在掌握当前被分发的困难内容。
+rotation 还把学到的难度用在 clip 级，对应上游的 motion resample：每个窗口有
+`rotation_difficulty_ratio`（默认 0.5）比例的 clip 槽位按采样器的逐 clip 权重有放回抽取
+（困难 clip 跨窗口史频繁地重现），其余槽位仍来自无放回的覆盖排列，因此每条 clip 依旧随
+pass 出现，buffer 多样性保有最坏情况下的下限。两种情况下窗口发布都保持 drain-gated：与
+上游换批时的 `reset_all` 不同，episode 不会被强制重置（off-policy replay 不应看到人为截断）。
+显式关闭 adaptive sampling 时，rotation 回退到原有的均匀帧采样，既不改变随机数序列，也不
+分配任何 adaptive 状态。小于一个窗口的语料根会回退到普通的常驻加载，冒烟语料不受影响。
 
 ## 构建语料
 

@@ -77,17 +77,44 @@ windows, while at `2 × buffer_size` (the `g1-sonic` default) each window's
 data fully churns out of the buffer before the next swap arrives, giving
 every window a complete digestion pass. Tune from the publish log: window
 decode should stay well under the period, and the drain wait under the
-episode-length bound. With adaptive sampling disabled (the default), rotation
-continues to use the original uniform frame sampler: it neither changes the
-random draw sequence nor allocates adaptive state. With adaptive sampling
-enabled, failure statistics belong to the original source clip and are
-restored when that clip returns in a later window. Statistics are created
-lazily as clips are decoded, split into 50-frame bins by default, and an old
-window's draining lanes still report failures to their own source clip. The
-active distribution reserves `uniform_ratio` (default 20%) for uniform
-exploration; the remainder follows source-local failure mass. Corpus roots
-smaller than one window fall back to the plain resident load, so smoke corpora
-are unaffected.
+episode-length bound. Adaptive sampling is enabled by default (gear_sonic's
+release sets `enable: true`; play/eval configs disable it via `for_play()`,
+and `clip_round_robin` replaces it). Enabled, sampling follows gear_sonic's
+per-clip failure-rate contract, shared verbatim by resident corpora and
+rotated windows: every source clip is split into `adaptive_bin_size`-frame
+bins (one second at 50 Hz by default), and each bin keeps cumulative failure
+and episode counters (both initialized to `adaptive_init_count`). Every
+lane-step adds `1 / bin_length` episodes to the bin it occupies; every
+terminated episode adds one failure at the bin where it ended. Sampling
+probabilities blend the per-bin failure rate — clipped at
+`failure_rate_max_over_mean` times the mean rate — with a `uniform_ratio`
+uniform floor, then reshape the result with sequence-length-agnostic
+per-clip weights so every clip carries the same total mass. Episode starts
+shift back by up to `pre_failure_sample_window` frames so the policy
+practices the approach into a hard segment instead of teleporting into it.
+Statistics belong to the source clip and survive window swaps: draining
+lanes still report to their retired clip, and learned bins reappear when the
+clip returns. The active-window CDF republishes every
+`adaptive_update_period` control steps and eagerly on each window publication.
+The `adaptive_failure_rate` step metric reports the policy's realized failure
+rate over what adaptive sampling is currently serving (failures over episode
+exposure, exponentially decayed with a ~7k-step half-life): read it against
+`adaptive_sampling_entropy` / `adaptive_sampling_top1_prob` to tell policy
+progress from distribution shift — a falling rate while the sampler
+concentrates means the policy is mastering what it is being served.
+Rotation also spends the learned difficulty at the clip level, mirroring
+gear_sonic's motion resample: `rotation_difficulty_ratio` (default 0.5) of
+each window's clip slots are drawn with replacement from the sampler's
+per-clip weights — hard clips reappear across windows more often — while the
+remaining slots keep coming from the without-replacement coverage permutation,
+so every clip still rides the pass and buffer diversity keeps a worst-case
+floor. Window publication stays drain-gated either way: unlike upstream's
+resample-time `reset_all`, episodes are never force-reset (off-policy replay
+must not see artificial truncations). With adaptive sampling explicitly
+disabled, rotation falls back to the original uniform frame sampler: it
+neither changes the random draw sequence nor allocates adaptive state. Corpus
+roots smaller than one window fall back to the plain resident load, so smoke
+corpora are unaffected.
 
 ## Build a corpus
 

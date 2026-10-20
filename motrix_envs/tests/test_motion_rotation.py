@@ -12,6 +12,7 @@ import pytest
 import motrix_envs  # noqa: F401 registers built-in environments
 from motrix_env_core import registry
 from motrix_envs.locomotion.sonic.mdp import G1_SONIC_BODY_NAMES, G1_SONIC_JOINTS
+from motrix_envs.motion.adaptive import AdaptiveMotionSampler
 from motrix_envs.motion.rotation import CorpusRotator
 
 _TASK_ORDER = {
@@ -68,8 +69,6 @@ class _FakeTerm:
     clip: object
     steps: np.ndarray
     window_range: np.ndarray
-    adaptive_bin_failed_count: np.ndarray = field(default_factory=lambda: np.zeros(4, np.float32))
-    adaptive_current_bin_failed_count: np.ndarray = field(default_factory=lambda: np.zeros(4, np.float32))
     sampling_cdf: np.ndarray = field(default_factory=lambda: np.linspace(0.25, 1.0, 4).astype(np.float32))
 
 
@@ -175,18 +174,13 @@ def test_publish_gates_on_drain_of_retiring_half(corpus):
     assert rotator.window_index == 2
 
 
-def test_publish_resets_adaptive_stats_and_flips_domain(corpus):
+def test_publish_flips_window_domain(corpus):
     clip, rotator = _build(corpus)
     term = _term(clip, rotator)
-    term.adaptive_bin_failed_count[:] = 7.0
-    term.adaptive_current_bin_failed_count[:] = 3.0
     _drive(rotator, term, until_window=1)
     base, frames = int(term.window_range[0]), int(term.window_range[1])
     assert base == rotator.active_base == rotator._frame_budget
     assert frames == rotator.active_frames > 0
-    np.testing.assert_array_equal(term.adaptive_bin_failed_count, 0.0)
-    np.testing.assert_array_equal(term.adaptive_current_bin_failed_count, 0.0)
-    np.testing.assert_allclose(term.sampling_cdf, np.linspace(0.25, 1.0, 4))
     # Published clip-end boundaries are window-global and monotone.
     window_ends = clip.frame_clip_end[base : base + frames]
     assert window_ends[-1] == base + frames - 1
@@ -196,17 +190,24 @@ def test_publish_resets_adaptive_stats_and_flips_domain(corpus):
 
 def test_rotation_adaptive_statistics_follow_source_clips_and_draining_lanes(corpus):
     clip, rotator = _build(corpus, track_sources=True)
-    rotator.enable_adaptive(bin_size=2, alpha=1.0, uniform_ratio=0.2, kernel_size=1, kernel_lambda=0.8)
     term = _adaptive_term(clip, rotator)
-    rotator.attach(term)
+    sampler = AdaptiveMotionSampler(
+        bin_size=2,
+        init_count=1.0,
+        uniform_ratio=0.2,
+        failure_rate_max_over_mean=50.0,
+        update_period=1,
+    )
+    sampler.attach(term)
 
     source_id = int(clip.frame_source_id[0])
     term.adaptive_failure_source_id[0] = source_id
     term.adaptive_failure_local_step[0] = 2
     term.adaptive_failure_pending[0] = True
-    rotator.tick(term)
-    assert rotator.adaptive is not None
-    assert rotator.adaptive.source_failure_mass(source_id) == pytest.approx(1.0)
+    sampler.tick(term)
+    assert sampler.source_failure_mass(source_id) == pytest.approx(1.0)
+    # The pending handoff is drained exactly once.
+    assert not term.adaptive_failure_pending.any()
 
     # Publish the next window, then report a delayed failure from a lane still
     # draining the retired half.  It must return to the old source, not the
@@ -215,8 +216,8 @@ def test_rotation_adaptive_statistics_follow_source_clips_and_draining_lanes(cor
     term.adaptive_failure_source_id[1] = source_id
     term.adaptive_failure_local_step[1] = 3
     term.adaptive_failure_pending[1] = True
-    rotator.tick(term)
-    assert rotator.adaptive.source_failure_mass(source_id) == pytest.approx(2.0)
+    sampler.tick(term)
+    assert sampler.source_failure_mass(source_id) == pytest.approx(2.0)
 
     # The source eventually returns in the seeded without-replacement pass;
     # its learned bin must receive more than the fixed 20% uniform floor.
@@ -226,6 +227,7 @@ def test_rotation_adaptive_statistics_follow_source_clips_and_draining_lanes(cor
         _drive(rotator, term, until_window=rotator.window_index + 1)
     else:
         raise AssertionError("source clip did not return during the rotation pass")
+    sampler.tick(term)
     count = int(term.adaptive_active_bin_count[0])
     probabilities = np.diff(np.concatenate(([0.0], term.sampling_cdf[:count])))
     assert np.all(probabilities >= 0.2 / count - 1e-7)
@@ -245,8 +247,11 @@ def test_rotation_adaptive_path_compiles_and_preserves_uniform_controller_absenc
     uniform_cfg.commands.motion.motion_files = (str(corpus_directory),)
     uniform_cfg.commands.motion.num_motions = 2
     uniform_cfg.commands.motion.rotation_period = 2
+    # The default enables adaptive sampling; pin it off to exercise the plain
+    # uniform rotation controller.
+    uniform_cfg.commands.motion.adaptive_sampling_enabled = False
     uniform_env = registry.resolve("g1-sonic", env_cfg=uniform_cfg).make(num_envs=2, seed=1)
-    assert uniform_env._motion_rotation[1].adaptive is None
+    assert uniform_env._motion_adaptive is None
     uniform_motion = uniform_env._command_terms["motion"]
     assert uniform_motion.sampling_cdf.size == 0
     assert uniform_motion.clip.frame_source_id.size == 0
@@ -259,9 +264,21 @@ def test_rotation_adaptive_path_compiles_and_preserves_uniform_controller_absenc
     adaptive_cfg.commands.motion.rotation_period = 2
     adaptive_cfg.commands.motion.adaptive_sampling_enabled = True
     adaptive_env = registry.resolve("g1-sonic", env_cfg=adaptive_cfg).make(num_envs=2, seed=1)
-    assert adaptive_env._motion_rotation[1].adaptive is not None
+    assert adaptive_env._motion_adaptive is not None
+    adaptive_motion = adaptive_env._command_terms["motion"]
+    # The sampler published per-source bins over the startup window.
+    assert adaptive_motion.sampling_cdf.size > 0
+    assert int(adaptive_motion.adaptive_active_bin_count[0]) > 0
+    assert adaptive_motion.sampling_cdf[-1] == pytest.approx(1.0)
     adaptive_env.init_state()
-    adaptive_env.step(np.zeros((2, len(G1_SONIC_JOINTS)), np.float32))
+    state = adaptive_env.step(np.zeros((2, len(G1_SONIC_JOINTS)), np.float32))
+    for key in (
+        "adaptive_sampling_entropy",
+        "adaptive_sampling_top1_prob",
+        "adaptive_failure_mass",
+        "adaptive_failure_rate",
+    ):
+        assert key in state.metrics
 
 
 def test_budget_trim_keeps_coverage_via_carry(tmp_path):
@@ -285,6 +302,33 @@ def test_budget_trim_keeps_coverage_via_carry(tmp_path):
         if seen >= all_tags:
             break
     assert seen >= all_tags
+
+
+def test_difficulty_slots_shape_window_composition(corpus):
+    clip, rotator = _build(corpus)
+    term = _term(clip, rotator)
+    hot = 3  # concentrate every difficulty draw on one corpus entry
+
+    def provider(count):
+        weights = np.full(count, 1e-9)
+        weights[hot] = 1.0
+        return weights / weights.sum()
+
+    # ratio 1.0: no permutation fill, deduplicated draws leave exactly the
+    # hot clip in the published window.
+    rotator.enable_difficulty_sampling(provider, 1.0)
+    _drive(rotator, term, until_window=1)
+    assert _active_tags(clip, rotator) == {float(hot + 1)}
+
+    # ratio 0.5 with a four-clip window: the hot clip plus two permutation
+    # entries; the coverage backbone keeps every clip reachable.
+    clip, rotator = _build(corpus, window_clips=4)
+    term = _term(clip, rotator)
+    rotator.enable_difficulty_sampling(provider, 0.5)
+    _drive(rotator, term, until_window=1)
+    tags = _active_tags(clip, rotator)
+    assert float(hot + 1) in tags
+    assert len(tags) == 3  # dedup(2 draws) + 2 permutation slots, hot not repeated
 
 
 def test_rotation_is_deterministic_for_a_fixed_seed(corpus):

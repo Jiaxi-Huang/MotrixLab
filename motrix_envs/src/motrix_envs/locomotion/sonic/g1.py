@@ -29,24 +29,29 @@ class SonicManagerEnv(ManagerEnv):
     """Manager environment for the SONIC G1 motion-tracking task.
 
     Drives :class:`~motrix_envs.motion.rotation.CorpusRotator` when the motion
-    command enables corpus rotation: the command cfg publishes its rotator
-    into ``_pending_motion_rotation`` during construction (the canonical,
+    command enables corpus rotation, and the shared
+    :class:`~motrix_envs.motion.adaptive.AdaptiveMotionSampler` when adaptive
+    sampling is enabled: the command cfg publishes each host-side object into
+    a ``_pending_motion_*`` attribute during construction (the canonical,
     kernel-bound command terms only exist once ``super().__init__`` returns),
-    and each control step ticks the rotator against the canonical motion term.
+    and each control step ticks them against the canonical motion term.
     """
 
     def __init__(self, cfg, num_envs: int = 1, backend: str | None = None, seed: int | None = None):
         self._pending_motion_rotation = None
+        self._pending_motion_adaptive = None
         super().__init__(cfg, num_envs=num_envs, backend=backend, seed=seed)
+        motion_term = self._command_terms["motion"]
         self._motion_rotation = (
-            (self._command_terms["motion"], self._pending_motion_rotation)
-            if self._pending_motion_rotation is not None
-            else None
+            (motion_term, self._pending_motion_rotation) if self._pending_motion_rotation is not None else None
         )
-        if self._motion_rotation is not None:
-            term, rotator = self._motion_rotation
-            rotator.attach(term)
+        self._motion_adaptive = (
+            (motion_term, self._pending_motion_adaptive) if self._pending_motion_adaptive is not None else None
+        )
+        if self._motion_adaptive is not None:
+            self._motion_adaptive[1].attach(motion_term)
         self._pending_motion_rotation = None
+        self._pending_motion_adaptive = None
 
     def step(self, actions):
         result = super().step(actions)
@@ -57,8 +62,9 @@ class SonicManagerEnv(ManagerEnv):
             # ``metrics/*`` TensorBoard curves.
             result.metrics["motion_rotation_window"] = float(rotator.window_index)
             result.metrics["motion_rotation_coverage"] = rotator.pass_coverage
-            if rotator.adaptive is not None:
-                result.metrics.update(rotator.adaptive_metrics())
+        if self._motion_adaptive is not None:
+            term, sampler = self._motion_adaptive
+            result.metrics.update(sampler.tick(term))
         return result
 
 

@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,7 +47,6 @@ from motrix_envs.motion.library import (
     motion_corpus_contract,
 )
 from motrix_envs.motion.loader import MotrixMotion
-from motrix_envs.motion.sampler import adaptive_sampling_metrics
 from motrix_envs.motion.sonic import SonicMotionClip
 from motrix_envs.motion.tracked import WbtMotionClip
 
@@ -92,163 +91,6 @@ def _assemble_window(
         source_start[start:end] = start
         start = end
     return fields, frame_clip_end, extensions, source_id, source_start
-
-
-class AdaptiveRotationSampler:
-    """Host-side, source-stable adaptive state for streamed SONIC corpora.
-
-    Statistics are allocated only after a corpus entry is decoded.  The compiled
-    command receives just the CDF and frame ranges of the active window, while
-    failure events retain their source id so retired-window lanes stay valid.
-    """
-
-    def __init__(
-        self,
-        *,
-        bin_size: int,
-        alpha: float,
-        uniform_ratio: float,
-        kernel_size: int,
-        kernel_lambda: float,
-        failure_rate_max_over_mean: float = 5.0,
-        max_prob_multiplier: float = 5.0,
-        update_period: int = 128,
-    ):
-        self._bin_size = bin_size
-        self._alpha = np.float32(alpha)
-        self._uniform_ratio = np.float32(uniform_ratio)
-        self._kernel_size = kernel_size
-        self._kernel_lambda = np.float32(kernel_lambda)
-        self._failure_rate_max_over_mean = np.float32(failure_rate_max_over_mean)
-        self._max_prob_multiplier = np.float32(max_prob_multiplier)
-        self._kernel = np.asarray([kernel_lambda**i for i in range(max(kernel_size, 1))], dtype=np.float32)
-        self._kernel /= np.sum(self._kernel)
-        self._update_period = update_period
-        self._steps_since_update = 0
-        self._dirty = False
-        self._history: dict[int, np.ndarray] = {}
-        self._current: dict[int, np.ndarray] = {}
-        self.entropy = 1.0
-        self.top1_prob = 0.0
-        self.top1_bin = 0.0
-        self.failure_mass = 0.0
-        self._probabilities = np.empty((0,), dtype=np.float32)
-
-    def attach(self, term) -> None:
-        self._write_active_distribution(term)
-        self._steps_since_update = 0
-        self._dirty = False
-
-    def tick(self, term) -> None:
-        pending = term.adaptive_failure_pending
-        if np.any(pending):
-            failed_rows = np.flatnonzero(pending)
-            touched: set[int] = set()
-            for row in failed_rows:
-                source_id = int(term.adaptive_failure_source_id[row])
-                local_step = int(term.adaptive_failure_local_step[row])
-                history = self._history[source_id]
-                current = self._current[source_id]
-                current[min(local_step // self._bin_size, current.size - 1)] += 1.0
-                touched.add(source_id)
-            pending[failed_rows] = False
-
-            for source_id in touched:
-                history = self._history[source_id]
-                current = self._current[source_id]
-                # A source may be absent for many rotation periods.  Accumulate
-                # its observed failure evidence rather than applying the legacy
-                # per-control-step decay, which would erase it before return.
-                history += self._alpha * current
-                current.fill(0.0)
-            self._dirty = True
-
-        if self._dirty:
-            self._steps_since_update += 1
-            if self._steps_since_update >= self._update_period:
-                self._write_active_distribution(term)
-                self._steps_since_update = 0
-                self._dirty = False
-
-    @property
-    def probabilities(self) -> np.ndarray:
-        return self._probabilities
-
-    def source_failure_mass(self, source_id: int) -> float:
-        """Return source-local state for rotation tests and diagnostics."""
-        return float(np.sum(self._history.get(source_id, 0.0)))
-
-    def _window_segments(self, term):
-        start = int(term.window_range[0])
-        limit = start + int(term.window_range[1])
-        while start < limit:
-            end = int(term.clip.frame_clip_end[start]) + 1
-            yield int(term.clip.frame_source_id[start]), start, end
-            start = end
-
-    def _ensure_source(self, source_id: int, start: int, end: int) -> np.ndarray:
-        history = self._history.get(source_id)
-        if history is None:
-            # The final motion frame cannot be a reset target; at least one
-            # bin remains for the two-frame minimum clip contract.
-            count = max(1, math.ceil((end - start - 1) / self._bin_size))
-            history = np.zeros(count, dtype=np.float32)
-            self._history[source_id] = history
-            self._current[source_id] = np.zeros_like(history)
-        return history
-
-    def _smoothed(self, values: np.ndarray) -> np.ndarray:
-        if self._kernel_size <= 1:
-            return values
-        return np.correlate(np.pad(values, (0, self._kernel_size - 1), mode="edge"), self._kernel, mode="valid")
-
-    def _write_active_distribution(self, term) -> None:
-        values: list[np.ndarray] = []
-        starts: list[int] = []
-        ends: list[int] = []
-        for source_id, start, end in self._window_segments(term):
-            history = self._ensure_source(source_id, start, end)
-            safe_end = end - 1
-            for bin_id in range(history.size):
-                bin_start = start + bin_id * self._bin_size
-                bin_end = min(bin_start + self._bin_size, safe_end)
-                if bin_start < bin_end:
-                    starts.append(bin_start)
-                    ends.append(bin_end)
-                    values.append(self._smoothed(history)[bin_id : bin_id + 1])
-
-        count = len(starts)
-        assert count <= term.sampling_cdf.size
-        term.adaptive_active_bin_count[0] = count
-        if not count:
-            return
-        adaptive = np.concatenate(values)
-        mean_adaptive = float(np.mean(adaptive))
-        if mean_adaptive > 0.0 and self._failure_rate_max_over_mean > 0.0:
-            adaptive = np.minimum(adaptive, mean_adaptive * self._failure_rate_max_over_mean)
-        total = float(np.sum(adaptive))
-        if total > 0.0 and np.isfinite(total):
-            adaptive /= total
-        else:
-            adaptive.fill(1.0 / count)
-        uniform = np.full(count, 1.0 / count, dtype=np.float32)
-        probabilities = (np.float32(1.0) - self._uniform_ratio) * adaptive + self._uniform_ratio * uniform
-        if self._max_prob_multiplier > 0.0:
-            probabilities = np.minimum(probabilities, self._max_prob_multiplier / count)
-            probabilities /= np.sum(probabilities)
-        term.sampling_cdf[:count] = np.cumsum(probabilities, dtype=np.float32)
-        term.sampling_cdf[count - 1] = 1.0
-        term.adaptive_bin_start[:count] = starts
-        term.adaptive_bin_end[:count] = ends
-        self._probabilities = probabilities
-        metrics = adaptive_sampling_metrics(
-            probabilities,
-            float(sum(np.sum(value) for value in self._history.values())),
-        )
-        self.entropy = metrics["adaptive_sampling_entropy"]
-        self.top1_prob = metrics["adaptive_sampling_top1_prob"]
-        self.top1_bin = metrics["adaptive_sampling_top1_bin"]
-        self.failure_mass = metrics["adaptive_failure_mass"]
 
 
 class CorpusRotator:
@@ -306,7 +148,8 @@ class CorpusRotator:
         self._assemble_future: Future | None = None
         self._pending_clips = 0
         self._carry: list[_DecodedSegment] = []
-        self._adaptive: AdaptiveRotationSampler | None = None
+        self._difficulty_provider: Callable[[int], np.ndarray] | None = None
+        self._difficulty_ratio = 0.0
         self._phase = _IDLE
         self._ticks = 0
         self._last_swap_tick = 0
@@ -431,46 +274,6 @@ class CorpusRotator:
         """Fixed CDF capacity for any window without inspecting the full corpus."""
         return math.ceil(self._frame_budget / bin_size) + self._window_clips
 
-    def enable_adaptive(
-        self,
-        *,
-        bin_size: int,
-        alpha: float,
-        uniform_ratio: float,
-        kernel_size: int,
-        kernel_lambda: float,
-        failure_rate_max_over_mean: float = 5.0,
-        max_prob_multiplier: float = 5.0,
-        update_period: int = 128,
-    ) -> None:
-        self._adaptive = AdaptiveRotationSampler(
-            bin_size=bin_size,
-            alpha=alpha,
-            uniform_ratio=uniform_ratio,
-            kernel_size=kernel_size,
-            kernel_lambda=kernel_lambda,
-            failure_rate_max_over_mean=failure_rate_max_over_mean,
-            max_prob_multiplier=max_prob_multiplier,
-            update_period=update_period,
-        )
-
-    def attach(self, term) -> None:
-        """Bind host-only adaptive state once the canonical command exists."""
-        if self._adaptive is not None:
-            self._adaptive.attach(term)
-
-    @property
-    def adaptive(self) -> AdaptiveRotationSampler | None:
-        return self._adaptive
-
-    def adaptive_metrics(self) -> dict[str, float]:
-        """Return the common metrics for the currently published CDF."""
-        assert self._adaptive is not None
-        return adaptive_sampling_metrics(
-            self._adaptive.probabilities,
-            self._adaptive.failure_mass,
-        )
-
     # ------------------------------------------------------------------
     # Per-step driver
     # ------------------------------------------------------------------
@@ -478,12 +281,10 @@ class CorpusRotator:
         """Advance the rotation state machine; called once per control step.
 
         ``term`` is the owning :class:`SonicMotionCommand`; only its host-side
-        arrays (``steps``, ``window_range``, adaptive accumulators) are read or
-        written here, never from a decoding thread.
+        arrays (``steps``, ``window_range``) are read or written here, never
+        from a decoding thread.
         """
         self._ticks += 1
-        if self._adaptive is not None:
-            self._adaptive.tick(term)
         if self._phase == _IDLE:
             if self._ticks - self._last_swap_tick >= self._period:
                 self._begin_decode()
@@ -498,13 +299,36 @@ class CorpusRotator:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def enable_difficulty_sampling(self, provider: Callable[[int], np.ndarray], ratio: float) -> None:
+        """Spend ``ratio`` of each window's clip budget on difficulty draws.
+
+        ``provider(num_sources)`` returns the per-entry sampling weights
+        (``AdaptiveMotionSampler.source_sampling_weights``). Each decode batch
+        draws ``round(ratio * window_clips)`` entries with replacement from
+        that distribution — gear_sonic's motion-level resample — deduplicated
+        within the window, while the remaining ``round((1 - ratio) *
+        window_clips)`` slots keep coming from the without-replacement
+        coverage permutation. Hard clips therefore reappear across windows
+        more often, while every clip still rides the permutation pass; window
+        publication stays drain-gated either way.
+        """
+        self._difficulty_provider = provider
+        self._difficulty_ratio = float(ratio)
+
     def _begin_decode(self) -> None:
         if self._pool is None:
             self._pool = ThreadPoolExecutor(max_workers=self._workers, thread_name_prefix="motion-rotation")
         self._decode_started_tick = self._ticks
+        batch: list[tuple[int, Path]] = []
+        if self._difficulty_provider is not None and self._difficulty_ratio > 0.0:
+            draws = int(round(self._difficulty_ratio * self._window_clips))
+            weights = self._difficulty_provider(len(self._entries))
+            picks = np.unique(self._rng.choice(len(self._entries), size=draws, replace=True, p=weights))
+            batch.extend((int(entry), self._entries[int(entry)]) for entry in picks)
         # The cursor advances on the manager thread only, keeping permutation
         # state single-threaded while the pool decodes files in parallel.
-        batch = [self._next_entry() for _ in range(self._window_clips - len(self._carry))]
+        fill = int(round((1.0 - self._difficulty_ratio) * self._window_clips)) - len(self._carry)
+        batch.extend(self._next_entry() for _ in range(max(fill, 0)))
         self._decode_futures = [self._pool.submit(self._decode_or_skip, source_id, path) for source_id, path in batch]
         self._phase = _DECODING
 
@@ -597,21 +421,12 @@ class CorpusRotator:
         for name in _SONIC_EXTENSION_CHANNELS:
             getattr(clip, name)[base : base + frames] = extensions[name]
         term.window_range[:] = (base, frames)
-        num_bins = int(term.adaptive_bin_failed_count.size)
-        if num_bins and self._adaptive is None:
-            # Bins live on the window's own frame timeline, so failure mass
-            # cannot carry across a swap; restart from the uniform floor.
-            term.adaptive_bin_failed_count.fill(0.0)
-            term.adaptive_current_bin_failed_count.fill(0.0)
-            term.sampling_cdf[:] = np.arange(1, num_bins + 1, dtype=np.float32) / np.float32(num_bins)
         self._half_frames[target] = frames
         self._active_half = target
         self._window_index += 1
         self._assemble_future = None
         self._phase = _IDLE
         self._last_swap_tick = self._ticks
-        if self._adaptive is not None:
-            self._adaptive.attach(term)
         logger.info(
             "Motion rotation: window %d published (%d clips, %d frames at base %d; "
             "decode+stage %d ticks, drain %d ticks, pass coverage %.1f%%).",

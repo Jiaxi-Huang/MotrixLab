@@ -237,7 +237,11 @@ teleop encoder 输入宽度现为同函数 `24F+27`，理论上亦可对应（ q
 - **观测噪声**：已对齐（2026-10-11，见上方「控制头输入序与产感 term 序、归一化对照」
   小节）：per-feature 幅度与上游 `local_dir_hist` / `unitoken_all_noz` 一致，噪声常开含
   play/eval。
-- **adaptive sampling 无尾部 bin mask**：上游同样没有（wbt 的 mask 是 wbt 特有）；
-  本地 EMA+kernel 平滑与上游 failure-rate 比例式亦不同，两者均为合法实现。
+- **adaptive sampling 无尾部 bin mask**：上游同样没有（wbt 的 mask 是 wbt 特有）。本地已统一为
+  上游 failure-rate 口径（per-source clip bin、累计 episodes/failures、uniform 混合 + outlier 截断、
+  sequence-length-agnostic 权重、pre-failure 回退采样），无 EMA/kernel 平滑（上游亦无）；常驻语料与
+  rotation 窗口共用同一采样器，统计随源 clip 跨窗口保留。rotation 另按
+  `rotation_difficulty_ratio` 把部分窗口槽位交给逐 clip 难度权重有放回抽取（对应上游 motion
+  resample），其余仍走无放回覆盖排列；换窗保持 drain-gated，不像上游 reset_all 强制截断 episode。
 - **joint_limit 惩罚**：本地加 soft_limit 0.9 与 cap 5.0（上游为裸 L1 超限）；
   **anti_shake** 用 torso_link 替代上游 head_link（g1_sonic 无 head）。

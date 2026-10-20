@@ -38,6 +38,21 @@ def test_sonic_config_defaults_match_upstream_base() -> None:
     assert isinstance(SonicActionsCfg().joint_position, JointPositionActionCfg)
     assert motion.reference_body_name == "pelvis"
     assert motion.encoder_sampling == "mixed"
+    # Adaptive sampling defaults equal the gear_sonic release recipe
+    # (config/manager_env/commands/terms/motion.yaml, ``adaptive_sampling:``
+    # block), so the default sampling behavior matches upstream:
+    # enable/bin_size/sequence_length_agnostic/init_num_failures/
+    # uniform_sampling_rate/pre_failure_sample_window/
+    # adp_samp_failure_rate_max_over_mean = true/50/true/1/0.1/200/50;
+    # use_failure_rate_decay=false and no max_prob_per_bin/motion caps.
+    assert motion.adaptive_sampling_enabled is True
+    assert motion.adaptive_bin_size == 50
+    assert motion.adaptive_sequence_length_agnostic is True
+    assert motion.adaptive_init_count == 1.0
+    assert motion.uniform_ratio == pytest.approx(0.1)
+    assert motion.pre_failure_sample_window == 200
+    assert motion.failure_rate_max_over_mean == pytest.approx(50.0)
+    assert motion.adaptive_max_prob_per_bin is None
 
 
 def test_sonic_model_hip_pitch_release_gains() -> None:
@@ -98,8 +113,7 @@ def test_sonic_reset_expands_smpl_native_rows_multi_hot() -> None:
         clip=clip,
         window_range=np.asarray([0, 4], np.int64),
         steps=np.zeros(1, np.int64),
-        sampling_cdf=np.ones(1, np.float32),
-        adaptive_rotation_enabled=np.bool_(False),
+        sampling_cdf=np.empty(0, np.float32),
         clip_round_robin=np.bool_(False),
         start_at_timestep_zero_prob=np.float32(1.0),
         pre_failure_sample_window=np.int64(0),
@@ -131,60 +145,6 @@ def test_sonic_reset_expands_smpl_native_rows_multi_hot() -> None:
     assert observed("smpl", 64) == {(1.0, 0.0, 1.0), (1.0, 1.0, 1.0)}
 
 
-def test_sonic_adaptive_sampling_changes_probability_and_draws() -> None:
-    from motrix_env_core.numba.manager.rand import initialize_rand_states, next_uniform
-
-    weights = np.ones(4, dtype=np.float32)
-    baseline = mdp._adaptive_rate_probabilities(
-        np.ones(4, dtype=np.float32),
-        np.ones(4, dtype=np.float32),
-        weights,
-        np.float32(0.2),
-        np.float32(50.0),
-        np.float32(0.0),
-    )
-    # Rate-based signal: the same failure count means different difficulty at
-    # different exposure. Bin 2 fails as often as bin 1 but in 10x the visits.
-    failures = np.ones(4, dtype=np.float32)
-    exposure = np.ones(4, dtype=np.float32)
-    exposure[2] = 0.1
-    focused = mdp._adaptive_rate_probabilities(
-        failures,
-        exposure,
-        weights,
-        np.float32(0.2),
-        np.float32(50.0),
-        np.float32(0.0),
-    )
-
-    np.testing.assert_allclose(baseline.sum(), 1.0)
-    np.testing.assert_allclose(focused.sum(), 1.0)
-    assert np.all(focused > 0.0)
-    assert np.argmax(focused) == 2
-    assert focused[2] > baseline[2]
-    # The count-degenerate case: equal failure counts with equal exposure stay
-    # uniform — sampling volume alone must never shape the distribution.
-    degenerate = mdp._adaptive_rate_probabilities(
-        np.full(4, 3.0, np.float32),
-        np.full(4, 5.0, np.float32),
-        weights,
-        np.float32(0.2),
-        np.float32(50.0),
-        np.float32(0.0),
-    )
-    np.testing.assert_allclose(degenerate, np.full(4, 0.25, np.float32), atol=1e-7)
-
-    cdf = np.cumsum(focused, dtype=np.float32)
-    cdf[-1] = 1.0
-    states = initialize_rand_states(256, 7)
-    sampled_bins = []
-    for state in states:
-        unit = (next_uniform(state) + np.float32(1.0)) * np.float32(0.5)
-        sampled_bins.append(min(int(np.searchsorted(cdf, unit, side="left")), 3))
-    counts = np.bincount(sampled_bins, minlength=4)
-    assert counts[2] > counts[[0, 1, 3]].max()
-
-
 def test_sonic_cdf_sampling_draws_follow_probabilities() -> None:
     from motrix_env_core.numba.manager.rand import initialize_rand_states
 
@@ -211,8 +171,7 @@ def test_sonic_advance_switches_segment_at_clip_end() -> None:
         window_range=np.asarray([0, 10], np.int64),
         start_at_timestep_zero_prob=np.float32(0.0),
         pre_failure_sample_window=np.int64(0),
-        sampling_cdf=np.linspace(0.1, 1.0, 10).astype(np.float32),
-        adaptive_rotation_enabled=np.bool_(False),
+        sampling_cdf=np.empty(0, np.float32),
         clip_round_robin=np.bool_(False),
         clip=SimpleNamespace(
             joint_pos=np.zeros((10, 2), np.float32),
@@ -1139,78 +1098,6 @@ def test_sonic_critic_diff_and_root_channels_match_mimiclite_semantics() -> None
     np.testing.assert_allclose(out[future_dim - 6 : future_dim], identity6, atol=1e-6)
 
 
-def test_sonic_adaptive_rate_clips_outlier_and_equalizes_motion_mass() -> None:
-    """Outlier rates clip at mean x multiplier, and bin weights equalize motions."""
-    num_bins = 100
-    failures = np.ones(num_bins, np.float32)
-    failures[0] = 1000.0  # one extreme outlier bin: rate 100 vs 0.1 elsewhere
-    exposure = np.full(num_bins, 10.0, np.float32)
-    # Two motions of fifty bins each; equal weights inside a motion.
-    weights = np.full(num_bins, 1.0 / 50.0, np.float32)
-
-    got = mdp._adaptive_rate_probabilities(
-        failures,
-        exposure,
-        weights,
-        np.float32(0.0),
-        np.float32(50.0),
-        np.float32(0.0),
-    )
-    np.testing.assert_allclose(got.sum(), 1.0, rtol=1e-6)
-    rates = failures / exposure
-    bound = rates.mean() * 50.0
-    assert rates[0] > bound  # pre-condition: the outlier exceeds the clip
-    assert np.argmax(got) == 0
-    # Post-clip, the outlier's probability share is reduced below its raw
-    # rate share instead of monopolizing the distribution.
-    uncapped_share = rates[0] / rates.sum()
-    assert got[0] < uncapped_share
-    # Same clip rate everywhere + equal weights: uniform mixture output.
-    even = mdp._adaptive_rate_probabilities(
-        np.full(num_bins, 2.0, np.float32),
-        exposure,
-        weights,
-        np.float32(0.0),
-        np.float32(50.0),
-        np.float32(0.0),
-    )
-    np.testing.assert_allclose(even, np.full(num_bins, 1.0 / num_bins, np.float32), atol=1e-7)
-    # Unequal motion weights reshape even rates toward the heavier motion.
-    weights[50:] = np.float32(3.0 / 50.0)
-    weighted = mdp._adaptive_rate_probabilities(
-        np.full(num_bins, 2.0, np.float32),
-        exposure,
-        weights,
-        np.float32(0.0),
-        np.float32(50.0),
-        np.float32(0.0),
-    )
-    assert weighted[50:].sum() > weighted[:50].sum()
-
-
-def test_sonic_adaptive_per_bin_cap_survives_normalization() -> None:
-    """Water-filling keeps every bin at or below cap x uniform after renorm."""
-    num_bins = 100
-    failures = np.ones(num_bins, np.float32)
-    failures[0] = 1000.0  # outlier: rate 100 vs 0.1 elsewhere, share ~0.91 uncapped
-    exposure = np.full(num_bins, 10.0, np.float32)
-    weights = np.full(num_bins, 1.0 / 50.0, np.float32)
-
-    got = mdp._adaptive_rate_probabilities(
-        failures,
-        exposure,
-        weights,
-        np.float32(0.0),
-        np.float32(50.0),
-        np.float32(5.0),
-    )
-    assert got.max() <= np.float32(5.0 / num_bins) + 1e-6
-    np.testing.assert_allclose(got.sum(), 1.0, rtol=1e-5)
-    assert np.argmax(got) == 0  # still preferred, just bounded
-    # ordering among the non-outlier bins is preserved
-    assert got[1] > got[-1] - 1e-6 and got[1] > 0.0
-
-
 def test_sonic_cdf_sampling_matches_linear_walk_reference() -> None:
     """Binary-search bin selection reproduces the linear walk draw for draw."""
     from motrix_env_core.numba.manager.rand import initialize_rand_states, next_uniform
@@ -1261,7 +1148,6 @@ def test_sonic_round_robin_starts_cover_clips_cyclically() -> None:
         ),
         window_range=np.asarray([0, 15], np.int64),
         steps=np.zeros(1, np.int64),
-        adaptive_rotation_enabled=np.bool_(False),
         clip_round_robin=np.bool_(True),
         rr_cursor=np.zeros(1, np.int64),
         rr_clip_start=np.asarray([0, 10], np.int64),
