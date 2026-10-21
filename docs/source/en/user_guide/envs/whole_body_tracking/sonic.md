@@ -17,7 +17,11 @@ environment.
 The task recipe inlines `algo.variant` in
 `configs/task/g1-sonic/motrix.fastsac.yaml`. `model.num_future_frames` defines
 both the environment policy-observation width and the actor input width;
-`auxiliary` holds weights for the five upstream-named auxiliary losses
+`model.encoder_index: false` drops the trailing three-value encoder mask from
+the packed observation: every row then routes through the g1 encoder and
+observation normalization covers all dimensions uniformly (no binary
+passthrough channels remain). `auxiliary` holds weights for the five
+upstream-named auxiliary losses
 (`g1_recon`, `g1_smpl_latent`, `g1_teleop_latent`, `teleop_smpl_latent`,
 `reencoded_smpl_g1_latent`), which FastSAC weights and logs as `aux_*`
 metrics. `g1_control_decoder_hidden_dims` does not appear in the training
@@ -29,14 +33,14 @@ policy head.
 The `g1-sonic` policy observation has width 1355 (with `num_future_frames=5`;
 the G1/SMPL blocks scale linearly with that value and the teleop block adds a
 constant 27-wide current-frame tail) and the privileged value observation has
-width 1220. The value observation merges the gear_sonic and MimicLite critic
-contracts: per-future-frame reference joint positions and velocities plus the
-reference root pose in the robot root frame (MimicLite
-`ref_root_*_future_b`), MimicLite-style per-body reference-minus-actual
-differences (position, 6D orientation, and world-frame linear/angular
-velocities over all tracked bodies at diff steps `[0, 1]`, each side
-canonicalized in the projected-yaw frame of its own pelvis anchor), and the
-windowed proprioception history (`lin_vel | ang_vel | joint_pos | joint_vel |
+width 890. The value observation ports the upstream sonic_release
+`privileged_mf_hist` critic contract: a future-reference joint block (all
+position frames then all velocity frames on the G1 stride grid), current-frame
+anchor channels (the reference anchor position in the robot anchor frame — 3
+values carrying the z height error and the xy drift — plus the reference
+anchor orientation relative to the robot anchor as 6D), the robot body block
+(per tracked body position and 6D orientation in the robot anchor frame), and
+the windowed proprioception history (`lin_vel | ang_vel | joint_pos | joint_vel |
 action` per frame). Actions are 29 normalized joint-position targets; the
 environment action term owns action scaling and offsets, so the FastSAC actor
 keeps an identity action affine.

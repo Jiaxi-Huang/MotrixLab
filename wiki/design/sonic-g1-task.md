@@ -39,7 +39,8 @@ reward 求值前更新该状态，不扩展通用 `ActionTerm` 或 Manager 生�
 
 `FastSacCfg.policy_variant` 通过中性 `policy_variant_registry` 选择专用 actor；
 `FastSacCfg.variant` 是由 SONIC 变体自解析的映射，FastSAC 不理解其字段。普通
-FastSAC 路径不变。SONIC observation 最后三个 multi-hot encoder mask 维度绕过经验归一化。
+FastSAC 路径不变。SONIC observation 默认以末三维度 multi-hot encoder mask 绕过经验归一化；
+`model.encoder_index: false` 可去掉该 mask（见下方 2026-10-21 小节）。
 action 链路与 g1-wbt-dance 同构：环境声明按关节限位反推的紧致 action space
 （限位残差 ÷ term scale），`SonicPolicyVariant.build_actor` 把 env 推导的
 `action_scale`/`action_bias`（及 `use_tanh`）转发给 policy head，tanh ±1 恰好张满每个
@@ -197,6 +198,30 @@ teleop encoder 输入宽度现为同函数 `24F+27`，理论上亦可对应（ q
   ±0.05（lower-body / vr 块干净）；critic 与 encoder mask 无噪声。实现为 per-dim 幅度
   数组随 `ObsTerm` 传入 kernel（单一幅度无法表达融合 term 的分块噪声）；噪声常开含
   play/eval（上游从不关 corruption），本地 eval 的确定性随之降低。
+
+### critic 契约对齐 privileged_mf_hist 与 encoder_index 可选化（2026-10-21）
+
+- **critic 重写为上游 sonic_release 的 `privileged_mf_hist` 契约**：原先「gear_sonic +
+  MimicLite 合并」设计（逐未来帧 ref-root 通道 + 投影-yaw 锚系下的逐身体 ref−实际差分、
+  `SONIC_CRITIC_DIFF_STEPS=[0,1]`）删除。现布局（feature-grouped，上游 term 序）：
+  `[未来参考关节——G1 步长网格上全部位置帧再全部速度帧 | motion_anchor_pos_b 3（当前帧
+  原始参考锚在机器人锚系下，z 分量即特权高度误差，xy 为相对 clip 世界轨迹的漂移）|
+  motion_anchor_ori_b 6（参考锚相对机器人锚）| robot_body_pos_b 逐 tracked 身体 3 |
+  robot_body_ori_b 逐 tracked 身体 6（均在机器人锚系下）| 本体感知历史
+  `lin_vel|ang_vel|joint_pos|joint_vel|action` 逐块最旧→最新]`，无噪声（上游该组
+  无 corruption）。宽度 `2FJ + 9 + 9B + (6+3J)H`（F=H=5 时 890，替代旧 1220）；
+  `test_sonic_critic_matches_release_privileged_mf_hist` 逐块锁定。
+  **此变更使旧 SONIC checkpoint 的 critic 输入槽位语义互换，需重训。**
+- **encoder_index 可选化（`algo.variant.model.encoder_index: false`）**：core manager
+  组增加 IsaacLab 惯例的 `term = None` 禁用语义（`_manager_group_to_dict` 与
+  `ManagerObservationGroupCfg.to_dict` 跳过 None），sonic variant 在关闭时把
+  `env_cfg.observations.policy.encoder_index` 置 None、`passthrough_dims` 归零，packed
+  observation 止于 teleop 块，观测归一化对全部维度统一（不再为二值 mask 保留
+  passthrough）。maskless 模式下每一行按路由级联默认走 g1 encoder（等价于全部
+  g1-native 行），跨 encoder 对齐损失归零、g1_recon 仍训练；多流联合训练仍需默认
+  的 mask 输入。`test_none_manager_terms_are_disabled`、
+  `test_sonic_maskless_model_routes_every_row_through_g1`、
+  `test_sonic_encoder_index_false_drops_mask_term_and_passthrough` 钉住。
 
 ### 已核对一致项
 

@@ -715,14 +715,13 @@ def test_sonic_observation_sizes_are_derived_from_runtime_shapes() -> None:
     # Upstream teleop layout: lower-body block per future frame plus the
     # static current-frame tail (3 positions + 3 quaternions + anchor 6D).
     assert mdp.SonicHybridReferenceObservationCfg()(env).size == num_future_frames * 24 + 27
-    # Merged gear_sonic/MimicLite contract: per-future-frame joints plus the
-    # ref-root channel (3 + 6), body-diff terms (15 per body per diff step),
-    # then the proprioception history frames.
+    # sonic_release privileged_mf_hist contract: future reference joints
+    # (positions then velocities), the anchor pos/ori channels (9), the robot
+    # body pos/ori channels (9 per tracked body), then the proprioception
+    # history frames (6 + 3 per joint per frame).
     critic_history_frames = 4
     assert mdp.SonicCriticObservationCfg(num_history_frames=critic_history_frames)(env).size == (
-        num_future_frames * (2 * joint_count + 9)
-        + len(mdp.SONIC_CRITIC_DIFF_STEPS) * body_count * 15
-        + critic_history_frames * actor_frame_dim
+        num_future_frames * 2 * joint_count + 9 + 9 * body_count + critic_history_frames * (6 + 3 * joint_count)
     )
 
 
@@ -903,10 +902,10 @@ def test_sonic_critic_observes_robot_state_and_resets_history() -> None:
         },
     )
     term = mdp.SonicCriticObservation(np.zeros((2, n, 6 + 3 * joints), np.float32), np.full(2, -1, np.int64))
-    out = np.full(n * (2 * joints + 9) + 2 * 15 * bodies + n * (6 + 3 * joints), np.nan, np.float32)
+    out = np.full(n * 2 * joints + 9 + 9 * bodies + n * (6 + 3 * joints), np.nan, np.float32)
     mdp.SonicCriticObservation.compute(ctx, out, term)
     assert np.isfinite(out).all()
-    history_start = n * (2 * joints + 9) + 2 * 15 * bodies
+    history_start = n * 2 * joints + 9 + 9 * bodies
     np.testing.assert_array_equal(out[history_start : history_start + 6], [1, 2, 3, 1, 2, 3])
     sim["tracked_body_linear_velocity"][:] = 4
     mdp.SonicCriticObservation.compute(ctx, out, term)
@@ -918,56 +917,51 @@ def test_sonic_critic_observes_robot_state_and_resets_history() -> None:
 
 
 def _run_critic_observation(
-    clip_body_pos,
-    clip_body_quat,
+    clip_joint_pos,
+    clip_joint_vel,
+    ref_anchor_pos,
+    ref_anchor_quat,
     robot_body_pos,
     robot_body_quat,
     *,
     anchor_quat=None,
     root_pos=None,
-    ref_root_pos=None,
 ):
     """Run ``SonicCriticObservation.compute`` on a one-env, two-body fixture.
 
-    Body 0 is the pelvis anchor (static at the origin unless ``root_pos``
-    moves the robot's), body 1 carries the caller's per-frame reference pose
-    (leading axis: [frame, component]) and per-frame robot pose. Anchors take
-    ``anchor_quat`` on both sides so the projected-yaw canonicalization is
-    exercised. Returns the output vector plus context and term for in-place
-    mutation and recompute.
+    Body 0 is the pelvis anchor (at the origin unless ``root_pos`` moves it and
+    with ``anchor_quat`` when given); body 1 carries the caller's robot pose.
+    The clip provides per-frame reference joint rows (leading axis: frame) and
+    the reference anchor pose. Returns the output vector plus context and term
+    for in-place mutation and recompute.
     """
-    joints, bodies, frames = 1, 2, 2
-    identity = _identity_quaternions((frames, bodies))
-    clip_bodies_quat = identity.copy()
-    clip_bodies_quat[:, 1] = clip_body_quat
+    joints, bodies, frames = 2, 2, 6
     robot_bodies_quat = _identity_quaternions((bodies,))
     robot_bodies_quat[1] = robot_body_quat
-    clip_bodies_pos = np.zeros((frames, bodies, 3), np.float32)
-    clip_bodies_pos[:, 1] = clip_body_pos
     robot_bodies_pos = np.zeros((bodies, 3), np.float32)
     robot_bodies_pos[1] = robot_body_pos
     if anchor_quat is not None:
-        clip_bodies_quat[:, 0] = anchor_quat
         robot_bodies_quat[0] = anchor_quat
+    ref_quats = np.zeros((frames, 4), np.float32)
+    ref_quats[:, 3] = 1.0
+    ref_quats[:] = ref_anchor_quat
     motion = SimpleNamespace(
         steps=np.asarray((0,), np.int64),
-        num_future_frames=np.int64(1),
+        num_future_frames=np.int64(2),
         reference_index=np.int64(0),
         reset_counter=np.asarray([0]),
         clip=SimpleNamespace(
-            frame_clip_end=np.asarray([1, 1]),
-            joint_pos=np.zeros((frames, joints), np.float32),
-            joint_vel=np.zeros((frames, joints), np.float32),
-            reference_body_pos_w=np.zeros((frames, 3), np.float32),
-            reference_body_quat_w=_identity_quaternions((frames,)),
-            tracked_bodies_pos_w=clip_bodies_pos,
-            tracked_bodies_quat_w=clip_bodies_quat,
+            frame_clip_end=np.full(frames, frames - 1, np.int64),
+            joint_pos=clip_joint_pos.astype(np.float32),
+            joint_vel=clip_joint_vel.astype(np.float32),
+            reference_body_pos_w=np.asarray(ref_anchor_pos, np.float32),
+            reference_body_quat_w=ref_quats,
+            tracked_bodies_pos_w=np.zeros((frames, bodies, 3), np.float32),
+            tracked_bodies_quat_w=_identity_quaternions((frames, bodies)),
             tracked_bodies_lin_vel_w=np.zeros((frames, bodies, 3), np.float32),
             tracked_bodies_ang_vel_w=np.zeros((frames, bodies, 3), np.float32),
         ),
     )
-    if ref_root_pos is not None:
-        motion.clip.reference_body_pos_w[:] = ref_root_pos
     sim = {
         "tracked_body_pos": robot_bodies_pos,
         "tracked_body_quat": robot_bodies_quat,
@@ -991,77 +985,73 @@ def _run_critic_observation(
             )
         },
     )
-    term = mdp.SonicCriticObservation(np.zeros((1, 1, 6 + 3 * joints), np.float32), np.full(1, -1, np.int64))
-    out = np.full(1 * (2 * joints + 9) + 2 * 15 * bodies + 1 * (6 + 3 * joints), np.nan, np.float32)
+    history = 1
+    term = mdp.SonicCriticObservation(np.zeros((1, history, 6 + 3 * joints), np.float32), np.full(1, -1, np.int64))
+    out = np.full(2 * 2 * joints + 9 + 9 * bodies + history * (6 + 3 * joints), np.nan, np.float32)
     mdp.SonicCriticObservation.compute(ctx, out, term)
     return out, ctx, term
 
 
-def test_sonic_critic_diff_and_root_channels_match_mimiclite_semantics() -> None:
+def test_sonic_critic_matches_release_privileged_mf_hist() -> None:
     identity6 = np.asarray([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], np.float32)
     yaw90 = np.zeros(4, np.float32)
     yaw90[2] = np.float32(np.sin(np.pi / 4))
     yaw90[3] = np.float32(np.cos(np.pi / 4))
+    joints, bodies = 2, 2
+    width = 2 * joints
+    anchor_start = 2 * width
+    body_pos_base = anchor_start + 9
+    body_ori_base = body_pos_base + 3 * bodies
+
+    clip_joint_pos = np.arange(6 * joints, dtype=np.float64).reshape(6, joints)
+    clip_joint_vel = clip_joint_pos + 100.0
+    ref_anchor = np.tile(np.asarray((1.5, 0.0, 0.25), np.float32), (6, 1))
     identity_body = _identity_quaternions((2,))
-    # Feature-grouped diff layout offsets; body 1 at diff step s lives at
-    # flat index s * 2 + 1 (step-major, two bodies).
-    bodies = 2
-    future_dim = 1 * (2 * 1 + 9)
-    diff_stride = len(mdp.SONIC_CRITIC_DIFF_STEPS) * bodies
-    pos_base = future_dim
-    ori_base = pos_base + 3 * diff_stride
-    lin_base = ori_base + 6 * diff_stride
-    ang_base = lin_base + 3 * diff_stride
 
-    def diff_index(step, body):
-        return step * bodies + body
-
-    # Aligned reference and robot: zero position and velocity diffs, identity
-    # orientation diffs (the 6D of a null rotation, not zeros), and a
-    # zero/identity root channel.
+    # Reference joints: positions for all future frames first, then the same
+    # frames' velocities, sampled on the G1 stride grid from the current step
+    # (stride 5 on a 6-frame clip: frames 0 and 5).
     out, _, _ = _run_critic_observation(
-        np.zeros((2, 3), np.float32), identity_body, np.zeros(3, np.float32), identity_body[0]
+        clip_joint_pos, clip_joint_vel, ref_anchor, identity_body[0], np.zeros(3, np.float32), identity_body[0]
     )
-    np.testing.assert_allclose(out[pos_base:ori_base], 0.0, atol=1e-7)
-    np.testing.assert_allclose(out[ori_base:lin_base], np.tile(identity6, diff_stride), atol=1e-6)
-    np.testing.assert_allclose(out[lin_base : ang_base + 3 * diff_stride], 0.0, atol=1e-7)
-    np.testing.assert_allclose(out[future_dim - 9 : future_dim - 6], 0.0, atol=1e-7)
-    np.testing.assert_allclose(out[future_dim - 6 : future_dim], identity6, atol=1e-6)
+    np.testing.assert_allclose(out[:width], [0.0, 1.0, 10.0, 11.0], atol=1e-6)
+    np.testing.assert_allclose(out[width : 2 * width], [100.0, 101.0, 110.0, 111.0], atol=1e-6)
 
-    # Reference offset: diff pos is ref-local minus robot-local in the
-    # projected-yaw anchor frames, and the velocity diff is the plain
-    # world-frame difference. Both diff steps agree on a static clip.
-    ref_offset = np.tile(np.asarray((0.3, 0.0, 0.1), np.float32), (2, 1))
-    out, ctx, term = _run_critic_observation(ref_offset, identity_body, np.zeros(3, np.float32), identity_body[0])
-    ctx.commands["motion"].clip.tracked_bodies_lin_vel_w[:, 1] = (0.5, 0.0, 0.0)
-    ctx.sim["tracked_body_linear_velocity"][1] = (0.2, 0.0, 0.0)
-    mdp.SonicCriticObservation.compute(ctx, out, term)
-    for step in range(len(mdp.SONIC_CRITIC_DIFF_STEPS)):
-        index = diff_index(step, 1)
-        np.testing.assert_allclose(out[pos_base + 3 * index : pos_base + 3 * index + 3], (0.3, 0.0, 0.1), atol=1e-6)
-        np.testing.assert_allclose(out[lin_base + 3 * index : lin_base + 3 * index + 3], (0.3, 0.0, 0.0), atol=1e-6)
+    # Anchor channels: the raw current-frame reference anchor relative to the
+    # robot anchor in the robot anchor frame — the z component carries the
+    # height error, the xy part the drift from the clip's recorded trajectory.
+    np.testing.assert_allclose(out[anchor_start : anchor_start + 3], (1.5, 0.0, 0.25), atol=1e-6)
+    np.testing.assert_allclose(out[anchor_start + 3 : anchor_start + 9], identity6, atol=1e-6)
+    # Robot body channels: body poses in the robot anchor frame. Body 0 is the
+    # anchor itself (zero offset, identity rotation).
+    np.testing.assert_allclose(out[body_pos_base : body_pos_base + 3], 0.0, atol=1e-7)
+    np.testing.assert_allclose(out[body_ori_base : body_ori_base + 6], identity6, atol=1e-6)
 
-    # A clip whose second frame keeps moving advances only the second diff
-    # step; a yaw-90 reference orientation yields the relative rotation 6D in
-    # this repo's first-two-columns layout.
-    moving = ref_offset.copy()
-    moving[1] += (0.1, 0.0, 0.0)
-    yaw_body = np.tile(yaw90, (2, 1))
-    out, _, _ = _run_critic_observation(moving, yaw_body, np.zeros(3, np.float32), identity_body[0])
-    for step in range(len(mdp.SONIC_CRITIC_DIFF_STEPS)):
-        index = diff_index(step, 1)
-        np.testing.assert_allclose(
-            out[ori_base + 6 * index : ori_base + 6 * index + 6], (0.0, -1.0, 1.0, 0.0, 0.0, 0.0), atol=1e-6
-        )
-    np.testing.assert_allclose(
-        out[pos_base + 3 * diff_index(0, 1) : pos_base + 3 * diff_index(0, 1) + 3], (0.3, 0.0, 0.1), atol=1e-6
+    # A yaw-90 robot anchor rotates the anchor offset into the robot frame and
+    # the anchor orientation channel holds the relative rotation (yaw -90) 6D.
+    out, _, _ = _run_critic_observation(
+        clip_joint_pos,
+        clip_joint_vel,
+        ref_anchor,
+        identity_body[0],
+        np.zeros(3, np.float32),
+        identity_body[0],
+        anchor_quat=yaw90,
     )
-    np.testing.assert_allclose(
-        out[pos_base + 3 * diff_index(1, 1) : pos_base + 3 * diff_index(1, 1) + 3], (0.4, 0.0, 0.1), atol=1e-6
-    )
+    np.testing.assert_allclose(out[anchor_start : anchor_start + 3], (0.0, -1.5, 0.25), atol=1e-6)
+    np.testing.assert_allclose(out[anchor_start + 3 : anchor_start + 9], (0.0, 1.0, -1.0, 0.0, 0.0, 0.0), atol=1e-6)
 
-    # The diff terms stay invariant under a common yaw rotation and xy
-    # translation of both sides: each anchor's projected-yaw frame absorbs it.
+    # A yaw-90 robot body 1 yields its relative rotation 6D; its anchor-frame
+    # position offset passes through unrotated under the identity anchor.
+    offset = np.asarray((0.3, 0.0, 0.1), np.float32)
+    out, _, _ = _run_critic_observation(clip_joint_pos, clip_joint_vel, ref_anchor, identity_body[0], offset, yaw90)
+    np.testing.assert_allclose(out[body_pos_base + 3 : body_pos_base + 6], (0.3, 0.0, 0.1), atol=1e-6)
+    np.testing.assert_allclose(out[body_ori_base + 6 : body_ori_base + 12], (0.0, -1.0, 1.0, 0.0, 0.0, 0.0), atol=1e-6)
+
+    # The anchor and robot-body channels are invariant under a common yaw
+    # rotation plus xy translation of the whole world: everything is expressed
+    # relative to the robot anchor.
+
     def rotate_xy(vector, translation):
         vector = np.asarray(vector, np.float32)
         translation = np.asarray(translation, np.float32)
@@ -1070,32 +1060,34 @@ def test_sonic_critic_diff_and_root_channels_match_mimiclite_semantics() -> None
         )
 
     translation = (1.0, 2.0, 0.0)
-    transformed = np.asarray([rotate_xy(row, translation) for row in ref_offset], np.float32)
+    moved_anchor = np.asarray([rotate_xy(row, translation) for row in ref_anchor], np.float32)
     out, _, _ = _run_critic_observation(
-        transformed,
-        yaw_body,
-        rotate_xy((0.0, 0.0, 0.0), translation),
-        identity_body[0],
+        clip_joint_pos,
+        clip_joint_vel,
+        moved_anchor,
+        yaw90,
+        rotate_xy(offset, translation),
+        yaw90,
         anchor_quat=yaw90,
+        root_pos=rotate_xy((0.0, 0.0, 0.0), translation),
     )
-    index = diff_index(0, 1)
-    np.testing.assert_allclose(out[pos_base + 3 * index : pos_base + 3 * index + 3], (0.3, 0.0, 0.1), atol=1e-6)
-    np.testing.assert_allclose(
-        out[ori_base + 6 * index : ori_base + 6 * index + 6], (0.0, -1.0, 1.0, 0.0, 0.0, 0.0), atol=1e-6
-    )
+    np.testing.assert_allclose(out[anchor_start : anchor_start + 3], (1.5, 0.0, 0.25), atol=1e-6)
+    np.testing.assert_allclose(out[anchor_start + 3 : anchor_start + 9], identity6, atol=1e-6)
+    np.testing.assert_allclose(out[body_pos_base + 3 : body_pos_base + 6], (0.3, 0.0, 0.1), atol=1e-6)
 
-    # Root channel: reference root relative to the robot root in the robot
-    # root frame, on the future-frame slots of the G1 grid.
-    out, _, _ = _run_critic_observation(
-        np.zeros((2, 3), np.float32),
-        identity_body,
-        np.zeros(3, np.float32),
-        identity_body[0],
-        root_pos=(1.0, 0.0, 0.0),
-        ref_root_pos=(1.5, 0.0, 0.25),
+    # Future frames clamp at the clip end: when the clip ends before the second
+    # stride frame, that slot repeats the last clip frame.
+    short_pos = np.zeros((6, joints), np.float64)
+    short_pos[1] = (7.0, 8.0)
+    short_vel = np.zeros((6, joints), np.float64)
+    short_vel[1] = (70.0, 80.0)
+    out, ctx, term = _run_critic_observation(
+        short_pos, short_vel, ref_anchor, identity_body[0], np.zeros(3, np.float32), identity_body[0]
     )
-    np.testing.assert_allclose(out[future_dim - 9 : future_dim - 6], (0.5, 0.0, 0.25), atol=1e-6)
-    np.testing.assert_allclose(out[future_dim - 6 : future_dim], identity6, atol=1e-6)
+    ctx.commands["motion"].clip.frame_clip_end[:] = 1
+    mdp.SonicCriticObservation.compute(ctx, out, term)
+    np.testing.assert_allclose(out[:width], [0.0, 0.0, 7.0, 8.0], atol=1e-6)
+    np.testing.assert_allclose(out[width : 2 * width], [0.0, 0.0, 70.0, 80.0], atol=1e-6)
 
 
 def test_sonic_cdf_sampling_matches_linear_walk_reference() -> None:

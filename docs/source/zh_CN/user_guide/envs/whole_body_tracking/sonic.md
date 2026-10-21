@@ -11,7 +11,10 @@ LAFAN 数据和小规模验证都使用同一个环境。
 
 任务配置把 `algo.variant` 直接内联在 `configs/task/g1-sonic/motrix.fastsac.yaml` 中。
 其中 `model.num_future_frames` 同时决定环境 policy observation 宽度与 actor 输入宽度；
-`auxiliary` 是五个上游命名辅助损失（`g1_recon`、`g1_smpl_latent`、`g1_teleop_latent`、
+`model.encoder_index: false` 可从 packed observation 中去掉末尾的三值 encoder mask：
+去掉后每一行都路由到 g1 encoder，观测归一化对全部维度统一进行（不再为二值 mask 保留
+passthrough 通道）。`auxiliary` 是五个上游命名辅助损失（`g1_recon`、`g1_smpl_latent`、
+`g1_teleop_latent`、
 `teleop_smpl_latent`、`reencoded_smpl_g1_latent`）的权重，由 FastSAC 加权求和并记录
 `aux_*` 指标。`g1_control_decoder_hidden_dims` 不出现在训练配置中：训练 actor 不构造该
 decoder，并用 FastSAC policy head 替代它。
@@ -19,12 +22,12 @@ decoder，并用 FastSAC policy head 替代它。
 ## 观察与动作
 
 `g1-sonic` 的 policy observation 宽度为 1355（`num_future_frames=5` 时；G1/SMPL 块随该值
-线性缩放，teleop 块另加 27 维常量当前帧尾部），privileged value observation 宽度为 1220。
-value observation 合并了 gear_sonic 与 MimicLite 的 critic 契约：逐未来帧的参考关节位置与
-速度加上机器人根系下的参考根位姿（对应 MimicLite `ref_root_*_future_b`）、MimicLite 式逐
-身体"参考−实际"差分（位置、6D 朝向与世界系线/角速度，覆盖全部 tracked 身体，diff 步为
-`[0, 1]`，两侧各在自身 pelvis 锚的投影-yaw 系下规范化），以及滑窗本体感知历史（每帧
-`lin_vel | ang_vel | joint_pos | joint_vel | action`）。动作是 29 维归一化关节位置目标，动作
+线性缩放，teleop 块另加 27 维常量当前帧尾部），privileged value observation 宽度为 890。value
+observation 对齐上游 sonic_release 的 `privileged_mf_hist` critic 契约：未来参考关节块（G1 步长网格
+上的全部位置帧、再全部速度帧）、当前帧锚通道（机器人锚系下的参考锚位置 3 维——含 z 高度误差
+与 xy 漂移——及参考锚相对机器人锚的 6D 朝向）、机器人身体块（逐 tracked 身体在机器人锚系下的
+位置与 6D 朝向），以及滑窗本体感知历史（每帧 `lin_vel | ang_vel | joint_pos | joint_vel |
+action`）。动作是 29 维归一化关节位置目标，动作
 缩放和偏置在环境 action term 内完成；FastSAC actor 保持 identity action affine。
 
 ## 数据与运行

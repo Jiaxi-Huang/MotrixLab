@@ -56,10 +56,16 @@ class ManagerObservationGroupCfg:
     """Typed declaration group for one named observation group's terms."""
 
     def to_dict(self) -> dict[str, ObservationTermCfg]:
-        """Return observation term configs keyed by their declaration names."""
+        """Return observation term configs keyed by their declaration names.
+
+        A term declared ``None`` is disabled (the IsaacLab manager-group
+        convention) and is omitted.
+        """
         term_cfgs: dict[str, ObservationTermCfg] = {}
         for term_field in fields(self):
             term_cfg = getattr(self, term_field.name)
+            if term_cfg is None:
+                continue
             if not isinstance(term_cfg, ObservationTermCfg):
                 raise TypeError(
                     f"Observation term {term_field.name!r} must be an ObservationTermCfg, "

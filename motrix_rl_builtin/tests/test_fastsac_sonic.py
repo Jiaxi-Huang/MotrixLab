@@ -135,6 +135,63 @@ def test_sonic_backbone_routes_multi_hot_with_smpl_priority() -> None:
     assert torch.equal(output.selected_tokens[4], expected_teleop[4])
 
 
+def _maskless_packed(cfg: SonicModelConfig, batch: int = 4) -> torch.Tensor:
+    return torch.cat(
+        (
+            torch.randn(batch, cfg.actor_obs_dim),
+            torch.randn(batch, cfg.g1_input_dim),
+            torch.randn(batch, cfg.smpl_input_dim),
+            torch.randn(batch, cfg.teleop_input_dim),
+        ),
+        dim=-1,
+    )
+
+
+def test_sonic_maskless_model_routes_every_row_through_g1() -> None:
+    """``encoder_index=False`` drops the mask input and defaults to g1 routing.
+
+    The maskless forward must behave exactly like a masked batch of g1-native
+    rows: the packed observation ends after the teleop block, the mask slice
+    is absent, and the smpl/teleop encoders stay zeroed out.
+    """
+    from motrix_rl_builtin.fastsac.sonic import SonicBackbone
+
+    cfg = SonicModelConfig(
+        num_future_frames=2,
+        num_history_frames=3,
+        num_tokens=1,
+        token_dim=4,
+        fsq_levels=8,
+        action_dim=7,
+        encoder_index=False,
+    )
+    assert cfg.packed_obs_dim == (cfg.actor_obs_dim + cfg.g1_input_dim + cfg.smpl_input_dim + cfg.teleop_input_dim)
+
+    actor = SonicActor(cfg, hidden_dim=32, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor_obs, g1, smpl, teleop, index = actor._split(_maskless_packed(cfg, 4))
+    assert index is None
+    actions, logp, aux = actor.get_actions_and_log_probs_with_aux(_maskless_packed(cfg, 4))
+    assert actions.shape == (4, cfg.action_dim)
+    assert torch.isfinite(actions).all() and torch.isfinite(logp).all()
+    # The cross-encoder alignment losses reduce to zero rows; g1
+    # reconstruction still trains.
+    assert aux["g1_smpl_latent"].item() == 0.0
+    assert aux["g1_teleop_latent"].item() == 0.0
+    assert aux["teleop_smpl_latent"].item() == 0.0
+    assert aux["reencoded_smpl_g1_latent"].item() == 0.0
+
+    # Maskless routing equals an explicit all-g1 mask on the same batch.
+    torch.manual_seed(0)
+    backbone = SonicBackbone(cfg, device="cpu")
+    backbone.eval()
+    observations = _maskless_packed(cfg, 4)
+    actor_obs, g1, smpl, teleop, _ = actor._split(observations)
+    with torch.no_grad():
+        maskless = backbone(actor_obs, g1, smpl, teleop, None)
+        explicit = backbone(actor_obs, g1, smpl, teleop, torch.tensor([[1.0, 0.0, 0.0]] * 4))
+    torch.testing.assert_close(maskless.selected_tokens, explicit.selected_tokens)
+
+
 def test_sonic_deterministic_action_is_bounded() -> None:
     cfg = SonicModelConfig(
         num_future_frames=2, num_history_frames=3, num_tokens=1, token_dim=4, fsq_levels=8, action_dim=7

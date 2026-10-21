@@ -546,6 +546,37 @@ def test_manager_cfg_accepts_dict_groups_and_empty_commands() -> None:
     np.testing.assert_array_equal(state.obs.policy[:, 0], [0.0, 1.0])
 
 
+def test_none_manager_terms_are_disabled() -> None:
+    """A ``None`` term disables it (IsaacLab manager-group convention).
+
+    Both declaration shapes — dict groups and typed group configs — must drop
+    ``None`` terms instead of failing the type check, so a policy variant can
+    omit an optional observation term per configuration.
+    """
+    dict_cfg = ManagerBasedEnvCfg(
+        scene=SceneCfg(),
+        actions={"test": _TestActionCfg()},
+        observations={"policy": {"lane": _LaneObservationCfg(), "disabled": None}},
+    )
+    assert tuple(dict_cfg.observation_cfgs()["policy"]) == ("lane",)
+
+    @configclass
+    class _OptionalPolicyObsCfg(ManagerObservationGroupCfg):
+        lane: _LaneObservationCfg = _LaneObservationCfg()
+        disabled: None = None
+
+    @configclass
+    class _OptionalObsCfg(ManagerObservationsCfg):
+        policy: _OptionalPolicyObsCfg = _OptionalPolicyObsCfg()
+
+    typed_cfg = ManagerBasedEnvCfg(scene=SceneCfg(), observations=_OptionalObsCfg())
+    assert tuple(typed_cfg.observation_cfgs()["policy"]) == ("lane",)
+
+    env = ManagerEnv(dict_cfg, num_envs=2)
+    assert tuple(env.observation_groups["policy"].terms) == (env.observation_groups["policy"].terms[0],)
+    assert env.observation_groups["policy"].size == 1
+
+
 def test_multiple_action_terms_concatenate_spaces_and_receive_ordered_slices() -> None:
     @dispatch
     def _multiple_action_observation(ctx: ManagerContext, out: np.ndarray) -> None:

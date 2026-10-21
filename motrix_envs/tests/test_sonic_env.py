@@ -64,11 +64,7 @@ def test_sonic_environment_compiles_and_steps(tmp_path) -> None:
         + mdp._hybrid_reference_width(future_frames)
         + mdp.SONIC_ENCODER_COUNT
     )
-    value_width = (
-        future_frames * (2 * joints + 9)
-        + len(mdp.SONIC_CRITIC_DIFF_STEPS) * bodies * 15
-        + critic_history_frames * mdp._sonic_actor_frame_dim(joints)
-    )
+    value_width = future_frames * 2 * joints + 9 + 9 * bodies + critic_history_frames * (6 + 3 * joints)
 
     env = registry.resolve("g1-sonic", env_cfg=cfg).make(num_envs=2, seed=1)
 

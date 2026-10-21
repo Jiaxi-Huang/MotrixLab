@@ -54,6 +54,10 @@ class SonicModelConfig:
     smpl_encoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 512)
     teleop_encoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 512)
     g1_motion_decoder_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 512)
+    # Whether the packed observation carries the trailing multi-hot encoder
+    # mask. Maskless runs route every row through the g1 encoder and observation
+    # normalization covers the full vector uniformly (no binary passthrough).
+    encoder_index: bool = True
 
     @property
     def actor_obs_dim(self) -> int:
@@ -93,9 +97,8 @@ class SonicModelConfig:
 
     @property
     def packed_obs_dim(self) -> int:
-        return (
-            self.actor_obs_dim + self.g1_input_dim + self.smpl_input_dim + self.teleop_input_dim + SONIC_ENCODER_COUNT
-        )
+        mask_dim = SONIC_ENCODER_COUNT if self.encoder_index else 0
+        return self.actor_obs_dim + self.g1_input_dim + self.smpl_input_dim + self.teleop_input_dim + mask_dim
 
     @property
     def token_total_dim(self) -> int:
@@ -115,6 +118,7 @@ class SonicModelConfig:
             "smpl_encoder_hidden_dims",
             "teleop_encoder_hidden_dims",
             "g1_motion_decoder_hidden_dims",
+            "encoder_index",
         }
         data = {key: values[key] for key in allowed if key in values}
         for key in (
@@ -201,7 +205,7 @@ class SonicBackbone(nn.Module):
         g1_reference: torch.Tensor,
         smpl_reference: torch.Tensor,
         teleop_reference: torch.Tensor,
-        encoder_index: torch.Tensor,
+        encoder_index: torch.Tensor | None,
         *,
         compute_auxiliary: bool = False,
     ) -> SonicBackboneOutput:
@@ -214,14 +218,22 @@ class SonicBackbone(nn.Module):
             raise ValueError("invalid SONIC SMPL reference shape")
         if teleop_reference.ndim != 2 or teleop_reference.shape[-1] != cfg.teleop_input_dim:
             raise ValueError("invalid SONIC teleop reference shape")
-        if encoder_index.shape != (actor_obs.shape[0], SONIC_ENCODER_COUNT):
-            raise ValueError(f"SONIC encoder_index must have shape (B, {SONIC_ENCODER_COUNT})")
-        # Column order mirrors upstream encoder_sample_probs: [g1, teleop, smpl].
-        # The mask is multi-hot: smpl-native rows also activate g1 and, with
-        # probability 0.5, teleop.
-        g1_mask = encoder_index[:, 0].bool()
-        teleop_mask = encoder_index[:, 1].bool()
-        smpl_mask = encoder_index[:, 2].bool()
+        if encoder_index is None:
+            # Maskless contract: every row routes through the g1 encoder (the
+            # routing cascade's default), so the smpl/teleop latents stay
+            # masked out and their alignment losses reduce to zero rows.
+            g1_mask = torch.ones(actor_obs.shape[0], dtype=torch.bool, device=actor_obs.device)
+            teleop_mask = torch.zeros_like(g1_mask)
+            smpl_mask = torch.zeros_like(g1_mask)
+        else:
+            if encoder_index.shape != (actor_obs.shape[0], SONIC_ENCODER_COUNT):
+                raise ValueError(f"SONIC encoder_index must have shape (B, {SONIC_ENCODER_COUNT})")
+            # Column order mirrors upstream encoder_sample_probs: [g1, teleop,
+            # smpl]. The mask is multi-hot: smpl-native rows also activate g1
+            # and, with probability 0.5, teleop.
+            g1_mask = encoder_index[:, 0].bool()
+            teleop_mask = encoder_index[:, 1].bool()
+            smpl_mask = encoder_index[:, 2].bool()
         g1_input = torch.where(g1_mask[:, None, None], g1_reference, torch.zeros_like(g1_reference))
         smpl_input = torch.where(smpl_mask[:, None, None], smpl_reference, torch.zeros_like(smpl_reference))
         teleop_input = torch.where(teleop_mask[:, None], teleop_reference, torch.zeros_like(teleop_reference))
@@ -337,7 +349,7 @@ class SonicActor(nn.Module):
         g1_flat = obs[:, g1_start:smpl_start]
         smpl_flat = obs[:, smpl_start:teleop_start]
         teleop = obs[:, teleop_start : teleop_start + cfg.teleop_input_dim]
-        encoder_index = obs[:, teleop_start + cfg.teleop_input_dim :]
+        encoder_index = obs[:, teleop_start + cfg.teleop_input_dim :] if cfg.encoder_index else None
         g1_command_frame_dim = cfg.g1_frame_dim - SONIC_ROTATION_REPRESENTATION_DIM
         g1_command_width = cfg.num_future_frames * g1_command_frame_dim
         g1 = torch.cat(
@@ -396,6 +408,11 @@ class SonicPolicyVariant:
         env_cfg.commands.motion.num_future_frames = model.num_future_frames
         env_cfg.observations.policy.obs.num_history_frames = model.num_history_frames
         env_cfg.observations.value.obs.num_history_frames = model.num_history_frames
+        if not model.encoder_index:
+            # ``None`` disables the term (manager-group convention): the packed
+            # observation ends after the teleop block and actor observation
+            # normalization no longer needs the binary-mask passthrough.
+            env_cfg.observations.policy.encoder_index = None
 
     def _model(self, values: Mapping[str, Any]) -> SonicModelConfig:
         model_values = values.get("model")
@@ -428,7 +445,8 @@ class SonicPolicyVariant:
         return actor
 
     def passthrough_dims(self, cfg: FastSacCfg) -> int:
-        return SONIC_ENCODER_COUNT
+        model = self._model(cfg.variant)
+        return SONIC_ENCODER_COUNT if model.encoder_index else 0
 
     def _aux_loss_weights(self, cfg: FastSacCfg) -> dict[str, float]:
         values = cfg.variant.get("auxiliary", {})

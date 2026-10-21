@@ -96,6 +96,48 @@ def test_sonic_temporal_dims_configure_environment_independently() -> None:
     assert spec.env_cfg.observations.value.obs.num_history_frames == 7
 
 
+def test_sonic_encoder_index_false_drops_mask_term_and_passthrough() -> None:
+    """Maskless runs shrink the packed observation and normalize uniformly.
+
+    ``encoder_index=false`` must remove the trailing encoder-mask term from the
+    environment's policy group (a ``None`` term is disabled) and drop the
+    binary passthrough exception, so observation normalization covers the
+    whole vector like every other task.
+    """
+    import motrix_envs  # noqa: F401 registers built-in environments
+    from motrix_env_core import registry
+
+    config = _compose("g1-sonic/motrix.fastsac", ["+algo.variant.model.encoder_index=false"])
+    variant = resolve_policy_variant(config.algo.policy_variant)
+    spec = configure_env_spec(config.algo, registry.resolve("g1-sonic"))
+
+    assert spec.env_cfg.observations.policy.encoder_index is None
+    assert variant.passthrough_dims(config.algo) == 0
+
+    masked = _compose("g1-sonic/motrix.fastsac", [])
+    assert variant.passthrough_dims(masked.algo) == SONIC_ENCODER_COUNT
+    assert _sonic_obs_dim(config) == _sonic_obs_dim(masked) - SONIC_ENCODER_COUNT
+
+    actor = variant.build_actor(
+        config.algo,
+        (_sonic_obs_dim(config), config.algo.variant["model"]["action_dim"]),
+        torch.ones(config.algo.variant["model"]["action_dim"]),
+        torch.zeros(config.algo.variant["model"]["action_dim"]),
+        device="cpu",
+    )
+    actions, log_probs, auxiliary_loss, metrics = variant.policy_update(
+        actor, torch.zeros(2, _sonic_obs_dim(config)), config.algo
+    )
+    assert actions.shape == (2, config.algo.variant["model"]["action_dim"])
+    assert torch.isfinite(auxiliary_loss)
+    # Maskless rows are g1-native: the cross-encoder alignment losses see no
+    # smpl/teleop rows and reduce to zero, while g1 reconstruction still runs.
+    assert metrics["aux_g1_smpl_latent"].item() == 0.0
+    assert metrics["aux_g1_teleop_latent"].item() == 0.0
+    assert metrics["aux_teleop_smpl_latent"].item() == 0.0
+    assert metrics["aux_reencoded_smpl_g1_latent"].item() == 0.0
+
+
 def test_sonic_canonical_variant_builds_actor() -> None:
     config = _compose("g1-sonic/motrix.fastsac", [])
     variant = resolve_policy_variant(config.algo.policy_variant)
@@ -311,6 +353,7 @@ def _tiny_sonic_config() -> TrainConfig:
 def _sonic_obs_dim(config: TrainConfig) -> int:
     model = config.algo.variant["model"]
     action_dim = model["action_dim"]
+    encoder_mask = 3 if model.get("encoder_index", True) else 0
     proprioceptive = 3 * action_dim + 6
     g1_reference = 2 * action_dim + 6
     smpl_reference = 24 * 3 + 6 + 2 * 3
@@ -319,7 +362,7 @@ def _sonic_obs_dim(config: TrainConfig) -> int:
         model["num_history_frames"] * proprioceptive
         + model["num_future_frames"] * (g1_reference + smpl_reference)
         + teleop_reference
-        + 3
+        + encoder_mask
     )
 
 
