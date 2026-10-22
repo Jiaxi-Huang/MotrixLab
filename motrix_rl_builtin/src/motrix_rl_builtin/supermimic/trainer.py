@@ -146,7 +146,10 @@ class Trainer(TrainerBase):
             if iteration < 300 or iteration % 25 == 0:
                 print(
                     f"[motrix.supermimic] iter {iteration}/{num_iterations} "
-                    f"buffer={learner.buffer.size} elapsed={time.time() - start_time:.0f}s",
+                    f"buffer={learner.buffer.size} elapsed={time.time() - start_time:.0f}s "
+                    f"mm_prec={torch.get_float32_matmul_precision()} "
+                    f"tf32={torch.backends.cuda.matmul.allow_tf32} "
+                    f"cudnn_tf32={torch.backends.cudnn.allow_tf32}",
                     flush=True,
                 )
             learning_rate = learner.lr_at(iteration)
