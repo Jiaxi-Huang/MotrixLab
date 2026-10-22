@@ -68,8 +68,13 @@ class SuperMimicLearner:
         self.device = device
         self.mdp = mdp.to(device)
 
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        # TF32 speeds up Ampere+ NVIDIA matmuls, but the ROCm TF32 path is
+        # pathologically slow for the small 3x3 bmms this MDP issues (tens of
+        # milliseconds of host-side time per call on ROCm 7.x), so keep it off
+        # there. bf16 autocast (amp) covers the large-matmul speedup instead.
+        if torch.version.hip is None:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
         if seed is not None:
             torch.manual_seed(seed)
         networks.AMP_DTYPE = torch.bfloat16 if cfg.amp == "bf16" and device.type == "cuda" else None
