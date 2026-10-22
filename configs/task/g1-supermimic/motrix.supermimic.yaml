@@ -1,0 +1,23 @@
+# @package _global_
+# Task g1-supermimic with the SuperMimic world-model learner: a learned latent
+# dynamics model plus the task's analytic reward/termination heads, a
+# goal-conditioned policy trained on imagined rollouts, and a lambda-returns
+# critic. Requires the LAFAN1 corpus cache (scripts/motion/download_lafan.py --all).
+defaults:
+  - /algo_base@algo: motrix.supermimic
+  - _self_
+task:
+  env: g1-supermimic
+  rllib: motrix
+  algo: supermimic
+num_envs: 4096
+play_num_envs: 16
+seed: 1
+checkpoint:
+  interval: 2000
+algo:
+  # Keep the learner's goal width equal to the task command's goal frames.
+  agent:
+    goal_frames: 10
+  trainer:
+    num_learning_iterations: 12000

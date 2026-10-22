@@ -1,0 +1,59 @@
+# Source-of-truth base values for the motrix.supermimic provider.
+# SuperMimic world-model training: a learned latent dynamics model with the
+# task's analytic reward/termination heads, a goal-conditioned policy trained
+# on imagined rollouts, and a lambda-returns critic. Values mirror the
+# upstream UniSuperMimic defaults; the synchronous trainer collects and
+# updates in one process.
+defaults:
+  # Load the shared structured SuperMimicCfg schema registered by the Motrix provider.
+  - _motrix_supermimic_schema
+  # Apply the values in this file after the schema.
+  - _self_
+# Learning device such as cuda, cuda:0, or cpu; null selects CUDA when available, otherwise CPU.
+device: null
+agent:
+  # Replay capacity in control steps (the time axis; environments are the batch axis).
+  buffer_steps: 1000
+  # Environment steps collected per training iteration (inverse update-to-data cadence).
+  utd: 0.4
+  # Imagination horizon for the policy update.
+  horizon: 32
+  # Future reference frames in the goal observation.
+  goal_frames: 10
+  # Observation history length consumed by the policy.
+  hist: 10
+  # Goal encoder latent width.
+  z_dim: 32
+  # Hidden layer widths of the world model, policy, and critic MLPs.
+  wm_hidden: [2048, 2048, 2048]
+  policy_hidden: [2048, 1024, 512, 256]
+  critic_hidden: [256, 128]
+  # World-model multi-step window and batches per iteration.
+  wm_window: 8
+  wm_batches: 10
+  wm_batch: 2048
+  # Policy-update batch size.
+  pi_batch: 4096
+  # Adam learning rate (shared by world model, policy, and critic).
+  lr: 0.0002
+  # Reward discount and lambda-return interpolation.
+  gamma: 0.99
+  lam: 0.95
+  # Exploration noise added to the collected actions.
+  action_noise: 0.1
+  # Critic regression epochs and minibatches per policy update.
+  critic_epochs: 5
+  critic_minibatches: 4
+  # Collection steps before the first update.
+  warmup_steps: 64
+  # Iterations of world-model-only training before policy updates start.
+  wm_only_iters: 500
+  # Cosine learning-rate decay horizon.
+  lr_decay_iters: 250000
+  # Mixed-precision mode for the MLP forward passes: none or bf16.
+  amp: bf16
+  # Compile the imagination kernels with torch.compile on CUDA.
+  compile: true
+trainer:
+  # Target collector iterations; each iteration collects num_envs / utd transitions.
+  num_learning_iterations: 12000

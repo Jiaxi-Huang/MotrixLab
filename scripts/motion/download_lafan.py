@@ -17,6 +17,10 @@ Examples:
     # download + convert one clip into the package motion dir (default 50 fps)
     uv run scripts/motion/download_lafan.py --motion dance1_subject1
 
+    # download + convert the whole LAFAN1 corpus (40 clips) into the
+    # g1-supermimic corpus cache dir
+    uv run scripts/motion/download_lafan.py --all
+
     # custom output path / frame rate
     uv run scripts/motion/download_lafan.py \\
         --motion walk1_subject1 \\
@@ -52,6 +56,17 @@ _CACHE_DIR = flags.DEFINE_string("cache-dir", None, "Cache dir for downloaded cs
 _FORCE = flags.DEFINE_bool("force", False, "Re-download the csv even if it is already cached.")
 _KEEP_CSV = flags.DEFINE_bool("keep-csv", True, "Keep the downloaded csv in the cache dir after converting.")
 _LIST = flags.DEFINE_bool("list", False, "List available clips for --robot and exit.")
+_ALL = flags.DEFINE_bool(
+    "all",
+    False,
+    "Download + convert every clip of the dataset into a corpus directory "
+    "(default ~/.cache/motrixlab/lafan/<robot>_npz, the g1-supermimic corpus source).",
+)
+_OUTPUT_DIR = flags.DEFINE_string(
+    "output-dir",
+    None,
+    "Corpus output directory for --all (default ~/.cache/motrixlab/lafan/<robot>_npz).",
+)
 
 
 def _default_motion_dir() -> Path:
@@ -59,6 +74,13 @@ def _default_motion_dir() -> Path:
     import motrix_envs.locomotion.wbt as wbt_pkg
 
     return Path(wbt_pkg.__file__).resolve().parent / "assets" / "motion" / _ROBOT.value
+
+
+def _corpus_dir() -> Path:
+    """Corpus cache dir populated by ``--all`` (the g1-supermimic source)."""
+    if _OUTPUT_DIR.value:
+        return Path(_OUTPUT_DIR.value).expanduser()
+    return Path.home() / ".cache" / "motrixlab" / "lafan" / f"{_ROBOT.value}_npz"
 
 
 def _cache_dir() -> Path:
@@ -103,6 +125,28 @@ def main(argv):
         print(f"{len(clips)} clips available for robot {_ROBOT.value!r}:")
         for c in clips:
             print(f"  {c}")
+        return
+
+    if _ALL.value:
+        corpus_dir = _corpus_dir()
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        total_frames = 0
+        for index, name in enumerate(_list_clips(), start=1):
+            csv_path = _cache_dir() / f"{name}.csv"
+            if _FORCE.value or not csv_path.exists():
+                _download_csv(name, csv_path)
+            stats = convert_lafan(
+                csv_path,
+                corpus_dir / f"{name}.npz",
+                robot=_ROBOT.value,
+                input_fps=_INPUT_FPS.value,
+                output_fps=_OUTPUT_FPS.value,
+                start_sec=_START_SEC.value,
+                end_sec=_END_SEC.value,
+            )
+            total_frames += stats["num_frames"]
+            print(f"[{index:2d}] {name}: {stats['num_frames']} frames @ {int(round(_OUTPUT_FPS.value))} fps")
+        print(f"Corpus ready: {corpus_dir} ({total_frames} frames total)")
         return
 
     if _MOTION.value is None:

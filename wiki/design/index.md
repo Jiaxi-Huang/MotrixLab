@@ -34,7 +34,9 @@
 - [MotrixLab Motion NPZ Schema 设计](./motrixlab-motion-npz-schema.md)
   MotrixLab 自己的 WBT `.npz` 动作文件格式 v1：在 BeyondMimic 原生 schema 上加 `schema_version / joint_names / body_names / num_frames` 与 `ext_*` 扩展槽位，四元数约定切到 xyzw 与 MotrixSim 内部 API 对齐。提供通用 `MotrixMotion` loader、Holosoma/BeyondMimic → MotrixLab 一次性 converter、`scripts/motion/replay.py` 通用化。
 - [多 Motion Clip 训练基础设施设计](./motion-multi-clip-infra.md)
-  把 `WbtMotionCommand` 从"单 clip 假设"中解耦：数据平面 `MotionLibrary` 将多个 schema v1 npz 文件按任务序重排、按声明装载 `ext_` 通道并拼接为带逐帧 clip 边界（`frame_clip_end`）的全局帧轴，时间线平面由 `WbtMotionCommand` 原地泛化（hold/wrap 语义不变），课程平面第一版冻结现有 sampling 设定。
+  把 `WbtMotionCommand` 从“单 clip 假设”中解耦：数据平面 `MotionLibrary` 将多个 schema v1 npz 文件按任务序重排、按声明装载 `ext_` 通道并拼接为带逐帧 clip 边界（`frame_clip_end`）的全局帧轴，时间线平面由 `WbtMotionCommand` 原地泛化（hold/wrap 语义不变），课程平面第一版冻结现有 sampling 设定。
+- [g1-supermimic 任务设计](./g1-supermimic-task.md)
+  在 MotrixSim Manager 栈上复现 SuperMimic 的 G1 LAFAN1 全身跟踪：复用主分支 LAFAN1 下载/转换管线（`download_lafan.py --all` 语料库）与 `WbtMotionCommand` 重锚定/hold 语义，新增目标条件观察、上游奖励/终止配方与回报驱动的一秒分桶起点采样；记录与 UniSuperMimic 的有意偏差（FastSAC、无 ξ 上下文随机化、clip 末终止的 RL 语义）。
 - [用户文档 Envs 栏目设计](./user-docs-envs-part.md)
   在现有双语用户指南的 Tutorials 之后建立独立 `Envs` 一级栏目：明确 Environment、Robot、Training Task 与 Tutorial Workflow 的边界，基于 registry、双语 metadata 和 Hydra Task 配置自动生成 Env ID、description 与支持训练算法的 overview 表格，以 Whole Body Tracking、Humanoid Locomotion、Quadruped Locomotion 等任务主题组织环境，并通过先建导航、再统一页面、最后迁移文件的方式渐进落地。
 

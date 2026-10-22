@@ -86,6 +86,7 @@ The following videos show Dex-EVT and Unitree G1 tracking dance motions, Unitree
 env_design
 motion_format
 adding_wbt_task
+supermimic
 
 ```
 
@@ -104,6 +105,7 @@ thumbnail to open the full-size SVG.
 | `g1-wbt-dance` | Unitree G1 29-DoF | `dance1_subject2.npz` | 19.98&nbsp;s | `motrix.fastsac` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="g1-wbt-dance-curve" aria-label="Enlarge the Unitree G1 dance WBT training curve"><img src="../../../_static/images/performance/g1-wbt-dance.svg" alt="Unitree G1 dance WBT training curve" width="180"></button> |
 | `dex-evt-wbt-dance` | Dex-EVT | `dance1_easy.npz` | 39.72&nbsp;s | `motrix.fastsac` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="dex-evt-wbt-dance-curve" aria-label="Enlarge the Dex-EVT dance WBT training curve"><img src="../../../_static/images/performance/dex-evt-wbt-dance.svg" alt="Dex-EVT dance WBT training curve" width="180"></button> |
 | `k1-wbt-freekick` | Booster K1 | `freekick_shoot_arc_02.npz` | 2.50&nbsp;s | `motrix.fastsac` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="k1-wbt-freekick-curve" aria-label="Enlarge the Booster K1 free-kick WBT training curve"><img src="../../../_static/images/performance/k1-wbt-freekick.svg" alt="Booster K1 free-kick WBT training curve" width="180"></button> |
+| `g1-supermimic` | Unitree G1 29-DoF | LAFAN1 corpus, 40 clips (downloaded) | — | `motrix.fastsac`, `motrix.supermimic` | — |
 :::
 
 <dialog id="g1-wbt-backflip-curve" class="training-curve-dialog" aria-labelledby="g1-wbt-backflip-curve-caption">

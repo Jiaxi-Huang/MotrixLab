@@ -85,6 +85,7 @@
 env_design
 motion_format
 adding_wbt_task
+supermimic
 
 ```
 
@@ -102,6 +103,7 @@ adding_wbt_task
 | `g1-wbt-dance` | Unitree G1 29-DoF | `dance1_subject2.npz` | 19.98&nbsp;s | `motrix.fastsac` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="g1-wbt-dance-curve" aria-label="放大 Unitree G1 舞蹈 WBT 训练曲线"><img src="../../../_static/images/performance/g1-wbt-dance.svg" alt="Unitree G1 舞蹈 WBT 训练曲线" width="180"></button> |
 | `dex-evt-wbt-dance` | Dex-EVT | `dance1_easy.npz` | 39.72&nbsp;s | `motrix.fastsac` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="dex-evt-wbt-dance-curve" aria-label="放大 Dex-EVT 舞蹈 WBT 训练曲线"><img src="../../../_static/images/performance/dex-evt-wbt-dance.svg" alt="Dex-EVT 舞蹈 WBT 训练曲线" width="180"></button> |
 | `k1-wbt-freekick` | Booster K1 | `freekick_shoot_arc_02.npz` | 2.50&nbsp;s | `motrix.fastsac` | <button type="button" class="training-curve-thumbnail" data-training-curve-dialog="k1-wbt-freekick-curve" aria-label="放大 Booster K1 任意球 WBT 训练曲线"><img src="../../../_static/images/performance/k1-wbt-freekick.svg" alt="Booster K1 任意球 WBT 训练曲线" width="180"></button> |
+| `g1-supermimic` | Unitree G1 29-DoF | LAFAN1 语料 40 段（下载） | — | `motrix.fastsac`, `motrix.supermimic` | — |
 :::
 
 <dialog id="g1-wbt-backflip-curve" class="training-curve-dialog" aria-labelledby="g1-wbt-backflip-curve-caption">
