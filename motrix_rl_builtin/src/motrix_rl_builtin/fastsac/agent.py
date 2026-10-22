@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch import nn, optim
 
 from motrix_rl_builtin.fastsac.buffer import EmpiricalNormalization, SimpleReplayBuffer
-from motrix_rl_builtin.fastsac.config import FastSacCfg
+from motrix_rl_builtin.fastsac.config import FastSacCfg, resolve_hidden_dims
 from motrix_rl_builtin.fastsac.factory import make_actor, resolve_policy_variant
 from motrix_rl_builtin.fastsac.networks import Critic
 from motrix_rl_builtin.fastsac.window_metrics import WindowMetrics
@@ -93,7 +93,7 @@ class FastSacAgent:
             num_atoms=cfg.num_atoms,
             v_min=cfg.v_min,
             v_max=cfg.v_max,
-            hidden_dim=cfg.critic_hidden_dim,
+            hidden_dims=resolve_hidden_dims(cfg.critic_hidden_dims, cfg.critic_hidden_dim),
             use_layer_norm=cfg.use_layer_norm,
             num_q_networks=cfg.num_q_networks,
             device=device,

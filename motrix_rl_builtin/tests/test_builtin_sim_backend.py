@@ -197,6 +197,7 @@ def _async_cfg():
         variant={},
         agent=SimpleNamespace(
             actor_hidden_dim=16,
+            actor_hidden_dims=None,
             log_std_max=2.0,
             log_std_min=-5.0,
             use_tanh=True,

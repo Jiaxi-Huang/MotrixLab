@@ -236,7 +236,7 @@ def test_sonic_control_input_orders_tokens_before_proprioception() -> None:
         smpl_encoder_hidden_dims=(32,),
         g1_motion_decoder_hidden_dims=(32,),
     )
-    actor = SonicActor(config, hidden_dim=16, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor = SonicActor(config, hidden_dims=(16, 8, 4), log_std_min=-5.0, log_std_max=0.0, device="cpu")
     actor.eval()
     token_total = config.num_tokens * config.token_dim
     actor_obs_dim = history_frames * proprioceptive
@@ -290,7 +290,7 @@ def test_sonic_split_reproduces_upstream_tokenizer_flat_order() -> None:
     resolved = config.with_env_dims(obs_dim, act_dim)
     assert resolved.num_future_frames == future_frames
     assert resolved.num_history_frames == history_frames
-    actor = SonicActor(config, hidden_dim=16, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor = SonicActor(config, hidden_dims=(16, 8, 4), log_std_min=-5.0, log_std_max=0.0, device="cpu")
 
     batch = 2
     obs = torch.randn(batch, obs_dim)
@@ -551,6 +551,7 @@ def test_sonic_checkpoint_records_variant_metadata() -> None:
     assert checkpoint["policy_variant_metadata"] == {
         **config.algo.variant,
         "actor_hidden_dim": config.algo.agent.actor_hidden_dim,
+        "actor_hidden_dims": config.algo.agent.actor_hidden_dims,
         "log_std_min": config.algo.agent.log_std_min,
         "log_std_max": config.algo.agent.log_std_max,
         "use_layer_norm": config.algo.agent.use_layer_norm,

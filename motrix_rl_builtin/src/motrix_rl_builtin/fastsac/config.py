@@ -1,10 +1,26 @@
 # Copyright Motphys Technology Co., Ltd. 2025, 2026
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from omegaconf import MISSING
+
+
+def resolve_hidden_dims(explicit: Sequence[int] | None, fallback: int) -> tuple[int, ...]:
+    """Resolve configured network layer widths.
+
+    An explicit width list sets every layer's width (e.g. ``[1024, 1024,
+    1024]``); ``None`` keeps the holosoma FastSAC taper
+    ``(fallback, fallback // 2, fallback // 4)`` from the scalar field.
+    """
+    if explicit is None:
+        return (fallback, fallback // 2, fallback // 4)
+    dims = tuple(int(width) for width in explicit)
+    if not dims or any(width <= 0 for width in dims):
+        raise ValueError(f"hidden_dims must be a non-empty list of positive widths, got {explicit!r}")
+    return dims
 
 
 @dataclass
@@ -21,6 +37,11 @@ class FastSacAgentCfg:
     # actor / critic networks
     actor_hidden_dim: int = MISSING
     critic_hidden_dim: int = MISSING
+    # Explicit actor/critic layer widths (e.g. [1024, 1024, 1024]); when set
+    # they override the scalar hidden_dim fields above, which expand to the
+    # holosoma taper (dim, dim // 2, dim // 4).
+    actor_hidden_dims: list[int] | None = None
+    critic_hidden_dims: list[int] | None = None
     num_q_networks: int = MISSING
     use_layer_norm: bool = MISSING
     use_tanh: bool = MISSING

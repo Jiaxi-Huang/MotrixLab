@@ -8,7 +8,7 @@ actor consumes the packed policy observation emitted by the manager and
 returns the same ``(actions, log_probs)`` pair as the generic FastSAC actor.
 The G1/SMPL/teleop tokenizer mirrors the upstream SONIC graph while the
 training policy head is the standard FastSAC actor sized by
-``algo.agent.actor_hidden_dim``.
+``algo.agent.actor_hidden_dims`` (or the ``actor_hidden_dim`` scalar taper).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from motrix_rl_builtin.fastsac.api import policy_variant_registry
-from motrix_rl_builtin.fastsac.config import FastSacCfg
+from motrix_rl_builtin.fastsac.config import FastSacCfg, resolve_hidden_dims
 from motrix_rl_builtin.fastsac.networks import Actor
 
 SONIC_VECTOR_DIM = 3
@@ -289,7 +289,7 @@ class SonicActor(nn.Module):
         self,
         config: SonicModelConfig,
         *,
-        hidden_dim: int,
+        hidden_dims: tuple[int, ...],
         log_std_min,
         log_std_max,
         use_tanh: bool = True,
@@ -304,7 +304,7 @@ class SonicActor(nn.Module):
         self.policy_head = Actor(
             n_obs=config.token_total_dim + config.actor_obs_dim,
             n_act=config.action_dim,
-            hidden_dim=hidden_dim,
+            hidden_dims=hidden_dims,
             log_std_max=log_std_max,
             log_std_min=log_std_min,
             use_tanh=use_tanh,
@@ -433,7 +433,7 @@ class SonicPolicyVariant:
         model = self._model(values).with_env_dims(obs_dim, act_dim)
         actor = SonicActor(
             model,
-            hidden_dim=cfg.agent.actor_hidden_dim,
+            hidden_dims=resolve_hidden_dims(cfg.agent.actor_hidden_dims, cfg.agent.actor_hidden_dim),
             log_std_min=cfg.agent.log_std_min,
             log_std_max=cfg.agent.log_std_max,
             use_tanh=cfg.agent.use_tanh,
@@ -471,6 +471,7 @@ class SonicPolicyVariant:
         return {
             **cfg.variant,
             "actor_hidden_dim": cfg.agent.actor_hidden_dim,
+            "actor_hidden_dims": cfg.agent.actor_hidden_dims,
             "log_std_min": cfg.agent.log_std_min,
             "log_std_max": cfg.agent.log_std_max,
             "use_layer_norm": cfg.agent.use_layer_norm,

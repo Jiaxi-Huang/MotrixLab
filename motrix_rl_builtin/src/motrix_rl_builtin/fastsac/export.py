@@ -10,7 +10,7 @@ import numpy as np
 
 from motrix_rl.deploy.api import OnnxExportRequest, OnnxModelArtifact, OnnxPolicyExporter
 from motrix_rl.deploy.onnx_validation import validate_onnx_policy
-from motrix_rl_builtin.fastsac.config import FastSacCfg
+from motrix_rl_builtin.fastsac.config import FastSacCfg, resolve_hidden_dims
 
 
 class FastSacOnnxExporter(OnnxPolicyExporter):
@@ -41,7 +41,7 @@ class FastSacOnnxExporter(OnnxPolicyExporter):
         actor = Actor(
             n_obs=observation_size,
             n_act=action_size,
-            hidden_dim=actor_cfg.actor_hidden_dim,
+            hidden_dims=resolve_hidden_dims(actor_cfg.actor_hidden_dims, actor_cfg.actor_hidden_dim),
             log_std_max=actor_cfg.log_std_max,
             log_std_min=actor_cfg.log_std_min,
             use_tanh=actor_cfg.use_tanh,

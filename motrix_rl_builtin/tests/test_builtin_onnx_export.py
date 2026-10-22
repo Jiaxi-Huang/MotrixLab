@@ -9,6 +9,7 @@ import pytest
 import torch
 from hydra import compose, initialize_config_module
 from hydra.core.global_hydra import GlobalHydra
+from motrix_rl_builtin.fastsac.config import resolve_hidden_dims
 
 from motrix_rl import checkpoints, runs
 from motrix_rl.cli import to_typed_config
@@ -72,7 +73,7 @@ def test_fastsac_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
     actor = Actor(
         n_obs=5,
         n_act=3,
-        hidden_dim=actor_cfg.actor_hidden_dim,
+        hidden_dims=resolve_hidden_dims(actor_cfg.actor_hidden_dims, actor_cfg.actor_hidden_dim),
         log_std_max=actor_cfg.log_std_max,
         log_std_min=actor_cfg.log_std_min,
         use_tanh=actor_cfg.use_tanh,

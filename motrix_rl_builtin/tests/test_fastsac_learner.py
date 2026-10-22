@@ -10,7 +10,9 @@ def _tiny_agent_cfg(**overrides):
     """Minimal provider-level FastSac namespace for a real (tiny) CUDA agent."""
     values = dict(
         actor_hidden_dim=16,
+        actor_hidden_dims=None,
         critic_hidden_dim=16,
+        critic_hidden_dims=None,
         num_q_networks=2,
         actor_learning_rate=1e-3,
         critic_learning_rate=1e-3,

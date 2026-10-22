@@ -16,6 +16,22 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def _mlp_trunk(
+    input_dim: int,
+    hidden_dims: tuple[int, ...],
+    use_layer_norm: bool,
+    device,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    source = input_dim
+    for width in hidden_dims:
+        layers.append(nn.Linear(source, width, device=device))
+        layers.append(nn.LayerNorm(width, device=device) if use_layer_norm else nn.Identity())
+        layers.append(nn.SiLU())
+        source = width
+    return nn.Sequential(*layers)
+
+
 class Actor(nn.Module):
     """Tanh-squashed Gaussian policy."""
 
@@ -23,7 +39,7 @@ class Actor(nn.Module):
         self,
         n_obs: int,
         n_act: int,
-        hidden_dim: int,
+        hidden_dims: tuple[int, ...],
         log_std_max: float,
         log_std_min: float,
         use_tanh: bool = True,
@@ -38,19 +54,9 @@ class Actor(nn.Module):
         self.log_std_min = log_std_min
         self.use_tanh = use_tanh
 
-        self.net = nn.Sequential(
-            nn.Linear(n_obs, hidden_dim, device=device),
-            nn.LayerNorm(hidden_dim, device=device) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2, device=device),
-            nn.LayerNorm(hidden_dim // 2, device=device) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4, device=device),
-            nn.LayerNorm(hidden_dim // 4, device=device) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-        )
-        self.fc_mu = nn.Linear(hidden_dim // 4, n_act, device=device)
-        self.fc_logstd = nn.Linear(hidden_dim // 4, n_act, device=device)
+        self.net = _mlp_trunk(n_obs, hidden_dims, use_layer_norm, device)
+        self.fc_mu = nn.Linear(hidden_dims[-1], n_act, device=device)
+        self.fc_logstd = nn.Linear(hidden_dims[-1], n_act, device=device)
         nn.init.constant_(self.fc_mu.weight, 0.0)
         nn.init.constant_(self.fc_mu.bias, 0.0)
         nn.init.constant_(self.fc_logstd.weight, 0.0)
@@ -118,22 +124,14 @@ class DistributionalQNetwork(nn.Module):
         num_atoms: int,
         v_min: float,
         v_max: float,
-        hidden_dim: int,
+        hidden_dims: tuple[int, ...],
         use_layer_norm: bool = True,
         device: torch.device | None = None,
     ):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_obs + n_act, hidden_dim, device=device),
-            nn.LayerNorm(hidden_dim, device=device) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2, device=device),
-            nn.LayerNorm(hidden_dim // 2, device=device) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4, device=device),
-            nn.LayerNorm(hidden_dim // 4, device=device) if use_layer_norm else nn.Identity(),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 4, num_atoms, device=device),
+            _mlp_trunk(n_obs + n_act, hidden_dims, use_layer_norm, device),
+            nn.Linear(hidden_dims[-1], num_atoms, device=device),
         )
         self.v_min = v_min
         self.v_max = v_max
@@ -192,7 +190,7 @@ class Critic(nn.Module):
         num_atoms: int,
         v_min: float,
         v_max: float,
-        hidden_dim: int,
+        hidden_dims: tuple[int, ...],
         use_layer_norm: bool = True,
         num_q_networks: int = 2,
         device: torch.device | None = None,
@@ -208,7 +206,7 @@ class Critic(nn.Module):
                     num_atoms=num_atoms,
                     v_min=v_min,
                     v_max=v_max,
-                    hidden_dim=hidden_dim,
+                    hidden_dims=hidden_dims,
                     use_layer_norm=use_layer_norm,
                     device=device,
                 )

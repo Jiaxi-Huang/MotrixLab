@@ -80,6 +80,7 @@ def _cfg(device: str, *, compile: bool = False, amp: bool = False):
         variant={},
         agent=SimpleNamespace(
             actor_hidden_dim=32,
+            actor_hidden_dims=None,
             log_std_max=0.0,
             log_std_min=-5.0,
             use_tanh=True,
@@ -103,7 +104,7 @@ def _source_policy():
     actor = Actor(
         n_obs=_OBS_DIM,
         n_act=_ACT_DIM,
-        hidden_dim=32,
+        hidden_dims=(32, 16, 8),
         log_std_max=0.0,
         log_std_min=-5.0,
         use_tanh=True,
@@ -406,6 +407,7 @@ def _backpressure_collector(*, capacity=16):
         variant={},
         agent=SimpleNamespace(
             actor_hidden_dim=16,
+            actor_hidden_dims=None,
             log_std_max=2.0,
             log_std_min=-5.0,
             use_tanh=True,

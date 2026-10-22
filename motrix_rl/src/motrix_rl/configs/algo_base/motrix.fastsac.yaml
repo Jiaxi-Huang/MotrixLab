@@ -28,6 +28,13 @@ agent:
   actor_hidden_dim: 512
   # Hidden width used by each critic network.
   critic_hidden_dim: 768
+  # Explicit actor network layer widths, e.g. [1024, 1024, 1024]; when set
+  # they override actor_hidden_dim, which otherwise expands to the holosoma
+  # taper (dim, dim // 2, dim // 4).
+  actor_hidden_dims: null
+  # Explicit critic network layer widths; null keeps the actor_hidden_dim-style
+  # taper from critic_hidden_dim.
+  critic_hidden_dims: null
   # Number of distributional Q networks in the critic ensemble.
   num_q_networks: 2
   # Apply LayerNorm in actor and critic hidden blocks.

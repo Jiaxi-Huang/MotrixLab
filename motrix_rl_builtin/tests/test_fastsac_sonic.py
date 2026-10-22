@@ -66,7 +66,7 @@ def test_sonic_actor_forward_and_auxiliary_backward() -> None:
         teleop_encoder_hidden_dims=(256, 128),
         g1_motion_decoder_hidden_dims=(256, 128),
     )
-    actor = SonicActor(cfg, hidden_dim=128, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor = SonicActor(cfg, hidden_dims=(128, 64, 32), log_std_min=-5.0, log_std_max=0.0, device="cpu")
     observations = _packed(cfg)
     # Multi-hot rows like the sampler emits: a tri-hot row (smpl co-activates
     # g1 and teleop) drives the g1-teleop / teleop-smpl alignment losses.
@@ -167,7 +167,7 @@ def test_sonic_maskless_model_routes_every_row_through_g1() -> None:
     )
     assert cfg.packed_obs_dim == (cfg.actor_obs_dim + cfg.g1_input_dim + cfg.smpl_input_dim + cfg.teleop_input_dim)
 
-    actor = SonicActor(cfg, hidden_dim=32, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor = SonicActor(cfg, hidden_dims=(32, 16, 8), log_std_min=-5.0, log_std_max=0.0, device="cpu")
     actor_obs, g1, smpl, teleop, index = actor._split(_maskless_packed(cfg, 4))
     assert index is None
     actions, logp, aux = actor.get_actions_and_log_probs_with_aux(_maskless_packed(cfg, 4))
@@ -196,7 +196,7 @@ def test_sonic_deterministic_action_is_bounded() -> None:
     cfg = SonicModelConfig(
         num_future_frames=2, num_history_frames=3, num_tokens=1, token_dim=4, fsq_levels=8, action_dim=7
     )
-    actor = SonicActor(cfg, hidden_dim=32, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor = SonicActor(cfg, hidden_dims=(32, 16, 8), log_std_min=-5.0, log_std_max=0.0, device="cpu")
     actions = actor.explore(_packed(cfg, 2), deterministic=True)
     assert actions.shape == (2, cfg.action_dim)
     assert torch.all(actions <= 1.0) and torch.all(actions >= -1.0)
@@ -212,7 +212,7 @@ def test_sonic_normalization_preserves_encoder_selector() -> None:
     normalized = normalizer(observations, update=True)
 
     torch.testing.assert_close(normalized[:, -2:], observations[:, -2:])
-    actor = SonicActor(cfg, hidden_dim=32, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor = SonicActor(cfg, hidden_dims=(32, 16, 8), log_std_min=-5.0, log_std_max=0.0, device="cpu")
     assert actor.explore(normalized).shape == (4, cfg.action_dim)
 
 
@@ -224,7 +224,7 @@ def test_sonic_ignores_non_finite_inactive_reference() -> None:
     smpl_start = cfg.actor_obs_dim + cfg.g1_input_dim
     observations[:, smpl_start : smpl_start + cfg.smpl_input_dim] = float("nan")
     observations[:, -3:] = torch.tensor((1.0, 0.0, 0.0))
-    actor = SonicActor(cfg, hidden_dim=32, log_std_min=-5.0, log_std_max=0.0, device="cpu")
+    actor = SonicActor(cfg, hidden_dims=(32, 16, 8), log_std_min=-5.0, log_std_max=0.0, device="cpu")
 
     actions, logp, auxiliary = actor.get_actions_and_log_probs_with_aux(observations)
 
@@ -257,7 +257,9 @@ def test_sonic_backbone_is_excluded_from_actor_weight_decay() -> None:
     cfg = SonicModelConfig(**model)
     agent_cfg = SimpleNamespace(
         actor_hidden_dim=16,
+        actor_hidden_dims=None,
         critic_hidden_dim=16,
+        critic_hidden_dims=None,
         num_q_networks=2,
         actor_learning_rate=1e-3,
         critic_learning_rate=1e-3,

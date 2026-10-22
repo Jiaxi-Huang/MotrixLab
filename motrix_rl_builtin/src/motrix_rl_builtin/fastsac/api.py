@@ -87,13 +87,14 @@ class DefaultPolicyVariant:
         action_bias: torch.Tensor,
         device: torch.device | str,
     ) -> nn.Module:
+        from motrix_rl_builtin.fastsac.config import resolve_hidden_dims
         from motrix_rl_builtin.fastsac.networks import Actor
 
         obs_dim, act_dim = dims
         return Actor(
             n_obs=obs_dim,
             n_act=act_dim,
-            hidden_dim=cfg.agent.actor_hidden_dim,
+            hidden_dims=resolve_hidden_dims(cfg.agent.actor_hidden_dims, cfg.agent.actor_hidden_dim),
             log_std_max=cfg.agent.log_std_max,
             log_std_min=cfg.agent.log_std_min,
             use_tanh=cfg.agent.use_tanh,
