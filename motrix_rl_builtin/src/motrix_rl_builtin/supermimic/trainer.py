@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import random
 import time
 
@@ -135,8 +136,19 @@ class Trainer(TrainerBase):
         if learner.buffer.size < required_steps:
             learner.collect(required_steps - learner.buffer.size)
 
+        # Long unattended runs: if the loop ever wedges (e.g. a hung device
+        # kernel), dump the Python stack to stderr every 10 minutes instead
+        # of spinning silently.
+        faulthandler.dump_traceback_later(600, repeat=True)
+
         step_accumulator = 0.0
         for iteration in range(learner.iteration, num_iterations):
+            if iteration < 300 or iteration % 25 == 0:
+                print(
+                    f"[motrix.supermimic] iter {iteration}/{num_iterations} "
+                    f"buffer={learner.buffer.size} elapsed={time.time() - start_time:.0f}s",
+                    flush=True,
+                )
             learning_rate = learner.lr_at(iteration)
             for optimizer in (learner.opt_wm, learner.opt_pi, learner.opt_v):
                 for group in optimizer.param_groups:
