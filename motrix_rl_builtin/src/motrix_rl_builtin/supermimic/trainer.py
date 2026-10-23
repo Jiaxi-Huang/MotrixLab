@@ -69,13 +69,17 @@ class Trainer(TrainerBase):
         training_log = TrainingLogger(run_dir, self._context.metrics)
         try:
             env = self._make_env(self._context.num_envs, mode="train")
+            # Upstream's action convention: a wide ±20 clamp that never binds,
+            # so saturated policy outputs keep their gradients in imagination
+            # (a ±1 box would zero the gradient of every saturated dim).
+            num_joints = env.command_terms["motion"].clip.joint_pos.shape[1]
             learner = SuperMimicLearner(
                 env,
                 self._rlcfg.agent,
                 build_supermimic_mdp(env),
                 device=self._device(),
-                action_low=np.full(env.command_terms["motion"].clip.joint_pos.shape[1], -1.0, np.float32),
-                action_high=np.full(env.command_terms["motion"].clip.joint_pos.shape[1], 1.0, np.float32),
+                action_low=np.full(num_joints, -20.0, np.float32),
+                action_high=np.full(num_joints, 20.0, np.float32),
                 goal_frames=self._rlcfg.agent.goal_frames,
                 seed=self._context.seed,
             )
@@ -247,7 +251,7 @@ class PlayRunner:
             else:
                 obs_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
             goal = mdp.goal(frames, learner.goal_frames)
-            action = learner.pi(obs_hist, goal).clamp(-1.0, 1.0)
+            action = learner.pi(obs_hist, goal)
             env.step(action.detach().cpu().numpy().astype(np.float32))
             a_prev = action
 
@@ -259,13 +263,14 @@ def attach_play(trainer: Trainer, policy: str) -> None:
     renderer = create_renderer(env, trainer._render)
     if renderer is None:
         raise ValueError("motrix.supermimic play requires a render configuration.")
+    num_joints = env.command_terms["motion"].clip.joint_pos.shape[1]
     learner = SuperMimicLearner(
         env,
         trainer._rlcfg.agent,
         build_supermimic_mdp(env),
         device=trainer._device(),
-        action_low=np.full(env.command_terms["motion"].clip.joint_pos.shape[1], -1.0, np.float32),
-        action_high=np.full(env.command_terms["motion"].clip.joint_pos.shape[1], 1.0, np.float32),
+        action_low=np.full(num_joints, -20.0, np.float32),
+        action_high=np.full(num_joints, 20.0, np.float32),
         goal_frames=trainer._rlcfg.agent.goal_frames,
         seed=trainer._context.seed,
     )

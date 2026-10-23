@@ -101,7 +101,7 @@ def evaluate(
         else:
             history = torch.cat((history[:, 1:], obs.unsqueeze(1)), 1)
         goal = mdp.goal(frames, goal_frames)
-        action = policy(history, goal).clamp(-1.0, 1.0)
+        action = policy(history, goal)
         result = env.step(action.detach().cpu().numpy().astype(np.float32))
 
         reward = torch.as_tensor(np.asarray(result.reward), device=device)
