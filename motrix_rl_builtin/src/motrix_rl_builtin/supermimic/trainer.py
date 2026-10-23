@@ -23,7 +23,10 @@ from motrix_rl_builtin.supermimic.contracts import require_supermimic_env
 from motrix_rl_builtin.supermimic.learner import SuperMimicLearner
 from motrix_rl_builtin.supermimic.mdp import build_supermimic_mdp
 
-torch.set_float32_matmul_precision("high")
+# Deliberately NOT torch.set_float32_matmul_precision("high"): on ROCm the
+# TF32 matmul route makes the small 3x3 bmms of the analytic MDP pay tens of
+# milliseconds of host-side time per call, while the fp32 default is fast
+# there (bf16 autocast still covers the large MLP matmuls).
 
 
 class Trainer(TrainerBase):
