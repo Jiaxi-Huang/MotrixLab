@@ -255,7 +255,10 @@ class SuperMimicLearner:
         normalized_context: torch.Tensor,
         goal: torch.Tensor,
     ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        action = self.pi(obs_hist, goal)
+        # Clamp imagination actions to the environment's action box so the
+        # dream never queries the world model outside the action range it was
+        # trained on (collection clamps before stepping the environment).
+        action = torch.clamp(self.pi(obs_hist, goal), self._action_low, self._action_high)
         next_state = self.wm.step(state, action, normalized_context, self.mdp)
         next_frames = frames + 1
         obs = self.mdp.add_noise(self.mdp.obs(next_state, action, next_frames))
