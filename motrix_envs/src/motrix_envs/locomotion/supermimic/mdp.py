@@ -234,9 +234,13 @@ class SuperMimicMotionCommand(WbtMotionCommand):
         """Draw the lane's episode start from the SuperMimic bin mixture.
 
         Sequential playback (play mode) keeps the current frame, matching the
-        inherited WBT contract.
+        inherited WBT contract. Every path also seeds the published state
+        buffer with the teleport target: the fused evaluate kernel is the only
+        other writer, so without this seed the first transition after
+        construction would read a zero-initialized state.
         """
         if self.sequential_clips:
+            self._seed_state_from_frame(self.steps[0])
             return
         requested = int(self.requested_frames[0])
         if requested >= 0:
@@ -248,6 +252,7 @@ class SuperMimicMotionCommand(WbtMotionCommand):
                 bin_id += 1
             self.start_bin[0] = bin_id
             self.requested_frames[0] = np.int64(-1)
+            self._seed_state_from_frame(self.steps[0])
             return
         unit = (ctx.rand.next_uniform() + np.float32(1.0)) * np.float32(0.5)
         bin_id = np.int64(0)
@@ -258,6 +263,25 @@ class SuperMimicMotionCommand(WbtMotionCommand):
         offset = min(np.int64(phase * np.float32(span)), span - np.int64(1))
         self.steps[0] = self.bin_start[bin_id] + offset
         self.start_bin[0] = bin_id
+        self._seed_state_from_frame(self.steps[0])
+
+    def _seed_state_from_frame(self, step: np.int64) -> None:
+        """Seed the state buffer with the frame's reference root and joints."""
+        state = self.state
+        root_pos = self.clip.root_body_pos_w[step]
+        root_quat = self.clip.root_body_quat_w[step]
+        for axis in range(3):
+            state[axis] = root_pos[axis]
+            state[7 + axis] = self.clip.root_body_lin_vel_w[step, axis]
+            state[10 + axis] = self.clip.root_body_ang_vel_w[step, axis]
+        state[3] = root_quat[0]
+        state[4] = root_quat[1]
+        state[5] = root_quat[2]
+        state[6] = root_quat[3]
+        num_joints = self.clip.joint_pos.shape[1]
+        for joint_id in range(num_joints):
+            state[13 + joint_id] = self.clip.joint_pos[step, joint_id]
+            state[13 + num_joints + joint_id] = self.clip.joint_vel[step, joint_id]
 
 
 @configclass(kw_only=True)

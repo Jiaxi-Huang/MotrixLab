@@ -68,10 +68,11 @@ class ReplayBuffer:
         envs = env.unsqueeze(-1).expand_as(rows)
         out = {key: self.data[key][rows, envs] for key in ("s", "s1", "a", "xi", "done")}
         done = out["done"].float()
-        mask = torch.cumprod(
-            torch.cat((torch.ones(B, 1, device=self.device), 1 - done[:, :-1]), -1),
-            -1,
-        )
+        # The done row itself is masked too: on this stack an auto-reset
+        # rewrites the lane's published state before the host snapshots it,
+        # so the done row's ``s1`` is the post-reset teleport rather than the
+        # pre-reset state the world model should learn from.
+        mask = torch.cumprod(1 - done, -1)
         out["mask"] = mask
         return out
 
