@@ -49,7 +49,7 @@ from motrix_envs.locomotion.supermimic.mdp import (
     SuperMimicMotionCommandCfg,
     SuperMimicTrackingErrorObsCfg,
 )
-from motrix_envs.locomotion.supermimic.randomization import SuperMimicDynamicsResetCfg
+from motrix_envs.locomotion.supermimic.randomization import ROBOT_COLLISION_GEOMS, SuperMimicDynamicsResetCfg
 from motrix_envs.locomotion.wbt.mdp.observations import (
     DofPosRelObsCfg,
     DofVelObsCfg,
@@ -252,6 +252,7 @@ class SuperMimicEnvCfg(ManagerBasedEnvCfg):
         self.queries.model.update(
             {
                 "supermimic_friction_default": GeomFrictionQuery(name=dynamics.ground_geom),
+                "supermimic_robot_friction_default": GeomFrictionQuery(name=ROBOT_COLLISION_GEOMS[0]),
                 "supermimic_torso_com": LinkCenterOfMassQuery(name=robot.resolve_name(dynamics.com_link)),
             }
         )
@@ -269,9 +270,9 @@ class SuperMimicEnvCfg(ManagerBasedEnvCfg):
         cfg.sim_reset.body_lin_vel.noise_scale = 0.0
         cfg.sim_reset.body_rot_vel.noise_scale = 0.0
         cfg.sim_reset.body_dof_pos.noise_scale = 0.0
-        # Deterministic dynamics: degenerate ranges rewrite the nominal
-        # friction and CoM on every reset.
-        cfg.sim_reset.dynamics.friction_range = (1.0, 1.0)
+        # Deterministic dynamics: the eval scale rewrites the nominal
+        # friction and a zero CoM offset on every reset.
+        cfg.sim_reset.dynamics.eval_mode = True
         cfg.sim_reset.dynamics.com_offset_noise = (0.0, 0.0, 0.0)
         return cfg
 
@@ -294,6 +295,6 @@ class SuperMimicEnvCfg(ManagerBasedEnvCfg):
         cfg.sim_reset.body_lin_vel.noise_scale = 0.0
         cfg.sim_reset.body_rot_vel.noise_scale = 0.0
         cfg.sim_reset.body_dof_pos.noise_scale = 0.0
-        cfg.sim_reset.dynamics.friction_range = (1.0, 1.0)
+        cfg.sim_reset.dynamics.eval_mode = True
         cfg.sim_reset.dynamics.com_offset_noise = (0.0, 0.0, 0.0)
         return cfg
