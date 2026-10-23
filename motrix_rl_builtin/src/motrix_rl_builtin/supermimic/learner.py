@@ -37,6 +37,11 @@ from .replay import ReplayBuffer
 
 _ANNOTATE = type_cast
 
+# Per-row squared error cap for the world-model loss. Transitions beyond this
+# normalized error (contact impacts, solver pops) are chaotic: their gradient
+# is excluded so the fit on the predictable mass keeps improving.
+_WM_ERROR_CAP = 4.0
+
 
 def _set_requires_grad(module: nn.Module, enabled: bool) -> None:
     for parameter in module.parameters():
@@ -214,6 +219,12 @@ class SuperMimicLearner:
         std = torch.maximum(self.wm.out_norm.std(), self.err_floor)
         error = (self.wm.state_error(predicted, unflatten_state(window["s1"])) / std) ** 2
         error = error.mean(-1)
+        # Chaotic-but-real transitions (contact impacts and solver pops) are
+        # unpredictable in principle: without a cap their squared error
+        # dominates the window sum and the fit on the predictable mass
+        # degrades over training. Rows beyond the cap are excluded from the
+        # gradient instead of steering it.
+        error = error.clamp(max=_WM_ERROR_CAP)
         mask = window["mask"]
         loss = (error * mask).sum() / window["s1"].shape[0]
         self.opt_wm.zero_grad(set_to_none=True)
