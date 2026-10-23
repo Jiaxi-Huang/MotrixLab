@@ -94,6 +94,31 @@ def build_start_bins(frame_clip_end: np.ndarray, bin_frames: int) -> tuple[np.nd
     return bin_start, bin_end, frame_bin
 
 
+@njit(inline="always")
+def _seed_state_from_frame(
+    state: np.ndarray,
+    root_pos: np.ndarray,
+    root_quat: np.ndarray,
+    root_lin_vel: np.ndarray,
+    root_ang_vel: np.ndarray,
+    joint_pos: np.ndarray,
+    joint_vel: np.ndarray,
+) -> None:
+    """Seed the published state buffer with a reference frame's state."""
+    for axis in range(3):
+        state[axis] = root_pos[axis]
+        state[7 + axis] = root_lin_vel[axis]
+        state[10 + axis] = root_ang_vel[axis]
+    state[3] = root_quat[0]
+    state[4] = root_quat[1]
+    state[5] = root_quat[2]
+    state[6] = root_quat[3]
+    num_joints = joint_pos.shape[0]
+    for joint_id in range(num_joints):
+        state[13 + joint_id] = joint_pos[joint_id]
+        state[13 + num_joints + joint_id] = joint_vel[joint_id]
+
+
 @kernel_data
 class SuperMimicMotionCommand(WbtMotionCommand):
     """WBT motion command with SuperMimic start-bin sampling and goal frames.
@@ -240,7 +265,15 @@ class SuperMimicMotionCommand(WbtMotionCommand):
         construction would read a zero-initialized state.
         """
         if self.sequential_clips:
-            self._seed_state_from_frame(self.steps[0])
+            _seed_state_from_frame(
+                self.state,
+                self.clip.root_body_pos_w[self.steps[0]],
+                self.clip.root_body_quat_w[self.steps[0]],
+                self.clip.root_body_lin_vel_w[self.steps[0]],
+                self.clip.root_body_ang_vel_w[self.steps[0]],
+                self.clip.joint_pos[self.steps[0]],
+                self.clip.joint_vel[self.steps[0]],
+            )
             return
         requested = int(self.requested_frames[0])
         if requested >= 0:
@@ -252,7 +285,15 @@ class SuperMimicMotionCommand(WbtMotionCommand):
                 bin_id += 1
             self.start_bin[0] = bin_id
             self.requested_frames[0] = np.int64(-1)
-            self._seed_state_from_frame(self.steps[0])
+            _seed_state_from_frame(
+                self.state,
+                self.clip.root_body_pos_w[self.steps[0]],
+                self.clip.root_body_quat_w[self.steps[0]],
+                self.clip.root_body_lin_vel_w[self.steps[0]],
+                self.clip.root_body_ang_vel_w[self.steps[0]],
+                self.clip.joint_pos[self.steps[0]],
+                self.clip.joint_vel[self.steps[0]],
+            )
             return
         unit = (ctx.rand.next_uniform() + np.float32(1.0)) * np.float32(0.5)
         bin_id = np.int64(0)
@@ -263,25 +304,15 @@ class SuperMimicMotionCommand(WbtMotionCommand):
         offset = min(np.int64(phase * np.float32(span)), span - np.int64(1))
         self.steps[0] = self.bin_start[bin_id] + offset
         self.start_bin[0] = bin_id
-        self._seed_state_from_frame(self.steps[0])
-
-    def _seed_state_from_frame(self, step: np.int64) -> None:
-        """Seed the state buffer with the frame's reference root and joints."""
-        state = self.state
-        root_pos = self.clip.root_body_pos_w[step]
-        root_quat = self.clip.root_body_quat_w[step]
-        for axis in range(3):
-            state[axis] = root_pos[axis]
-            state[7 + axis] = self.clip.root_body_lin_vel_w[step, axis]
-            state[10 + axis] = self.clip.root_body_ang_vel_w[step, axis]
-        state[3] = root_quat[0]
-        state[4] = root_quat[1]
-        state[5] = root_quat[2]
-        state[6] = root_quat[3]
-        num_joints = self.clip.joint_pos.shape[1]
-        for joint_id in range(num_joints):
-            state[13 + joint_id] = self.clip.joint_pos[step, joint_id]
-            state[13 + num_joints + joint_id] = self.clip.joint_vel[step, joint_id]
+        _seed_state_from_frame(
+            self.state,
+            self.clip.root_body_pos_w[self.steps[0]],
+            self.clip.root_body_quat_w[self.steps[0]],
+            self.clip.root_body_lin_vel_w[self.steps[0]],
+            self.clip.root_body_ang_vel_w[self.steps[0]],
+            self.clip.joint_pos[self.steps[0]],
+            self.clip.joint_vel[self.steps[0]],
+        )
 
 
 @configclass(kw_only=True)
