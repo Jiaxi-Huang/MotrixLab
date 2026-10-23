@@ -193,7 +193,8 @@ class SuperMimicLearner:
             # Upstream's term_frac counts hard failures only: clip-end
             # episodes are successes (bootstrapped like time-outs) and the
             # dof guards are NaN-safety nets, so neither belongs here.
-            clip_end = np.asarray(result.metrics["motion_clip_end"], dtype=bool)
+            metrics = getattr(result, "metrics", None) or {}
+            clip_end = np.asarray(metrics.get("motion_clip_end", False), dtype=bool)
             hard = np.asarray(result.terminated, dtype=bool) & ~clip_end
             self.stats["term"].append(float(hard.sum()))
             self.stats["done"].append(float(done.sum()))
