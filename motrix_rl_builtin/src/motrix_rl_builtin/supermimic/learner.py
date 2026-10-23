@@ -190,7 +190,12 @@ class SuperMimicLearner:
             self.sim_steps += self.env.num_envs
             self.stats["r"].append(float(result.reward.mean()) / (self.mdp.max_step_reward * self.mdp.ctrl_dt))
             self.stats["ep_len"].append(float(ep_step.float().mean()))
-            self.stats["term"].append(float(np.asarray(result.terminated).sum()))
+            # Upstream's term_frac counts hard failures only: clip-end
+            # episodes are successes (bootstrapped like time-outs) and the
+            # dof guards are NaN-safety nets, so neither belongs here.
+            clip_end = np.asarray(result.metrics["motion_clip_end"], dtype=bool)
+            hard = np.asarray(result.terminated, dtype=bool) & ~clip_end
+            self.stats["term"].append(float(hard.sum()))
             self.stats["done"].append(float(done.sum()))
 
     # ------------------------------------------------------------------
