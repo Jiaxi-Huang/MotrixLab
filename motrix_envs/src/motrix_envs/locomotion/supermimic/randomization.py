@@ -136,9 +136,13 @@ class SuperMimicDynamicsResetCfg(ResetTermCfg):
 
     ground_geom: str = "floor"
     com_link: str = "torso_link"
-    friction_range: tuple[float, float] = (0.3, 1.2)
+    friction_range: tuple[float, float] = (1.0, 1.0)
     com_offset_noise: tuple[float, float, float] = (0.025, 0.05, 0.05)
-    eval_mode: bool = False
+    # Friction randomization is currently held at the nominal contact
+    # friction: the per-lane draw collapsed evaluation transfer (the policy
+    # must track at one friction while lanes span [0.3, 1.2]). The write
+    # path stays in place for a validated re-enable.
+    eval_mode: bool = True
 
     def __call__(self, ctx: BuildContext) -> ResetTerm:
         others = ctx.model.others
