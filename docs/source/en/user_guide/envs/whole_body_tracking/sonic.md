@@ -81,9 +81,9 @@ windows, while at `2 × buffer_size` (the `g1-sonic` default) each window's
 data fully churns out of the buffer before the next swap arrives, giving
 every window a complete digestion pass. Tune from the publish log: window
 decode should stay well under the period, and the drain wait under the
-episode-length bound. Adaptive sampling is enabled by default (gear_sonic's
-release sets `enable: true`; play/eval configs disable it via `for_play()`,
-and `clip_round_robin` replaces it). Enabled, sampling follows gear_sonic's
+episode-length bound. Episode start sampling is selected by `sampling_mode`
+(default `"adaptive"`, the gear_sonic release recipe; play/eval configs
+switch to `"uniform"` via `for_play()`). In adaptive mode, sampling follows gear_sonic's
 per-clip failure-rate contract, shared verbatim by resident corpora and
 rotated windows: every source clip is split into `adaptive_bin_size`-frame
 bins (one second at 50 Hz by default), and each bin keeps cumulative failure
@@ -114,11 +114,31 @@ remaining slots keep coming from the without-replacement coverage permutation,
 so every clip still rides the pass and buffer diversity keeps a worst-case
 floor. Window publication stays drain-gated either way: unlike upstream's
 resample-time `reset_all`, episodes are never force-reset (off-policy replay
-must not see artificial truncations). With adaptive sampling explicitly
-disabled, rotation falls back to the original uniform frame sampler: it
-neither changes the random draw sequence nor allocates adaptive state. Corpus
-roots smaller than one window fall back to the plain resident load, so smoke
-corpora are unaffected.
+must not see artificial truncations). With `sampling_mode = "uniform"`, rotation
+falls back to the original uniform frame sampler: it neither changes the
+random draw sequence nor allocates adaptive state. Corpus roots smaller than
+one window fall back to the plain resident load, so smoke corpora are
+unaffected.
+
+## Success Guided Sampling
+
+Setting `sampling_mode = "sgs"` swaps the probability model for Success
+Guided Sampling (arXiv 2610.12465) while keeping the adaptive path's bin
+layout, source-clip statistics ownership, and rotation integration (including
+`rotation_difficulty_ratio`). Each bin keeps the last `sgs_history` boolean
+episode outcomes — success when the episode reaches its time limit without a
+failure termination, failure when it is terminated — credited to the bin
+where the episode ended. Starts are drawn through the paper's Beta-shaped
+kernel over each bin's success rate (mode `sgs_target_success`, concentration
+`sgs_concentration`) and a softmax with temperature `sgs_temperature`, so
+training concentrates on bins near the frontier of the policy's capability
+while `sgs_epsilon` keeps every bin's probability non-zero and the estimates
+updating. Defaults (`0.66 / 5 / 1e-8 / 2 / 100`) are the paper's locomotion
+recipe. The step metrics `sgs_sampling_entropy`, `sgs_sampling_top1_prob`,
+and `sgs_mean_success_rate` report the distribution and the policy's success
+rate over recorded outcomes. `sampling_mode = "round_robin"` instead claims
+clips in cyclic order so every clip receives the same number of episode
+starts (resident corpora only).
 
 ## Build a corpus
 

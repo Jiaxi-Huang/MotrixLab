@@ -14,6 +14,7 @@ from motrix_env_core import registry
 from motrix_envs.locomotion.sonic.mdp import G1_SONIC_BODY_NAMES, G1_SONIC_JOINTS
 from motrix_envs.motion.adaptive import AdaptiveMotionSampler
 from motrix_envs.motion.rotation import CorpusRotator
+from motrix_envs.motion.sgs import SuccessGuidedSampler
 
 _TASK_ORDER = {
     "joint_names": ["joint_2", "joint_0"],
@@ -247,9 +248,9 @@ def test_rotation_adaptive_path_compiles_and_preserves_uniform_controller_absenc
     uniform_cfg.commands.motion.motion_files = (str(corpus_directory),)
     uniform_cfg.commands.motion.num_motions = 2
     uniform_cfg.commands.motion.rotation_period = 2
-    # The default enables adaptive sampling; pin it off to exercise the plain
-    # uniform rotation controller.
-    uniform_cfg.commands.motion.adaptive_sampling_enabled = False
+    # The default enables the adaptive curriculum; pin plain uniform draws to
+    # exercise the uniform rotation controller.
+    uniform_cfg.commands.motion.sampling_mode = "uniform"
     uniform_env = registry.resolve("g1-sonic", env_cfg=uniform_cfg).make(num_envs=2, seed=1)
     assert uniform_env._motion_adaptive is None
     uniform_motion = uniform_env._command_terms["motion"]
@@ -262,7 +263,7 @@ def test_rotation_adaptive_path_compiles_and_preserves_uniform_controller_absenc
     adaptive_cfg.commands.motion.motion_files = (str(corpus_directory),)
     adaptive_cfg.commands.motion.num_motions = 2
     adaptive_cfg.commands.motion.rotation_period = 2
-    adaptive_cfg.commands.motion.adaptive_sampling_enabled = True
+    adaptive_cfg.commands.motion.sampling_mode = "adaptive"
     adaptive_env = registry.resolve("g1-sonic", env_cfg=adaptive_cfg).make(num_envs=2, seed=1)
     assert adaptive_env._motion_adaptive is not None
     adaptive_motion = adaptive_env._command_terms["motion"]
@@ -279,6 +280,36 @@ def test_rotation_adaptive_path_compiles_and_preserves_uniform_controller_absenc
         "adaptive_failure_rate",
     ):
         assert key in state.metrics
+
+
+def test_rotation_sgs_path_publishes_bins_and_records_outcomes(tmp_path):
+    corpus_directory = tmp_path / "corpus"
+    corpus_directory.mkdir()
+    for index in range(5):
+        _write_g1_clip(corpus_directory / f"clip_{index}.npz", num_frames=8)
+
+    cfg = registry.make_env_config("g1-sonic")
+    cfg.commands.motion.motion_files = (str(corpus_directory),)
+    cfg.commands.motion.num_motions = 2
+    cfg.commands.motion.rotation_period = 2
+    cfg.commands.motion.sampling_mode = "sgs"
+    env = registry.resolve("g1-sonic", env_cfg=cfg).make(num_envs=2, seed=1)
+    assert isinstance(env._motion_adaptive[1], SuccessGuidedSampler)
+    motion = env._command_terms["motion"]
+    # The initial tables publish like the adaptive path: uniform SGS mass
+    # over per-source bins (no outcomes recorded yet).
+    count = int(motion.adaptive_active_bin_count[0])
+    assert count > 0
+    assert motion.sampling_cdf[count - 1] == pytest.approx(1.0)
+    probabilities = np.diff(np.concatenate(([0.0], motion.sampling_cdf[:count])))
+    np.testing.assert_allclose(probabilities, np.full(count, 1.0 / count), atol=1e-6)
+    assert motion.record_episode_outcomes
+    env.init_state()
+    state = env.step(np.zeros((2, len(G1_SONIC_JOINTS)), np.float32))
+    for key in ("sgs_sampling_entropy", "sgs_sampling_top1_prob", "sgs_mean_success_rate"):
+        assert key in state.metrics
+    # init_state resets lanes as failures, so the first tick records outcomes.
+    assert state.metrics["sgs_mean_success_rate"] == pytest.approx(0.0)
 
 
 def test_budget_trim_keeps_coverage_via_carry(tmp_path):

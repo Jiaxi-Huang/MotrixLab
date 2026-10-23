@@ -29,12 +29,14 @@ class SonicManagerEnv(ManagerEnv):
     """Manager environment for the SONIC G1 motion-tracking task.
 
     Drives :class:`~motrix_envs.motion.rotation.CorpusRotator` when the motion
-    command enables corpus rotation, and the shared
-    :class:`~motrix_envs.motion.adaptive.AdaptiveMotionSampler` when adaptive
-    sampling is enabled: the command cfg publishes each host-side object into
-    a ``_pending_motion_*`` attribute during construction (the canonical,
-    kernel-bound command terms only exist once ``super().__init__`` returns),
-    and each control step ticks them against the canonical motion term.
+    command enables corpus rotation, and the mode-selected host-side sampler
+    (``AdaptiveMotionSampler`` for ``sampling_mode="adaptive"``,
+    :class:`~motrix_envs.motion.sgs.SuccessGuidedSampler` for ``"sgs"``)
+    when a statistics-driven sampling mode is enabled: the command cfg
+    publishes each host-side object into a ``_pending_motion_*`` attribute
+    during construction (the canonical, kernel-bound command terms only exist
+    once ``super().__init__`` returns), and each control step ticks them
+    against the canonical motion term.
     """
 
     def __init__(self, cfg, num_envs: int = 1, backend: str | None = None, seed: int | None = None):

@@ -45,7 +45,7 @@ def test_sonic_config_defaults_match_upstream_base() -> None:
     # uniform_sampling_rate/pre_failure_sample_window/
     # adp_samp_failure_rate_max_over_mean = true/50/true/1/0.1/200/50;
     # use_failure_rate_decay=false and no max_prob_per_bin/motion caps.
-    assert motion.adaptive_sampling_enabled is True
+    assert motion.sampling_mode == "adaptive"
     assert motion.adaptive_bin_size == 50
     assert motion.adaptive_sequence_length_agnostic is True
     assert motion.adaptive_init_count == 1.0
@@ -53,6 +53,13 @@ def test_sonic_config_defaults_match_upstream_base() -> None:
     assert motion.pre_failure_sample_window == 200
     assert motion.failure_rate_max_over_mean == pytest.approx(50.0)
     assert motion.adaptive_max_prob_per_bin is None
+    # SGS defaults equal the paper's locomotion recipe (arXiv 2610.12465
+    # Sec. 3.2): t = 0.66, kappa = 5, eps = 1e-8, T = 2, H = 100.
+    assert motion.sgs_target_success == pytest.approx(0.66)
+    assert motion.sgs_concentration == pytest.approx(5.0)
+    assert motion.sgs_epsilon == pytest.approx(1e-8)
+    assert motion.sgs_temperature == pytest.approx(2.0)
+    assert motion.sgs_history == 100
 
 
 def test_sonic_model_hip_pitch_release_gains() -> None:
@@ -83,6 +90,16 @@ def test_sonic_reward_point_config_validation() -> None:
         mdp.SonicTrackingRewardCfg(weight=2.0, std=0.0)
     with pytest.raises(ValueError, match="encoder_sampling"):
         mdp.SonicMotionCommandCfg(encoder_sampling="both")
+    with pytest.raises(ValueError, match="sampling_mode"):
+        mdp.SonicMotionCommandCfg(sampling_mode="curriculum")
+    with pytest.raises(ValueError, match="resident corpus"):
+        mdp.SonicMotionCommandCfg(sampling_mode="round_robin", num_motions=2, rotation_period=64)
+    with pytest.raises(ValueError, match="rotation_difficulty_ratio"):
+        mdp.SonicMotionCommandCfg(sampling_mode="uniform", rotation_period=64, num_motions=2)
+    with pytest.raises(ValueError, match="sgs_target_success"):
+        mdp.SonicMotionCommandCfg(sampling_mode="sgs", sgs_target_success=1.0)
+    with pytest.raises(ValueError, match="sgs_history"):
+        mdp.SonicMotionCommandCfg(sampling_mode="sgs", sgs_history=0)
 
 
 def test_sonic_encoder_sampling_mode_selection() -> None:
@@ -99,6 +116,46 @@ def test_sonic_encoder_sampling_mode_selection() -> None:
     assert sampled("smpl", 8) == {2}
     # Mixed draws uniformly over the three reference streams.
     assert sampled("mixed", 64) == {0, 1, 2}
+
+
+def test_sonic_reset_records_episode_outcomes_for_sgs() -> None:
+    # Two source clips on one frame axis; lanes sit on frames 2 (source 7,
+    # local 2) and 4 (source 9, local 1).
+    clip = SimpleNamespace(
+        frame_clip_end=np.asarray([2, 2, 2, 5, 5, 5], np.int64),
+        frame_source_id=np.asarray([7, 7, 7, 9, 9, 9], np.int64),
+        frame_source_start=np.asarray([0, 0, 0, 3, 3, 3], np.int64),
+    )
+    motion = SimpleNamespace(
+        clip=clip,
+        steps=np.asarray([[2], [4]], np.int64),
+        sampling_cdf=np.ones(4, np.float32),
+        adaptive_failure_pending=np.zeros(2, bool),
+        adaptive_failure_source_id=np.full(2, -1, np.int64),
+        adaptive_failure_local_step=np.zeros(2, np.int64),
+        adaptive_outcome_success=np.zeros(2, bool),
+        record_episode_outcomes=np.bool_(True),
+        reset_counter=np.zeros((2, 1), np.int64),
+    )
+    ctx = SimpleNamespace(env_ids=np.asarray([0, 1]), terminated=np.asarray([True, False]))
+
+    # SGS records an outcome for every episode end: the terminated lane is a
+    # failure, the time-out lane a success, both tagged with their source.
+    mdp.SonicMotionCommand.reset(motion, ctx)
+    assert tuple(motion.adaptive_failure_pending) == (True, True)
+    assert tuple(motion.adaptive_failure_source_id) == (7, 9)
+    assert tuple(motion.adaptive_failure_local_step) == (2, 1)
+    assert tuple(motion.adaptive_outcome_success) == (False, True)
+
+    # The adaptive curriculum marks failures only and leaves outcome flags
+    # untouched.
+    motion.record_episode_outcomes = np.bool_(False)
+    motion.adaptive_failure_pending[:] = False
+    mdp.SonicMotionCommand.reset(motion, ctx)
+    assert tuple(motion.adaptive_failure_pending) == (True, False)
+    assert tuple(motion.adaptive_failure_source_id) == (7, 9)
+    assert tuple(motion.adaptive_outcome_success) == (False, True)
+    assert motion.reset_counter[:, 0].tolist() == [2, 2]
 
 
 def test_sonic_reset_expands_smpl_native_rows_multi_hot() -> None:

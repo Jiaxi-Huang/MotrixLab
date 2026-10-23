@@ -56,9 +56,9 @@ SONIC_MOTION_DIR=$PWD/data/bones_seed_npz \
 这使每次换窗都成为平缓的混合比变化——一个好的默认值是每 1–2 个 `buffer_size` 控制步换窗一次：
 取 `buffer_size` 时 buffer 永远混合两个窗口，取 `2 × buffer_size`（`g1-sonic` 默认）时每个窗口的
 数据在下次换窗前完整离开 buffer，每窗都能得到完整的消化。根据 publish 日志校准：窗口解码耗时应
-明显小于 period，排空等待应低于 episode 长度上界。adaptive sampling 默认开启（gear_sonic release
-`enable: true`；play/eval 配置经 `for_play()` 关闭，`clip_round_robin` 则取代它）。开启后，采样遵循
-gear_sonic 的 per-clip 失败率契约，常驻语料与轮换窗口共用同一实现：每条源 clip 按
+明显小于 period，排空等待应低于 episode 长度上界。episode 起点采样由 `sampling_mode` 选择（默认
+`"adaptive"`，即 gear_sonic release 的等价契约；play/eval 配置经 `for_play()` 切到 `"uniform"`）。
+adaptive 模式下，采样遵循 gear_sonic 的 per-clip 失败率契约，常驻语料与轮换窗口共用同一实现：每条源 clip 按
 `adaptive_bin_size` 帧（50 Hz 下默认 1 秒）切 bin，每个 bin 维护累计的失败数与 episode 数
 （同初始化为 `adaptive_init_count`）；每个 lane-step 给当前所在 bin 记 `1 / bin_length`
 次 episode，每次终止给结束位置所在的 bin 记一次失败。采样概率由逐 bin 失败率（按均值 ×
@@ -76,8 +76,20 @@ rotation 还把学到的难度用在 clip 级，对应上游的 motion resample�
 （困难 clip 跨窗口史频繁地重现），其余槽位仍来自无放回的覆盖排列，因此每条 clip 依旧随
 pass 出现，buffer 多样性保有最坏情况下的下限。两种情况下窗口发布都保持 drain-gated：与
 上游换批时的 `reset_all` 不同，episode 不会被强制重置（off-policy replay 不应看到人为截断）。
-显式关闭 adaptive sampling 时，rotation 回退到原有的均匀帧采样，既不改变随机数序列，也不
-分配任何 adaptive 状态。小于一个窗口的语料根会回退到普通的常驻加载，冒烟语料不受影响。
+`sampling_mode = "uniform"` 时，rotation 回退到原有的均匀帧采样，既不改变随机数序列，也不
+分配任何统计状态。小于一个窗口的语料根会回退到普通的常驻加载，冒烟语料不受影响。
+
+## Success Guided Sampling
+
+`sampling_mode = "sgs"` 将概率模型换为 Success Guided Sampling（arXiv 2610.12465），bin 布局、
+统计归属与 rotation 集成（含 `rotation_difficulty_ratio`）与 adaptive 模式完全一致。每个 bin 维护最近
+`sgs_history` 次 episode 布尔结果——达到时长上限而未失败终止记成功，失败终止记失败——归因到
+episode 结束时所在的 bin。起点按论文的 Beta 形核（mode 为 `sgs_target_success`、浓度为
+`sgs_concentration`）加温度 `sgs_temperature` 的 softmax 从各 bin 成功率中抽取，把训练集中在策略
+能力前沿附近的 bin 上；`sgs_epsilon` 保证任何 bin 的采样概率非零，成功率估计因此可以持续更新。默认值
+（`0.66 / 5 / 1e-8 / 2 / 100`）取自论文的 locomotion 配方。步级指标 `sgs_sampling_entropy`、
+`sgs_sampling_top1_prob` 与 `sgs_mean_success_rate` 报告采样分布与策略在已记录结果上的成功率。
+`sampling_mode = "round_robin"` 则按循环顺序为每条 clip 分配等量的 episode 起点（仅限常驻语料）。
 
 ## 构建语料
 

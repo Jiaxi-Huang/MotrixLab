@@ -187,7 +187,7 @@ class SonicManagerEnvCfg(ManagerBasedEnvCfg):
     def for_play(self) -> SonicManagerEnvCfg:
         cfg = deepcopy(self)
         cfg.max_episode_seconds = None
-        cfg.commands.motion.adaptive_sampling_enabled = False
+        cfg.commands.motion.sampling_mode = "uniform"
         # Evaluation tracks the startup window; streaming in new clips mid-eval
         # would change the task underneath the policy.
         cfg.commands.motion.rotation_period = None
