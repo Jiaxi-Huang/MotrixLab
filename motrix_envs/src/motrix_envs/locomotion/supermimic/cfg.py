@@ -212,7 +212,11 @@ class SuperMimicEnvCfg(ManagerBasedEnvCfg):
     the height/tilt checks, and are capped at 10 s (500 control steps).
     """
 
-    sim: SimCfg = SimCfg(dt=0.005, solver_iterations=3)
+    # dt 0.002 with 20 solver iterations: at the upstream-equivalent 0.005/3
+    # the MotrixSim solver produces rare contact pops that terminate long
+    # clips in evaluation; the finer step removes most of them (same 50 Hz
+    # control rate).
+    sim: SimCfg = SimCfg(dt=0.002, solver_iterations=20)
     ctrl_dt: float = 0.02
     max_episode_seconds: float = 10.0
     queries: SimQueriesCfg = SimQueriesCfg(
