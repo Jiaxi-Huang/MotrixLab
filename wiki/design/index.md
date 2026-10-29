@@ -19,6 +19,10 @@
   面向 Go2 的最小 command input 抽象：batch-first `PlanarVelocityCommand` 统一表达 training 与 deploy；core 内置 keyboard/gamepad/constant bindings，带 standing probability 的 `RandomPlanarVelocityBinding` 作为 task-specific 训练策略留在四足环境模块。
 - [RL 多算法架构设计](./rl-multi-algorithm-architecture.md)
   在 RL 集成层引入 `rllib/train_backend/algo` 正交维度的架构：配置注册表、`RlFramework`/`AgentProvider`、`TrainerContext` 与通用 runner、算法配置与模型/memory 工厂、run metadata、checkpoint manifest 与 play 自动发现，以及内置 framework 矩阵（skrl / rslrl / motrix）；明确 `motrix_rl` 控制平面与 `motrix_rl.contracts` 契约、三个 provider 插件包的单向依赖和 entry-point discovery 边界。
+- [APG 解析头协议设计](./apg-head-protocol.md)
+  把世界模型想象算法重构为任务无关的 `motrix.apg`：任务知识全部下沉到任务包的解析头（`ApgTask` 协议，task yaml 点路径 `algo.head` 声明、duck-typing 零依赖），新增任务零改动 provider；以 g1-supermimic 语料跟踪与 go2-walk-flat 速度指令四足两个不同族任务实证。
+- [APG Model-as-Env 编排设计](./apg-model-as-env-orchestration.md)
+  把 sync 训练的「收集 → WM 拟合 → 想象 → 策略更新」硬编码串行链重构为四个独立可复用阶段：以 `ImaginedEnv` 把世界模型与解析头封装成可微「想象环境」（`step()` 字段形状对齐 `ArrayEnvState`，两处显式差异——字段带 autograd 图、`terminated` 为可微 soft hazard），想象 rollout 成为标准循环并单份缓存供 actor 与 critic 目标共用；同时抽共享采样助手消除 collect/play 四处重复，附 12 条行为不变清单与分步实施验证。
 - [FastSAC 异构（Collector/Learner 分进程）训练器设计](./fastsac-async-heterogeneous-trainer.md)
   把仿真采样与网络训练拆到两进程、经共享内存交换数据的异构 FastSAC 训练器：统一注册为 `motrix.fastsac`，由 `algo.asynchronous` 选择执行拓扑，并包含 SPSC 有界背压 replay 环、update-to-data 比例治理、seqlock 双缓冲权重/normalizer 快照，以及进程生命周期与 checkpoint 兼容。
 - [训练实时指标（Live Metrics）设计](./live-metrics.md)

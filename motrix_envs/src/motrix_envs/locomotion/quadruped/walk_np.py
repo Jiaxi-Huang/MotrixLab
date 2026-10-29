@@ -285,6 +285,45 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
     def get_gravity(self) -> np.ndarray:
         return self.sim_data["upvector"]
 
+    @property
+    def num_feet(self) -> int:
+        return self._num_feet
+
+    @property
+    def velocity_commands(self) -> np.ndarray:
+        """The per-env (vx, vy, yaw-rate) command currently being tracked."""
+        return self._commands
+
+    @property
+    def gait_phase(self) -> np.ndarray:
+        """The per-env scalar trot phase in ``[0, 1)``."""
+        return self._phase
+
+    @property
+    def action_delay_steps(self) -> np.ndarray:
+        return self._action_delay_steps
+
+    def sliding_friction(self) -> np.ndarray:
+        """Per-env ground sliding friction in effect (nominal when not randomized)."""
+        if self._randomize_writes is not None and self._randomize_friction:
+            return np.asarray(self._randomize_writes.buffer("friction")[:, 0, 0], dtype=np.float32)
+        nominal = float(np.asarray(self.model.others["ground_friction"]).reshape(-1)[0])
+        return np.full((self._num_envs,), nominal, dtype=np.float32)
+
+    def base_mass(self) -> np.ndarray:
+        """Per-env base link mass in effect (nominal when not randomized)."""
+        if self._randomize_writes is not None and self._randomize_base_mass:
+            return np.asarray(self._randomize_writes.buffer("mass")[:, 0], dtype=np.float32)
+        nominal = float(np.asarray(self.model.others["base_mass"]).reshape(-1)[0])
+        return np.full((self._num_envs,), nominal, dtype=np.float32)
+
+    def base_com(self) -> np.ndarray:
+        """Per-env base CoM position in effect (nominal when not randomized)."""
+        if self._randomize_writes is not None and self._randomize_base_com:
+            return np.asarray(self._randomize_writes.buffer("com")[:, 0, :], dtype=np.float32)
+        nominal = np.asarray(self.model.others["base_com"], dtype=np.float32).reshape(3)
+        return np.tile(nominal, (self._num_envs, 1))
+
     # ---- contact / phase helpers -----------------------------------------
 
     def _obs_noise(self, data: np.ndarray, scale: float) -> np.ndarray:

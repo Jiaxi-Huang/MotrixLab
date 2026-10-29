@@ -1,0 +1,23 @@
+# @package _global_
+# Task g1-supermimic with the APG world-model learner: a learned latent
+# dynamics model plus the task-side parsing head (analytic reward/termination,
+# goal, and observation features over the LAFAN corpus), a goal-conditioned
+# policy trained on imagined rollouts, and a lambda-returns critic. Requires
+# the LAFAN1 corpus cache (scripts/motion/download_lafan.py --all).
+defaults:
+  - /algo_base@algo: motrix.apg
+  - _self_
+task:
+  env: g1-supermimic
+  rllib: motrix
+  algo: apg
+num_envs: 2048
+play_num_envs: 16
+seed: 1
+checkpoint:
+  interval: 2000
+algo:
+  # Task-side parsing head: dimensions, analytic heads, env-buffer reads.
+  head: motrix_envs.locomotion.supermimic.apg_head:build_head
+  trainer:
+    num_learning_iterations: 12000

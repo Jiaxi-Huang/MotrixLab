@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from motrix_rl import frameworks
-from motrix_rl_builtin.fastsac.framework import MotrixFramework
+from motrix_rl_builtin.framework import MotrixFramework
 
 
 def register() -> None:

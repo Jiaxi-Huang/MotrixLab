@@ -26,4 +26,10 @@ builtin = "motrix_envs:register"
 builtin = "motrix_envs.deploy:register"
 
 [project.optional-dependencies]
+# Task-side APG parsing heads (*.apg_head modules) need torch for their
+# analytic heads and the shared rotation/state-layout math in
+# motrix_env_core.torch.geometry; resolved only when a task yaml points an
+# APG run at them, so pure simulation installs stay torch-free. The torch
+# requirement is owned by motrix-env-core's `torch` extra.
+apg = ["motrix-env-core[torch]==0.4.0"]
 deploy = ["motrix-deploy==0.4.0", "motrix-deploy-tasks==0.4.0"]

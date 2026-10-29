@@ -1,8 +1,7 @@
 # Copyright Motphys Technology Co., Ltd. 2025, 2026
 # SPDX-License-Identifier: Apache-2.0
 
-from motrix_rl import frameworks
-from motrix_rl.contracts import AgentProvider, RlFramework, TrainerBase, TrainerContext
+from motrix_rl.contracts import AgentProvider, TrainerBase, TrainerContext
 from motrix_rl.deploy.api import OnnxPolicyExporter
 from motrix_rl_builtin.fastsac.config import FastSacCfg
 
@@ -39,14 +38,4 @@ class FastSacProvider(AgentProvider[FastSacCfg]):
         return FastSacOnnxExporter()
 
 
-class MotrixFramework(RlFramework):
-    def __init__(self) -> None:
-        super().__init__((FastSacProvider(),))
-
-    @property
-    def name(self) -> str:
-        return "motrix"
-
-
-def register_framework() -> None:
-    frameworks.register_framework(MotrixFramework())
+__all__ = ["FastSacProvider"]

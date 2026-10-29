@@ -1,0 +1,38 @@
+# @package _global_
+# Smoke variant of the APG go2-walk-flat recipe: a tiny end-to-end training
+# run (collection, WM fit, imagination, policy/critic updates, checkpoints)
+# used as a gate after orchestration changes. Covers both the sync and the
+# async trainer via algo.asynchronous.
+defaults:
+  - /task/go2-walk-flat/motrix.apg@_global_
+  - _self_
+num_envs: 64
+play_num_envs: 4
+seed: 1
+logging:
+  interval: 1
+checkpoint:
+  interval: 4
+algo:
+  agent:
+    buffer_steps: 128
+    horizon: 8
+    hist: 4
+    z_dim: 8
+    wm_hidden: [64, 64]
+    policy_hidden: [64, 64]
+    critic_hidden: [32, 32]
+    wm_window: 4
+    wm_batches: 2
+    wm_batch: 256
+    pi_batch: 128
+    critic_epochs: 2
+    critic_minibatches: 2
+    warmup_steps: 16
+    wm_only_iters: 2
+    lr_decay_iters: 100
+    amp: none
+  trainer:
+    num_learning_iterations: 8
+    collector_threads: 2
+    snapshot_every: 2

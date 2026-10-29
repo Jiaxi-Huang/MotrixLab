@@ -1,0 +1,24 @@
+# @package _global_
+# Task go2-walk-flat with the APG world-model learner: the task-side
+# quadruped parsing head mirrors the velocity-walk reward group in
+# imagination, the joystick command is the goal, and the world model
+# predicts frame-local increments of the floating-base state.
+defaults:
+  - /algo_base@algo: motrix.apg
+  - _self_
+task:
+  env: go2-walk-flat
+  rllib: motrix
+  algo: apg
+num_envs: 1024
+play_num_envs: 16
+seed: 1
+checkpoint:
+  interval: 1000
+algo:
+  # Task-side parsing head: dimensions, analytic heads, env-buffer reads.
+  head: motrix_envs.locomotion.quadruped.apg_head:build_head
+  agent:
+    hist: 10
+  trainer:
+    num_learning_iterations: 8000

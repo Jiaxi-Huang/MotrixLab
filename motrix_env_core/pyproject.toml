@@ -66,6 +66,11 @@ all = [
 # short kernels. The wheel drops libtbb.so.12 into <venv>/lib, so the runtime
 # preloads it by full path (see motrix_env_core.numba.threading).
 tbb = ["tbb==2021.13.0"]
+# Torch-requiring submodules (motrix_env_core.torch.*): the shared
+# rotation/state-layout math used by the APG world model and its task heads.
+# Standalone opt-in (not in `all`) because torch is a heavy CUDA/ROCm-variant
+# dependency the workspace manages through the cuda/rocm extras.
+torch = ["torch>=2.7,<3"]
 
 [project.urls]
 Homepage = "https://github.com/Motphys/MotrixLab"

@@ -1,0 +1,92 @@
+# Copyright Motphys Technology Co., Ltd. 2025, 2026
+# SPDX-License-Identifier: Apache-2.0
+
+"""Fixed-size device-resident replay laid out as ``(time, environment)``.
+
+Ported from the upstream reference replay; the joint and context widths are
+task-owned and injected by the learner from the task's parsing head.
+"""
+
+from __future__ import annotations
+
+import torch
+
+from motrix_env_core.torch.geometry import flat_state_dim
+
+
+def _make_fields(num_joints: int, context_dim: int) -> dict[str, tuple[int | tuple[()], torch.dtype]]:
+    state_dim = flat_state_dim(num_joints)
+    return {
+        "s": (state_dim, torch.float32),
+        "s1": (state_dim, torch.float32),
+        "a": (num_joints, torch.float32),
+        "a_prev": (num_joints, torch.float32),
+        "xi": (context_dim, torch.float32),
+        "r": ((), torch.float32),
+        "f": ((), torch.long),
+        "ep_step": ((), torch.int32),
+        "done": ((), torch.bool),
+    }
+
+
+class ReplayBuffer:
+    def __init__(self, T: int, N: int, device: str | torch.device, num_joints: int, context_dim: int):
+        self.T = T
+        self.N = N
+        self.device = torch.device(device)
+        self.fields = _make_fields(num_joints, context_dim)
+        self.data: dict[str, torch.Tensor] = {}
+        for key, (shape, dtype) in self.fields.items():
+            field_shape = (T, N) + ((shape,) if isinstance(shape, int) else shape)
+            self.data[key] = torch.zeros(field_shape, dtype=dtype, device=self.device)
+        self.ptr = 0
+        self.size = 0
+
+    def add(self, transition: dict[str, torch.Tensor]) -> None:
+        for key in self.fields:
+            self.data[key][self.ptr] = transition[key]
+        self.ptr = (self.ptr + 1) % self.T
+        self.size = min(self.size + 1, self.T)
+
+    def _row(self, age: torch.Tensor) -> torch.Tensor:
+        """Map age-ordered time indices (zero is oldest) to storage rows."""
+        return (self.ptr - self.size + age) % self.T
+
+    def sample_windows(self, B: int, k: int) -> dict[str, torch.Tensor]:
+        """Sample ``k``-step windows and mask transitions after episode ends."""
+        if not 1 <= k <= self.size:
+            raise ValueError(f"window length must be in [1, {self.size}], got {k}")
+        start = torch.randint(0, self.size - k + 1, (B,), device=self.device)
+        env = torch.randint(0, self.N, (B,), device=self.device)
+        ages = start.unsqueeze(-1) + torch.arange(k, device=self.device)
+        rows = self._row(ages)
+        envs = env.unsqueeze(-1).expand_as(rows)
+        out = {key: self.data[key][rows, envs] for key in ("s", "s1", "a", "xi", "done")}
+        done = out["done"].float()
+        # The terminal transition has an owned physical endpoint. Exclude only
+        # transitions after it, which belong to a different episode.
+        mask = torch.cumprod(torch.cat((torch.ones_like(done[:, :1]), 1 - done[:, :-1]), -1), -1)
+        out["mask"] = mask
+        return out
+
+    def sample_starts(self, B: int, hist: int) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Sample imagination starts and oldest-first, boundary-padded histories."""
+        if self.size == 0:
+            raise ValueError("cannot sample from an empty replay buffer")
+        if hist < 1:
+            raise ValueError(f"history length must be positive, got {hist}")
+        age = torch.randint(0, self.size, (B,), device=self.device)
+        env = torch.randint(0, self.N, (B,), device=self.device)
+        row = self._row(age)
+        ep_step = self.data["ep_step"][row, env].long()
+        back = torch.arange(hist - 1, -1, -1, device=self.device)
+        back = torch.minimum(back.unsqueeze(0), ep_step.unsqueeze(-1))
+        back = torch.minimum(back, age.unsqueeze(-1))
+        history_rows = self._row(age.unsqueeze(-1) - back)
+        history_envs = env.unsqueeze(-1).expand_as(history_rows)
+        start = {key: self.data[key][row, env] for key in ("s", "a_prev", "xi", "f")}
+        history = {key: self.data[key][history_rows, history_envs] for key in ("s", "a_prev", "xi", "f")}
+        return start, history
+
+
+__all__ = ["ReplayBuffer"]
