@@ -161,6 +161,7 @@ def collect_blocks(
         history = torch.zeros(num_envs, cfg.hist, head.obs_dim)
         previous_action = torch.zeros(num_envs, head.num_joints)
         episode_step = torch.zeros(num_envs, dtype=torch.int64)
+        episode_returns = np.zeros(num_envs, dtype=np.float32)
         sequence = 0
         steps = 0
         started = time.monotonic()
@@ -185,7 +186,7 @@ def collect_blocks(
                 obs_rows: list[np.ndarray] = []
                 goal_rows: list[np.ndarray] = []
                 sample_started = time.monotonic()
-                stats = {key: 0.0 for key in ("r", "ep_len_sum", "term", "done")}
+                stats = {key: 0.0 for key in ("r", "ep_len_sum", "ep_ret_sum", "term", "done")}
                 for _ in range(block_steps):
                     # The buffers mutate on every step, so snapshot them now.
                     state_raw, frames_raw, context_raw = head_transition_arrays(head)
@@ -218,6 +219,10 @@ def collect_blocks(
                     goal_rows.append(goal.numpy())
                     stats["r"] += float(reward.mean()) / (head.max_step_reward * head.ctrl_dt)
                     stats["ep_len_sum"] += float(((episode_step.numpy() + 1) * done).sum())
+                    episode_returns += reward
+                    if done.any():
+                        stats["ep_ret_sum"] += float(episode_returns[done].sum())
+                        episode_returns[done] = 0.0
                     stats["term"] += float(hard)
                     stats["done"] += float(done.sum())
                     previous_action = action.clone()

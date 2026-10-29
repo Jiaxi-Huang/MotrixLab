@@ -159,9 +159,11 @@ class ApgLearner:
         self.stats: dict[str, list[float]] = {
             "r": [],
             "ep_len_sum": [],
+            "ep_ret_sum": [],
             "term": [],
             "done": [],
         }
+        self._ep_returns = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         compile_kernels = cfg.compile and device.type == "cuda"
         self._wm_rollout_fn = torch.compile(self._wm_rollout) if compile_kernels else self._wm_rollout
         self._imag_step_fn = torch.compile(imagine_step) if compile_kernels else imagine_step
@@ -252,9 +254,29 @@ class ApgLearner:
             self.sim_steps += self.num_envs
             self.stats["r"].append(float(result.reward.mean()) / (self.head.max_step_reward * self.head.ctrl_dt))
             self.stats["ep_len_sum"].append(float(((ep_step + 1) * done).sum()))
+            rewards = self._as_tensor(result.reward)
+            self._ep_returns += rewards
+            finished = float(done.sum())
+            if finished:
+                self.stats["ep_ret_sum"].append(float(self._ep_returns[done].sum()))
+                self._ep_returns[done] = 0.0
             # The head classifies its own failure metrics into task terminations.
             self.stats["term"].append(float(self.head.termination_counts(result.metrics)))
             self.stats["done"].append(float(done.sum()))
+
+    def episode_metrics(self) -> dict[str, float]:
+        """Canonical live-metrics rollout means over completed episodes.
+
+        Empty when no episode finished since the last reset of ``stats`` —
+        the live panel then keeps its previous values instead of a NaN.
+        """
+        done = sum(self.stats["done"])
+        if not done:
+            return {}
+        return {
+            "rollout/mean_return": sum(self.stats["ep_ret_sum"]) / done,
+            "rollout/mean_ep_len": sum(self.stats["ep_len_sum"]) / done,
+        }
 
     # ------------------------------------------------------------------
     # World-model update

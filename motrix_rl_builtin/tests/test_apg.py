@@ -414,6 +414,21 @@ def test_put_latest_counts_dropped_snapshots():
     assert snapshots.get_nowait() == b"v3"
 
 
+def test_episode_metrics_report_canonical_rollout_means():
+    env = _FakeEnv(4)
+    learner = _make_learner(env)
+    learner.observe(env.init_state().obs.policy)
+    # No completed episode yet: the panel keeps its previous values.
+    assert learner.episode_metrics() == {}
+    learner.collect(21)
+    # The fake env pays 0.1 per step and truncates at 20: four full episodes
+    # of return 2.0, and the rollout means match the episode-length stat.
+    metrics = learner.episode_metrics()
+    assert sum(learner.stats["done"]) == 4
+    assert metrics["rollout/mean_return"] == pytest.approx(2.0)
+    assert metrics["rollout/mean_ep_len"] == pytest.approx(20.0)
+
+
 def test_update_credit_excludes_warmup_and_tracks_fractional_utd():
     credit = UpdateCredit(utd=0.4, warmup=4)
     credit.receive(4)

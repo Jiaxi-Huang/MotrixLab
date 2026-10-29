@@ -142,14 +142,14 @@ jsonl 每行一条记录，HTTP 每次发一批记录，两路都启用时是同
 
 规范 key 直接沿用 FastSAC 现有 TensorBoard tag，FastSAC 不需要映射。
 
-| 规范 key                                | FastSAC                             |
-| --------------------------------------- | ----------------------------------- |
-| `rollout/mean_return`                   | 同名                                |
-| `rollout/mean_ep_len`                   | 同名                                |
-| `perf/env_steps_per_s`                  | 同名                                |
-| `train/<loss>`                          | `qf_loss`、`actor_loss`、`alpha` 等 |
-| `reward/<term>`、`metrics/<k>`          | 同名                                |
-| `train/learning_rate`、`train/action_std` | 预留给后续接入的 on-policy 算法     |
+| 规范 key                                | FastSAC                             | APG（motrix.apg）                                                                                                             |
+| --------------------------------------- | ----------------------------------- | ----------------------------------------------------------------------------- |
+| `rollout/mean_return`                   | 同名                                | `learner.episode_metrics()`：完整 episode 的原始 return 均值，窗口内无 episode 结束时不发 |
+| `rollout/mean_ep_len`                   | 同名                                | 同上（另保留 `train/episode_length` 别名）                                     |
+| `perf/env_steps_per_s`                  | 同名                                | 两次日志点之间 `sim_steps` 差分除以墙钟                                        |
+| `train/<loss>`                          | `qf_loss`、`actor_loss`、`alpha` 等 | `wm_loss`、`policy_loss`、`value_loss` 等                                     |
+| `reward/<term>`、`metrics/<k>`          | 同名                                | 未发（任务指标经 `train/<k>` 与 sampling metrics 通道）                        |
+| `train/learning_rate`、`train/action_std` | 预留给后续接入的 on-policy 算法     | `train/learning_rate` 已发                                                    |
 
 - `reward/*` 的口径是"每步瞬时值在日志窗口内的均值"。
 - `sys/*` 是固定清单，只发到 live，不写 TensorBoard：`sys/cpu_percent`、`sys/mem_used_gb`、`sys/gpu{i}/util_percent`、

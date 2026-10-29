@@ -46,7 +46,9 @@ def _discover_task_specs():
         if len(parts) not in (2, 3):
             raise ValueError(f"Invalid task option '{env_name}/{option}'")
         rllib, algo = parts[:2]
-        backend = parts[2] if len(parts) == 3 else None
+        # A third segment is a train-backend variant (skrl.ppo.torch) only
+        # when it names a backend; other variants (.smoke) keep None.
+        backend = parts[2] if len(parts) == 3 and parts[2] in ("torch", "jax") else None
         specs.append((env_name, rllib, algo, backend))
     return sorted(specs, key=lambda spec: (spec[0], spec[1], spec[2], spec[3] or ""))
 

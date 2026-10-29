@@ -167,6 +167,7 @@ class Trainer(TrainerBase):
         accumulator = 0.0
         started = time.monotonic()
         log_started = started
+        logged_sim_steps = learner.sim_steps
         while learner.iteration < num_iterations:
             # One serial update per iteration; utd fixes the env steps
             # collected per update (1 / utd, accumulated so the collection
@@ -202,15 +203,23 @@ class Trainer(TrainerBase):
                         "train/completed_episodes": done,
                         "train/iterations_per_s": logging_interval / max(now - log_started, 1e-9),
                         "train/wall_time": learner.wall_time,
+                        # Canonical live-metrics key: env steps since the last
+                        # log point over wall time.
+                        "perf/env_steps_per_s": (learner.sim_steps - logged_sim_steps) / max(now - log_started, 1e-9),
                     }
                 )
                 if done:
-                    metrics["train/episode_length"] = sum(stats["ep_len_sum"]) / done
+                    # Canonical live-metrics rollout means (plus the legacy
+                    # train/* alias kept for existing panels).
+                    rollout = learner.episode_metrics()
+                    metrics.update(rollout)
+                    metrics["train/episode_length"] = rollout["rollout/mean_ep_len"]
                     metrics["train/termination_fraction"] = sum(stats["term"]) / done
                 sampling_metrics = learner.head.sampling_metrics()
                 metrics.update({f"train/{name}": value for name, value in sampling_metrics.items()})
                 training_log.scalars(metrics, iteration, env_steps=learner.sim_steps)
                 learner.stats = {key: [] for key in stats}
+                logged_sim_steps = learner.sim_steps
                 log_started = now
             if iteration % checkpoint_interval == 0 or iteration == num_iterations:
                 path = self._context.run_dir / "checkpoints" / f"ckpt_{iteration:06d}.pt"

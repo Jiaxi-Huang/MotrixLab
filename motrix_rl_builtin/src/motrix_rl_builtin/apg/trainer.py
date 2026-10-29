@@ -216,6 +216,7 @@ class Trainer(TrainerBase):
         sequence = replacements = 0
         started = time.monotonic()
         log_started = started
+        logged_sim_steps = learner.sim_steps
         try:
             collector.start()
             error_sender.close()
@@ -302,6 +303,10 @@ class Trainer(TrainerBase):
                                 / max(block.get("collector_elapsed_s", 0.0), 1e-9)
                             ),
                             "train/ingest_fps": float(credit.steps * learner.num_envs / max(now - started, 1e-9)),
+                            # Canonical live-metrics key: env steps since the
+                            # last log point over wall time.
+                            "perf/env_steps_per_s": (learner.sim_steps - logged_sim_steps)
+                            / max(now - log_started, 1e-9),
                         }
                         if learner.iteration > cfg.wm_only_iters:
                             metrics.update(
@@ -314,12 +319,17 @@ class Trainer(TrainerBase):
                                 }
                             )
                         if done:
-                            metrics["train/episode_length"] = sum(stats["ep_len_sum"]) / done
+                            # Canonical live-metrics rollout means (plus the
+                            # legacy train/* alias kept for existing panels).
+                            rollout = learner.episode_metrics()
+                            metrics.update(rollout)
+                            metrics["train/episode_length"] = rollout["rollout/mean_ep_len"]
                             metrics["train/termination_fraction"] = sum(stats["term"]) / done
                         sampling_metrics = learner.head.sampling_metrics()
                         metrics.update({f"train/{name}": value for name, value in sampling_metrics.items()})
                         training_log.scalars(metrics, learner.iteration, env_steps=learner.sim_steps)
                         learner.stats = {key: [] for key in stats}
+                        logged_sim_steps = learner.sim_steps
                         log_started = now
                     if learner.iteration % checkpoint_interval == 0 or learner.iteration == num_iterations:
                         if wm_client is not None:
