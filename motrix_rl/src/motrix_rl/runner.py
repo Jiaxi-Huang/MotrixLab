@@ -18,7 +18,7 @@ from motrix_rl.result import TrainResult
 logger = logging.getLogger(__name__)
 
 # Learning-curve family the live dashboard picks its charts by, keyed by agent name.
-_METRICS_FAMILIES = {"fastsac": "rl.offpolicy", "ppo": "rl.onpolicy"}
+_METRICS_FAMILIES = {"fastsac": "rl.offpolicy", "apg": "rl.offpolicy", "ppo": "rl.onpolicy"}
 
 
 @dataclass(frozen=True)

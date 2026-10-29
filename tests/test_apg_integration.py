@@ -11,7 +11,7 @@ the manager kernels lives in ``motrix_envs/tests``.
 """
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import numpy as np
@@ -29,10 +29,31 @@ from motrix_envs.locomotion.supermimic.g1 import SuperMimicManagerEnv, make_g1_s
 from motrix_envs.locomotion.wbt.g1.common import MOTION_DIR
 from motrix_rl.config import CheckpointConfig, LoggingConfig
 from motrix_rl.contracts import TrainerContext
+from motrix_rl.runs import RunMetadata
 
 _DANCE_MOTION = MOTION_DIR / "dance" / "dance1_subject2.npz"
 
 pytestmark = [pytest.mark.numba, pytest.mark.integration]
+
+
+def _seed_run_metadata(run_dir: Path, env_name: str = "g1-supermimic") -> None:
+    """Mirror the runner: trainers annotate metadata.json, so create it first.
+
+    Real runs go through ``runs.create_run_context`` before the trainer sees
+    the run directory; these tests build ``TrainerContext`` by hand and need
+    the same seed record for the trainers' ``annotate_run`` calls.
+    """
+    run_dir.mkdir(parents=True, exist_ok=True)
+    metadata = RunMetadata(
+        env_name=env_name,
+        rllib="motrix",
+        train_backend="torch",
+        algo="apg",
+        seed=1,
+        created_at="1970-01-01T00:00:00",
+        checkpoint_format="pt",
+    )
+    (run_dir / "metadata.json").write_text(json.dumps(asdict(metadata), indent=2), encoding="utf-8")
 
 
 def _corpus(tmp_path, lengths=(160, 140)) -> tuple[str, ...]:
@@ -140,6 +161,7 @@ def test_apg_trainer_runs_two_iterations(tmp_path, monkeypatch):
         checkpoint=CheckpointConfig(interval=1),
     )
 
+    _seed_run_metadata(context.run_dir, "g1-supermimic")
     Trainer(context=context).train()
 
     final = tmp_path / "run" / "checkpoints" / "latest.pt"
@@ -158,6 +180,7 @@ def test_apg_trainer_runs_two_iterations(tmp_path, monkeypatch):
     cfg.trainer.initialize_from = str(final)
     cfg.trainer.num_learning_iterations = 1
     next_run = tmp_path / "initialized"
+    _seed_run_metadata(next_run, "g1-supermimic")
     Trainer(context=replace(context, run_dir=next_run, checkpoint_dir=next_run / "checkpoints")).train()
     initialized = torch.load(next_run / "checkpoints" / "latest.pt", map_location="cpu", weights_only=False)
     assert initialized["iteration"] == 1
@@ -186,6 +209,7 @@ def test_apg_sync_trainer_runs_two_iterations(tmp_path, monkeypatch):
         checkpoint=CheckpointConfig(interval=1),
     )
 
+    _seed_run_metadata(run_dir, "g1-supermimic")
     SyncTrainer(context=context).train()
 
     final = run_dir / "checkpoints" / "latest.pt"
@@ -198,6 +222,14 @@ def test_apg_sync_trainer_runs_two_iterations(tmp_path, monkeypatch):
     # the two iterations then collects 1 / utd = 2 steps before its serial
     # update, all on the in-process simulator.
     assert checkpoint["sim_steps"] == 6 * context.num_envs
+
+    # Trainer provenance lands in metadata.json: the run's device record
+    # (gpus_used is empty on a CPU-only host) and the end-of-run summary.
+    metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+    assert "system" in metadata and isinstance(metadata["system"]["gpus_used"], list)
+    assert metadata["performance"]["iterations"] == 2
+    assert metadata["performance"]["total_env_steps"] == 6 * context.num_envs
+    assert metadata["performance"]["mean_env_steps_per_s"] > 0
 
 
 def test_apg_quadruped_sync_trainer_runs_two_iterations(tmp_path):
@@ -226,6 +258,7 @@ def test_apg_quadruped_sync_trainer_runs_two_iterations(tmp_path):
         checkpoint=CheckpointConfig(interval=1),
     )
 
+    _seed_run_metadata(run_dir, "go2-walk-flat")
     SyncTrainer(context=context).train()
 
     final = run_dir / "checkpoints" / "latest.pt"
@@ -263,6 +296,7 @@ def test_apg_per_clip_evaluation(tmp_path, monkeypatch):
         logging=LoggingConfig(backend="tensorboard", interval=1),
         checkpoint=CheckpointConfig(interval=1),
     )
+    _seed_run_metadata(context.run_dir, "g1-supermimic")
     Trainer(context=context).train()
     checkpoint = torch.load(run_dir / "checkpoints" / "latest.pt", map_location="cpu", weights_only=False)
 
@@ -326,6 +360,7 @@ def test_apg_eval_script_runs(tmp_path, monkeypatch, capsys):
         logging=LoggingConfig(backend="tensorboard", interval=1),
         checkpoint=CheckpointConfig(interval=1),
     )
+    _seed_run_metadata(context.run_dir, "g1-supermimic")
     Trainer(context=context).train()
 
     spec = importlib.util.spec_from_file_location(

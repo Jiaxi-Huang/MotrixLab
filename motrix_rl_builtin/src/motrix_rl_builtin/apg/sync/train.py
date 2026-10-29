@@ -22,10 +22,13 @@ from motrix_env_core.renderer import create_renderer
 from motrix_rl import checkpoints
 from motrix_rl.contracts import TrainerBase, TrainerContext
 from motrix_rl.device import resolve_default_device
+from motrix_rl.runs import annotate_run
+from motrix_rl.system_metrics import capture_system_info
 from motrix_rl.training_logger import TrainingLogger
 from motrix_rl_builtin.apg.config import ApgCfg
 from motrix_rl_builtin.apg.contracts import build_head, require_apg_env
 from motrix_rl_builtin.apg.learner import ApgLearner
+from motrix_rl_builtin.apg.live import SystemScalars
 from motrix_rl_builtin.apg.rollout import shift_history
 
 
@@ -99,6 +102,10 @@ class Trainer(TrainerBase):
                 f"num_envs={learner.num_envs} iters={num_iterations} (from {learner.iteration})"
             )
             training_log.event("run_started", step=learner.iteration)
+            # Provenance in metadata.json: the device this run actually uses,
+            # plus the performance summary written at the end of train().
+            annotate_run(run_dir, system=capture_system_info(fallback_device=learner.device))
+            train_started_at = time.perf_counter()
 
             def record(path) -> None:
                 checkpoints.record_checkpoint_artifact(
@@ -130,6 +137,18 @@ class Trainer(TrainerBase):
             )
             print(f"[motrix.apg sync] saved checkpoint to {ckpt_path}")
             training_log.event("checkpoint_saved", step=learner.iteration, path=str(ckpt_path))
+            wall_time_s = time.perf_counter() - train_started_at
+            annotate_run(
+                run_dir,
+                system=capture_system_info(fallback_device=learner.device),
+                performance={
+                    "num_envs": learner.num_envs,
+                    "iterations": learner.iteration,
+                    "total_env_steps": learner.sim_steps,
+                    "wall_time_s": round(wall_time_s, 1),
+                    "mean_env_steps_per_s": int(learner.sim_steps / max(wall_time_s, 1e-9)),
+                },
+            )
         finally:
             training_log.close()
 
@@ -165,6 +184,7 @@ class Trainer(TrainerBase):
         # window, and one observation history.
         learner.collect(max(cfg.warmup_steps, cfg.wm_window, cfg.hist))
         accumulator = 0.0
+        host_scalars = SystemScalars()
         started = time.monotonic()
         log_started = started
         logged_sim_steps = learner.sim_steps
@@ -217,7 +237,7 @@ class Trainer(TrainerBase):
                     metrics["train/termination_fraction"] = sum(stats["term"]) / done
                 sampling_metrics = learner.head.sampling_metrics()
                 metrics.update({f"train/{name}": value for name, value in sampling_metrics.items()})
-                training_log.scalars(metrics, iteration, env_steps=learner.sim_steps)
+                training_log.scalars(metrics, iteration, env_steps=learner.sim_steps, live_extra=host_scalars.sample)
                 learner.stats = {key: [] for key in stats}
                 logged_sim_steps = learner.sim_steps
                 log_started = now
