@@ -9,6 +9,7 @@ from typing import Generic, TypeVar
 import gymnasium as gym
 import numpy as np
 
+from motrix_env_core.array_api import Array, array_namespace, is_array, resolve_namespace
 from motrix_env_core.base import ABEnv, EnvCfg, ObsSpace
 from motrix_env_core.perf import Perf, perf_root
 from motrix_env_core.sim.backend import (
@@ -24,12 +25,18 @@ EnvCfgType = TypeVar("EnvCfgType", bound=EnvCfg)
 
 
 @dataclass
-class NpObs:
-    policy: np.ndarray
-    value: np.ndarray | None = None
+class Obs:
+    """Observation pair with an optional value branch.
+
+    Arrays belong to the frontend namespace the environment was constructed
+    with (NumPy by default, Torch when ``ns="torch"``).
+    """
+
+    policy: Array
+    value: Array | None = None
 
     @property
-    def value_or_policy(self) -> np.ndarray:
+    def value_or_policy(self) -> Array:
         return self.policy if self.value is None else self.value
 
 
@@ -41,36 +48,39 @@ class FinalObs:
     consumers must treat them as read-only. ``obs.value`` stays optional.
     """
 
-    env_ids: np.ndarray
-    obs: NpObs
+    env_ids: Array
+    obs: Obs
+
+    def __len__(self) -> int:
+        return len(self.env_ids)
 
 
 @dataclass
 class ArrayEnvState:
-    obs: NpObs
-    reward: np.ndarray
-    terminated: np.ndarray
-    truncated: np.ndarray
-    episode_steps: np.ndarray
+    obs: Obs
+    reward: Array
+    terminated: Array
+    truncated: Array
+    episode_steps: Array
     # Per-term reward breakdown for the latest transition: term name to a
     # ``(num_envs,)`` array. Freshly written every transition; empty when the
     # environment does not decompose its reward.
-    reward_terms: dict[str, np.ndarray] = dataclasses.field(default_factory=dict)
+    reward_terms: dict[str, Array] = dataclasses.field(default_factory=dict)
     # Live diagnostics view: per-environment quantities stay unreduced as
     # ``(num_envs,)`` arrays and are views into manager buffers that kernels
     # overwrite every step; batch-level gauges are scalars. Values always
     # reflect the latest step: retain values across steps through
     # :meth:`process_metrics`, which returns a fresh dict of reduced scalars.
-    metrics: dict[str, float | np.ndarray] = dataclasses.field(default_factory=dict)
+    metrics: dict[str, float | Array] = dataclasses.field(default_factory=dict)
     # None when no row truncated or the implementation does not capture finals.
     final_obs: FinalObs | None = None
 
     @property
-    def done(self) -> np.ndarray:
+    def done(self) -> Array:
         """
         Check if the environment is done.
         """
-        return np.logical_or(self.terminated, self.truncated)
+        return self.terminated | self.truncated
 
     def replace(self, **updates) -> "ArrayEnvState":
         return dataclasses.replace(self, **updates)
@@ -83,7 +93,7 @@ class ArrayEnvState:
         safe to retain across steps, unlike the raw ``metrics`` arrays.
         """
         return {
-            name: float(np.mean(value)) if isinstance(value, np.ndarray) else float(value)
+            name: float(array_namespace(value).mean(value)) if is_array(value) else float(value)
             for name, value in self.metrics.items()
         }
 
@@ -98,6 +108,12 @@ class ArrayEnvState:
         assert self.episode_steps.shape == (num_envs,), self.episode_steps.shape
 
 
+def _as_obs(obs: Obs | Array) -> Obs:
+    if isinstance(obs, Obs):
+        return obs
+    return Obs(policy=obs)
+
+
 def _as_obs_space(space: gym.Space | ObsSpace) -> ObsSpace:
     if isinstance(space, ObsSpace):
         return space
@@ -105,33 +121,47 @@ def _as_obs_space(space: gym.Space | ObsSpace) -> ObsSpace:
     return ObsSpace(policy=space)
 
 
-def _as_obs(obs: NpObs | np.ndarray) -> NpObs:
-    if isinstance(obs, NpObs):
-        return obs
-    assert isinstance(obs, np.ndarray)
-    return NpObs(policy=obs)
-
-
 class ArrayEnv(ABEnv, Generic[EnvCfgType]):
-    """Simulator-agnostic NumPy frontend environment lifecycle.
+    """Namespace-generic frontend environment lifecycle.
 
     ``ArrayEnv`` owns the step / auto-reset / truncation lifecycle shared by
-    NumPy-frontend environments. It is deliberately free of simulator-state
-    concepts: subclasses address simulator rows themselves inside the reset
-    hooks, so the frontend only ever speaks in environment indices.
+    NumPy- and Torch-frontend environments. It is deliberately free of
+    simulator-state concepts: subclasses address simulator rows themselves
+    inside the reset hooks, so the frontend only ever speaks in environment
+    indices.
+
+    The lifecycle speaks the Array API: subclass implementations read arrays
+    from ``self.xp`` and use operators/indexing so the same code runs on both
+    namespaces. Namespace-specific functions (``zeros``, ``nonzero``, dtypes)
+    are bound once in ``__init__`` so the per-step path never resolves the
+    namespace again.
     """
 
     _cfg: EnvCfgType
     _state: ArrayEnvState = None
     _render_spacing: float
 
-    def __init__(self, cfg: EnvCfgType, num_envs: int = 1):
+    def __init__(self, cfg: EnvCfgType, num_envs: int = 1, ns: str = "numpy"):
         self._cfg = cfg
         self._num_envs = num_envs
         self.perf = Perf()
         if cfg.scene is None:
             raise ValueError("EnvCfg.scene must be configured")
         self._render_spacing = cfg.render_spacing
+        self.xp = resolve_namespace(ns)
+        # Pre-bind the namespace functions the per-step lifecycle uses so the
+        # hot path holds direct function references instead of attribute
+        # lookups on the namespace module.
+        self._zeros = self.xp.zeros
+        self._ones = self.xp.ones
+        # Array API standard: nonzero returns a tuple of index arrays; the
+        # done mask is 1-D so its indices are the first element.
+        self._nonzero = self.xp.nonzero
+        self._bool_dtype = self.xp.bool
+        self._f32_dtype = self.xp.float32
+        # int64 rather than uint64: torch implements index assignment for
+        # signed counters only, and episode lengths stay far below 2**63.
+        self._i64_dtype = self.xp.int64
 
     @property
     def state(self) -> ArrayEnvState:
@@ -163,10 +193,11 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         Create a new environment state
         """
         obs = self._zeros_obs(self.observation_space)
-        reward = np.zeros((self._num_envs,), dtype=np.float32)
-        terminated = np.ones((self._num_envs,), dtype=bool)
-        truncated = np.zeros((self._num_envs,), dtype=bool)
-        episode_steps = np.zeros((self._num_envs,), dtype=np.uint64)
+        reward = self._zeros((self._num_envs,), dtype=self._f32_dtype)
+        # All lanes start terminated so the first reset pass covers the batch.
+        terminated = self._ones((self._num_envs,), dtype=self._bool_dtype)
+        truncated = self._zeros((self._num_envs,), dtype=self._bool_dtype)
+        episode_steps = self._zeros((self._num_envs,), dtype=self._i64_dtype)
         self._state = self._new_state(obs, reward, terminated, truncated, episode_steps)
         self._reset_done_envs()
         with self.perf.scope("observation"):
@@ -177,11 +208,11 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
 
     def _new_state(
         self,
-        obs: NpObs,
-        reward: np.ndarray,
-        terminated: np.ndarray,
-        truncated: np.ndarray,
-        episode_steps: np.ndarray,
+        obs: Obs,
+        reward: Array,
+        terminated: Array,
+        truncated: Array,
+        episode_steps: Array,
     ) -> ArrayEnvState:
         """Assemble the environment state; subclasses add simulator-owned fields."""
         return ArrayEnvState(
@@ -204,15 +235,22 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
     def has_value_observation(self) -> bool:
         return _as_obs_space(self.observation_space).value is not None
 
-    def _zeros_box(self, space: gym.spaces.Box) -> np.ndarray:
-        return np.zeros((self._num_envs, *space.shape), dtype=space.dtype)
+    def _zeros_box(self, space: gym.spaces.Box) -> Array:
+        # Gym spaces carry NumPy dtypes; map through the namespace so Torch
+        # allocators receive a torch dtype.
+        dtype = self._map_dtype(space.dtype)
+        return self._zeros((self._num_envs, *space.shape), dtype=dtype)
 
-    def _zeros_obs(self, space: gym.Space | ObsSpace) -> NpObs:
+    def _map_dtype(self, dtype) -> "Array":
+        """Translate a NumPy/gym dtype into the frontend namespace's dtype."""
+        return getattr(self.xp, np.dtype(dtype).name, dtype)
+
+    def _zeros_obs(self, space: gym.Space | ObsSpace) -> Obs:
         obs_space = _as_obs_space(space)
         value = None if obs_space.value is None else self._zeros_box(obs_space.value)
-        return NpObs(policy=self._zeros_box(obs_space.policy), value=value)
+        return Obs(policy=self._zeros_box(obs_space.policy), value=value)
 
-    def _assign_obs(self, dst: NpObs, mask: np.ndarray, src: NpObs | np.ndarray):
+    def _assign_obs(self, dst: Obs, mask: Array, src: Obs | Array):
         src = _as_obs(src)
         dst.policy[mask] = src.policy
         if dst.value is not None:
@@ -229,18 +267,20 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         with self.perf.scope("done_mask"):
             done = state.done
             assert done.shape == (self._num_envs,)
-            has_done = np.any(done)
+            has_done = bool(done.any())
         if not has_done:
             return
 
         with self.perf.scope("select_done"):
-            np.putmask(state.episode_steps, done, 0)
-            env_ids = np.flatnonzero(done)
+            # Index assignment (not masked_fill): torch does not implement
+            # masked assignment for signed step counters.
+            env_ids = self._nonzero(done)[0]
+            state.episode_steps[env_ids] = 0
         with self.perf.scope("reset_envs"):
             self.reset(env_ids)
 
     @abc.abstractmethod
-    def reset(self, env_ids: np.ndarray) -> None:
+    def reset(self, env_ids: Array) -> None:
         """Write reset rows for the selected environments.
 
         Subclasses address their simulator's rows themselves. Observation
@@ -248,7 +288,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         writes have completed.
         """
 
-    def _capture_final_obs(self, env_ids: np.ndarray) -> FinalObs | None:
+    def _capture_final_obs(self, env_ids: Array) -> FinalObs | None:
         """Capture truncated rows before reset; default implementation is unsupported.
 
         Called after transition and truncation updates, before any reset write.
@@ -274,13 +314,13 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         """Create the backend-owned renderer bound to this environment."""
 
     @abc.abstractmethod
-    def apply_action(self, actions: np.ndarray, state: ArrayEnvState) -> ArrayEnvState:
+    def apply_action(self, actions: Array, state: ArrayEnvState) -> ArrayEnvState:
         """
         Apply the action to the environment
 
         Args:
-            actions (np.ndarray): The actions to apply
-            state (ArrayEnvState): The environment state to apply the actions.
+            actions: The actions to apply
+            state: The environment state to apply the actions.
         """
 
     @abc.abstractmethod
@@ -294,7 +334,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         observations belong to :meth:`compute_observation`.
 
         Args:
-            state (ArrayEnvState): The environment state to update
+            state: The environment state to update
         """
 
     @abc.abstractmethod
@@ -305,9 +345,11 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         if self._state.final_obs is not None:
             self._state = self._state.replace(final_obs=None)
         state = self._state
-        state.reward.fill(0.0)
-        state.terminated.fill(False)
-        state.truncated.fill(False)
+        # Broadcast assignment instead of ``fill``/``fill_``: NumPy and Torch
+        # agree on ``arr[:] = scalar``.
+        state.reward[:] = 0.0
+        state.terminated[:] = False
+        state.truncated[:] = False
 
     def compute_observation(self, state: ArrayEnvState) -> ArrayEnvState:
         """Compute observations for all environments after reset.
@@ -322,7 +364,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         return state
 
     @perf_root("step")
-    def step(self, actions: np.ndarray) -> ArrayEnvState:
+    def step(self, actions: Array) -> ArrayEnvState:
         """Advance one control step.
 
         Timing: ``apply_action`` -> ``physics_step`` -> ``compute_transition``
@@ -345,8 +387,8 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
             self._state = self.compute_transition(self._state)
         self._state.episode_steps += 1
         self._update_truncate()
-        trunc_ids = np.flatnonzero(self._state.truncated)
-        if trunc_ids.size:
+        trunc_ids = self._nonzero(self._state.truncated)[0]
+        if len(trunc_ids):
             with self.perf.scope("final_obs"):
                 self._state = self._state.replace(final_obs=self._capture_final_obs(trunc_ids))
         with self.perf.scope("reset"):
@@ -357,4 +399,4 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         return self._state
 
 
-__all__ = ["ArrayEnv", "ArrayEnvState", "EnvCfgType", "FinalObs", "NpObs"]
+__all__ = ["ArrayEnv", "ArrayEnvState", "EnvCfgType", "FinalObs", "Obs"]

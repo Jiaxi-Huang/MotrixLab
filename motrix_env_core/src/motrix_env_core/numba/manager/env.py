@@ -13,7 +13,7 @@ from typing import Any, TypeVar
 import gymnasium as gym
 import numpy as np
 
-from motrix_env_core.array.env import ArrayEnv, ArrayEnvState, EnvCfgType, FinalObs, NpObs
+from motrix_env_core.array.env import ArrayEnv, ArrayEnvState, EnvCfgType, FinalObs, Obs
 from motrix_env_core.base import EnvCfg, ObsSpace
 from motrix_env_core.config import configclass
 from motrix_env_core.config.sim_reset import ManagerResetCfg, ResetTermCfg
@@ -282,11 +282,11 @@ class CompiledManagerProgram(abc.ABC):
 
 @dataclass(frozen=True)
 class _ObsBufferSlot:
-    observation: NpObs
+    observation: Obs
     kernel_outputs: NumbaKernelOutputs
 
     @classmethod
-    def bind(cls, observation: NpObs, reward: np.ndarray, terminated: np.ndarray) -> _ObsBufferSlot:
+    def bind(cls, observation: Obs, reward: np.ndarray, terminated: np.ndarray) -> _ObsBufferSlot:
         value = observation.value
         if value is None:
             value = np.empty((observation.policy.shape[0], 0), dtype=observation.policy.dtype)
@@ -305,7 +305,7 @@ class _ObsBufferSlot:
 class SwapObsBuffer:
     """Alternate two preallocated observation slots without copying.
 
-    Each slot binds an exposed ``NpObs`` to ``NumbaKernelOutputs`` that write
+    Each slot binds an exposed ``Obs`` to ``NumbaKernelOutputs`` that write
     into the same policy/value arrays. Swapping both together before the next
     kernel call keeps ``obs_t`` unchanged while a transition consumer retains
     it and the kernel produces ``obs_t+1`` in the other slot.
@@ -321,8 +321,8 @@ class SwapObsBuffer:
     @classmethod
     def create(
         cls,
-        first: NpObs,
-        second: NpObs,
+        first: Obs,
+        second: Obs,
         reward: np.ndarray,
         terminated: np.ndarray,
     ) -> SwapObsBuffer:
@@ -332,7 +332,7 @@ class SwapObsBuffer:
     def current(self) -> _ObsBufferSlot:
         return self._slots[self._index]
 
-    def swap(self) -> tuple[NpObs, NumbaKernelOutputs]:
+    def swap(self) -> tuple[Obs, NumbaKernelOutputs]:
         self._index = 1 - self._index
         slot = self.current
         return slot.observation, slot.kernel_outputs
@@ -565,7 +565,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         obs = slot.observation
         return FinalObs(
             env_ids=env_ids,
-            obs=NpObs(
+            obs=Obs(
                 policy=obs.policy[env_ids],
                 value=None if obs.value is None else obs.value[env_ids],
             ),
