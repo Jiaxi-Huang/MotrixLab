@@ -57,6 +57,11 @@ video = [
     "imageio>=2.30",
     "imageio-ffmpeg>=0.5",
 ]
+# Torch frontend namespace (ArrayEnv(ns="torch")). Core itself never imports
+# torch on the NumPy path; this extra installs it for the torch flavor.
+torch = [
+    "torch>=2.7,<3",
+]
 # Everything the training-side workspace needs from this package.
 all = [
     "motrix-env-core[numba,video]",

@@ -30,7 +30,7 @@ class EnvCfg:
 
     scene: SceneCfg | None = None
     sim: SimCfg = SimCfg()
-    max_episode_seconds: float = None
+    max_episode_seconds: float | None = None
     ctrl_dt: float = 0.01
     render_spacing: float = 1.0
 

@@ -34,8 +34,46 @@ def is_array(value: object) -> TypeGuard[Array]:
     return (is_numpy_array(value) and isinstance(value, np.ndarray)) or is_torch_array(value)
 
 
+def resolve_namespace(name: str) -> ModuleType:
+    """Resolve a frontend namespace name into its Array API module.
+
+    ``"numpy"`` and ``"torch"`` are the two supported frontend flavors. The
+    returned modules follow the Array API standard names (``zeros``,
+    ``flatnonzero``, ``bool``, ...) so callers can bind functions once and
+    stay namespace-agnostic afterwards. Torch is imported lazily: core
+    installs without it.
+    """
+    if name == "numpy":
+        import array_api_compat.numpy as xp
+
+        return xp
+    if name == "torch":
+        import array_api_compat.torch as xp
+
+        return xp
+    raise ValueError(f"Unknown array namespace {name!r}; expected 'numpy' or 'torch'.")
+
+
+def namespace_flatnonzero(xp: ModuleType):
+    """Bind the namespace's nonzero-indices function.
+
+    NumPy exposes ``flatnonzero``; the Torch compat namespace does not, so its
+    adapter is built from ``nonzero``. Both return integer index arrays.
+    """
+    flatnonzero = getattr(xp, "flatnonzero", None)
+    if flatnonzero is not None:
+        return flatnonzero
+
+    def _torch_flatnonzero(mask):
+        return xp.nonzero(mask)[0]
+
+    return _torch_flatnonzero
+
+
 __all__ = [
     "Array",
     "array_namespace",
     "is_array",
+    "namespace_flatnonzero",
+    "resolve_namespace",
 ]
