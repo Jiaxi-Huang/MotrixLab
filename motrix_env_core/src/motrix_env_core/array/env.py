@@ -9,7 +9,7 @@ from typing import Generic, TypeVar
 import gymnasium as gym
 import numpy as np
 
-from motrix_env_core.array_api import Array, namespace_flatnonzero, resolve_namespace
+from motrix_env_core.array_api import Array, array_namespace, is_array, resolve_namespace
 from motrix_env_core.base import ABEnv, EnvCfg, ObsSpace
 from motrix_env_core.perf import Perf, perf_root
 from motrix_env_core.sim.backend import (
@@ -92,14 +92,8 @@ class ArrayEnvState:
         rates); scalars pass through. The result is a fresh, small dict that is
         safe to retain across steps, unlike the raw ``metrics`` arrays.
         """
-        import torch
-
-        from motrix_env_core.array_api import array_namespace
-
         return {
-            name: float(array_namespace(value).mean(value))
-            if isinstance(value, (np.ndarray, torch.Tensor))
-            else float(value)
+            name: float(array_namespace(value).mean(value)) if is_array(value) else float(value)
             for name, value in self.metrics.items()
         }
 
@@ -138,7 +132,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
 
     The lifecycle speaks the Array API: subclass implementations read arrays
     from ``self.xp`` and use operators/indexing so the same code runs on both
-    namespaces. Namespace-specific functions (``zeros``, ``flatnonzero``, dtypes)
+    namespaces. Namespace-specific functions (``zeros``, ``nonzero``, dtypes)
     are bound once in ``__init__`` so the per-step path never resolves the
     namespace again.
     """
@@ -160,7 +154,9 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         # lookups on the namespace module.
         self._zeros = self.xp.zeros
         self._ones = self.xp.ones
-        self._flatnonzero = namespace_flatnonzero(self.xp)
+        # Array API standard: nonzero returns a tuple of index arrays; the
+        # done mask is 1-D so its indices are the first element.
+        self._nonzero = self.xp.nonzero
         self._bool_dtype = self.xp.bool
         self._f32_dtype = self.xp.float32
         # int64 rather than uint64: torch implements index assignment for
@@ -277,8 +273,8 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
 
         with self.perf.scope("select_done"):
             # Index assignment (not masked_fill): torch does not implement
-            # masked assignment for uint64 step counters.
-            env_ids = self._flatnonzero(done)
+            # masked assignment for signed step counters.
+            env_ids = self._nonzero(done)[0]
             state.episode_steps[env_ids] = 0
         with self.perf.scope("reset_envs"):
             self.reset(env_ids)
@@ -391,7 +387,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
             self._state = self.compute_transition(self._state)
         self._state.episode_steps += 1
         self._update_truncate()
-        trunc_ids = self._flatnonzero(self._state.truncated)
+        trunc_ids = self._nonzero(self._state.truncated)[0]
         if len(trunc_ids):
             with self.perf.scope("final_obs"):
                 self._state = self._state.replace(final_obs=self._capture_final_obs(trunc_ids))
