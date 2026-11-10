@@ -276,8 +276,233 @@ class AdaptiveTimestepsSampler(MotionStartSampler):
         self.sampling_cdf.copy_(cdf)
 
 
+def per_clip_bins(clip: WbtMotionClip, bin_frames: int) -> tuple[np.ndarray, np.ndarray]:
+    """Fixed one-per-``bin_frames`` start windows per clip: ``(start, span)``.
+
+    Windows are integer global-frame ranges inside one clip; each span ends
+    before its clip's terminal frame (span clamped to the clip end and to one
+    frame minimum), so a drawn start never begins on a terminal frame while a
+    nonterminal one exists in that clip.
+    """
+    ends_per_frame = clip.frame_clip_end.numpy()
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(ends_per_frame) != 0) + 1)).astype(np.int64)
+    ends = ends_per_frame[starts]
+    bin_start = []
+    bin_span = []
+    for start, end in zip(starts, ends):
+        for frame in range(int(start), max(int(end), int(start) + 1), int(bin_frames)):
+            bin_start.append(frame)
+            bin_span.append(min(max(int(end) - frame, 1), int(bin_frames)))
+    return np.asarray(bin_start, dtype=np.int64), np.asarray(bin_span, dtype=np.int64)
+
+
+def max_discounted_return(ctrl_dt: float, positive_reward_sum: float, sampling_gamma: float) -> float:
+    """Softmax normalizer: the task's largest achievable discounted return.
+
+    Derived from the configured reward weights (no copied value): the per-step
+    maximum reward summed over the discount horizon.
+    """
+    return ctrl_dt * positive_reward_sum / max(1.0 - sampling_gamma, 1e-6)
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnTimestepsSampler(MotionStartSampler):
+    """Return-based start sampling: prefer starts the policy performs worst on.
+
+    Each lane accumulates its open episode's discounted return
+    (``fold_step`` folds ``ctx.reward`` — the transition's own reward — every
+    ``advance``). At an episode reset the finished return is folded into an
+    EMA per start bin (``fold_episode_stats``; truncated episodes bootstrap
+    their remaining value from the mean step reward, terminated ones do not),
+    and the sampling distribution mixes a uniform prior, a softmax that
+    favors low-return bins, and a slow history prior (``rebuild``).
+
+    Bins are the fixed integer windows of :func:`per_clip_bins`; sampling
+    addresses them by integer offsets, so corpora beyond float32 frame
+    precision stay exact.
+    """
+
+    bin_start: torch.Tensor  # (B,) int64 global start frame of each bin
+    bin_span: torch.Tensor  # (B,) int64 frames covered by each bin
+    sampling_cdf: torch.Tensor  # (B,) float32
+    bin_return: torch.Tensor  # (B,) float32 EMA of per-bin mean episode return
+    bin_history: torch.Tensor  # (B,) float32 slow sampling-frequency prior (uniform)
+
+    # Per-lane open-episode accumulators, ``N`` lanes.
+    lane_return: torch.Tensor  # (N,) float32 discounted return so far
+    lane_undiscounted: torch.Tensor  # (N,) float32 plain reward sum
+    lane_gamma: torch.Tensor  # (N,) float32 discount power reached
+    lane_steps: torch.Tensor  # (N,) int64 transitions accumulated
+    lane_start_bin: torch.Tensor  # (N,) int64 bin the episode started from
+
+    num_frames: int
+    uniform_mix: float
+    return_mix: float
+    history_mix: float
+    sampling_gamma: float
+    return_ema: float
+    g_max: float
+
+    # Batch-level gauges written by the rebuild pass.
+    mean_bin_return: torch.Tensor = metric(name="return_sampling_mean_bin_return", scalar=True)
+    entropy: torch.Tensor = metric(name="return_sampling_entropy", scalar=True)
+    top1_prob: torch.Tensor = metric(name="return_sampling_top1_prob", scalar=True)
+    top1_bin: torch.Tensor = metric(name="return_sampling_top1_bin", scalar=True)
+
+    @property
+    def draw_count(self) -> int:
+        return 3
+
+    @staticmethod
+    def from_clip(
+        clip: WbtMotionClip,
+        env_fps: int,
+        num_envs: int,
+        *,
+        uniform_mix: float,
+        return_mix: float,
+        history_mix: float,
+        sampling_gamma: float,
+        return_ema: float,
+        g_max: float,
+    ) -> ReturnTimestepsSampler:
+        """Build the sampler over a clip corpus, accumulators zero-initialized."""
+        bin_start, bin_span = per_clip_bins(clip, env_fps)
+        num_bins = int(bin_start.size)
+        num_frames = clip.joint_pos.shape[0]
+        return ReturnTimestepsSampler(
+            bin_start=torch.from_numpy(bin_start),
+            bin_span=torch.from_numpy(bin_span),
+            sampling_cdf=torch.cumsum(torch.full((num_bins,), 1.0 / num_bins), dim=0),
+            bin_return=torch.zeros((num_bins,), dtype=torch.float32),
+            bin_history=torch.full((num_bins,), 1.0 / max(num_bins, 1), dtype=torch.float32),
+            lane_return=torch.zeros((num_envs,), dtype=torch.float32),
+            lane_undiscounted=torch.zeros((num_envs,), dtype=torch.float32),
+            lane_gamma=torch.ones((num_envs,), dtype=torch.float32),
+            lane_steps=torch.zeros((num_envs,), dtype=torch.int64),
+            lane_start_bin=torch.zeros((num_envs,), dtype=torch.int64),
+            num_frames=num_frames,
+            uniform_mix=float(uniform_mix),
+            return_mix=float(return_mix),
+            history_mix=float(history_mix),
+            sampling_gamma=float(sampling_gamma),
+            return_ema=float(return_ema),
+            g_max=float(g_max),
+            mean_bin_return=torch.zeros((), dtype=torch.float32),
+            entropy=torch.zeros((), dtype=torch.float32),
+            top1_prob=torch.zeros((), dtype=torch.float32),
+            top1_bin=torch.zeros((), dtype=torch.float32),
+        )
+
+    # -- Sampling ------------------------------------------------------------
+
+    def sample(self, draws: torch.Tensor, start_at_timestep_zero_prob: float) -> torch.Tensor:
+        unit = (draws[:, :1] + 1.0) * 0.5
+        bin_id = (self.sampling_cdf[None, :] < unit).sum(dim=1, dtype=torch.int64)
+        bin_unit = (draws[:, 1:2] + 1.0) * 0.5
+        # Integer addressing: keep the offset arithmetic in int64 so corpora
+        # beyond float32 frame precision stay exact.
+        offset = (bin_unit[:, 0] * self.bin_span[bin_id]).to(torch.int64)
+        steps = self.bin_start[bin_id] + offset
+        steps = torch.clamp(steps, min=0, max=self.num_frames - 2)
+        zero_unit = (draws[:, -1:] + 1.0) * 0.5
+        return torch.where(zero_unit[:, 0] < start_at_timestep_zero_prob, torch.zeros_like(steps), steps)
+
+    # -- Curriculum folds -------------------------------------------------------
+
+    def fold_step(self, ctx: ManagerContext) -> None:
+        """Fold this transition's reward into every lane's open-episode return."""
+        reward = ctx.reward
+        self.lane_return.add_(self.lane_gamma * reward)
+        self.lane_undiscounted.add_(reward)
+        self.lane_gamma.mul_(self.sampling_gamma)
+        self.lane_steps.add_(1)
+
+    def fold_episode_stats(
+        self,
+        idx: torch.Tensor,
+        reset_episode: torch.Tensor,
+        terminated: torch.Tensor,
+        steps: torch.Tensor,
+    ) -> None:
+        """Fold finished episodes' returns into the per-bin statistic.
+
+        ``advance`` already folded the dying transition's reward into
+        ``lane_return`` (the evaluate kernel publishes the reward total before
+        the advance hooks run), so the episode closes with its full return;
+        truncated episodes additionally bootstrap the remaining value from
+        their mean step reward, terminated ones do not. Expressed over the
+        full compact rows with masks (no data-dependent shapes): non-episode
+        rows contribute zero mass.
+        """
+        episode = reset_episode.to(torch.float32)
+        returns = self.lane_return[idx]
+        undiscounted = self.lane_undiscounted[idx]
+        lengths = self.lane_steps[idx].to(torch.float32)
+        bootstrap = torch.where(
+            ~terminated[idx] & reset_episode,
+            self.lane_gamma[idx]
+            * self.sampling_gamma
+            * (undiscounted / lengths.clamp(min=1.0))
+            / (1.0 - self.sampling_gamma),
+            torch.zeros_like(returns),
+        )
+        values = (returns + bootstrap) * episode
+        by_bin = torch.zeros_like(self.bin_return)
+        counts = torch.zeros_like(self.bin_return)
+        by_bin.index_add_(0, self.lane_start_bin[idx], values)
+        counts.index_add_(0, self.lane_start_bin[idx], episode)
+        touched = counts > 0
+        means = torch.where(touched, by_bin / counts.clamp(min=1.0), self.bin_return)
+        self.bin_return.copy_((1.0 - self.return_ema) * self.bin_return + self.return_ema * means)
+
+    def rebuild(self) -> None:
+        """Rebuild the sampling CDF from the per-bin return statistics."""
+        num_bins = self.bin_return.numel()
+        # Return-weighted preference: low-return bins get more mass.
+        scaled = -25.0 * self.bin_return / max(self.g_max, 1e-9)
+        soft = torch.exp(scaled - scaled.max())
+        soft = soft / soft.sum()
+        history = self.bin_history / self.bin_history.sum()
+        probability = self.uniform_mix / num_bins + self.return_mix * soft + self.history_mix * history
+        probability = probability / probability.sum()
+        self.mean_bin_return.copy_(self.bin_return.mean())
+        self.entropy.copy_(-(probability * torch.log(probability + 1e-12)).sum() / math.log(max(num_bins, 2)))
+        top_bin = torch.argmax(probability)
+        self.top1_prob.copy_(torch.gather(probability, 0, top_bin.reshape(1)).reshape(()))
+        self.top1_bin.copy_(top_bin.to(torch.float32) / float(num_bins))
+        cdf = torch.cumsum(probability, dim=0).to(torch.float32)
+        cdf[-1] = 1.0
+        self.sampling_cdf.copy_(cdf)
+
+    def mark_episode_starts(
+        self,
+        idx: torch.Tensor,
+        reset_episode: torch.Tensor,
+        steps: torch.Tensor,
+    ) -> None:
+        """Open new episodes on the episode-reset rows from the frames in place.
+
+        Sim-reset rows of the pass keep their open-episode accumulators: their
+        episode continues on the rematerialized frame.
+        """
+        # Global bin starts are sorted; the last (terminal) frame of a clip
+        # belongs to its final bin. Written over the full compact rows with a
+        # where-mask so no data-dependent shapes enter the reset kernel.
+        new_bins = (torch.searchsorted(self.bin_start, steps, right=True) - 1).clamp(min=0)
+        self.lane_start_bin[idx] = torch.where(reset_episode, new_bins, self.lane_start_bin[idx])
+        zeros = torch.zeros_like(self.lane_return[idx])
+        self.lane_return[idx] = torch.where(reset_episode, zeros, self.lane_return[idx])
+        self.lane_undiscounted[idx] = torch.where(reset_episode, zeros, self.lane_undiscounted[idx])
+        self.lane_gamma[idx] = torch.where(reset_episode, torch.ones_like(zeros), self.lane_gamma[idx])
+        self.lane_steps[idx] = torch.where(reset_episode, torch.zeros_like(self.lane_steps[idx]), self.lane_steps[idx])
+
+
 __all__ = [
     "AdaptiveTimestepsSampler",
     "MotionStartSampler",
+    "ReturnTimestepsSampler",
     "UniformTimestepsSampler",
+    "max_discounted_return",
+    "per_clip_bins",
 ]

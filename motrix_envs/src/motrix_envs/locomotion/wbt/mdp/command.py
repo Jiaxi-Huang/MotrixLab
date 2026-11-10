@@ -23,10 +23,12 @@ from motrix_envs.motion import MotionLibrary, WbtMotionClip
 from motrix_envs.motion.sampler import (
     AdaptiveTimestepsSampler,
     MotionStartSampler,
+    ReturnTimestepsSampler,
     UniformTimestepsSampler,
+    max_discounted_return,
 )
 
-_SAMPLING_MODES = ("uniform", "adaptive")
+_SAMPLING_MODES = ("uniform", "adaptive", "return")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,8 +193,14 @@ class WbtMotionCommandCfg(CommandCfg):
     alpha: float = 0.001
     kernel_size: int = 1
     kernel_lambda: float = 0.8
+    # Return-mode mixing and fold parameters (ignored by other modes).
+    uniform_mix: float = 0.5
+    return_mix: float = 0.4
+    history_mix: float = 0.1
+    sampling_gamma: float = 0.99
+    return_ema: float = 0.2
 
-    def _build_sampler(self, source: WbtMotionClip, env_fps: int) -> MotionStartSampler:
+    def _build_sampler(self, env: ManagerEnv, source: WbtMotionClip, env_fps: int) -> MotionStartSampler:
         if self.sampling_mode == "uniform":
             return UniformTimestepsSampler(num_frames=source.joint_pos.shape[0])
         if self.sampling_mode == "adaptive":
@@ -203,6 +211,26 @@ class WbtMotionCommandCfg(CommandCfg):
                 alpha=self.alpha,
                 kernel_size=self.kernel_size,
                 kernel_lambda=self.kernel_lambda,
+            )
+        if self.sampling_mode == "return":
+            # Softmax normalizer derived from the configured reward weights
+            # (no copied value): the task's largest achievable discounted
+            # return over the sampling horizon.
+            g_max = max_discounted_return(
+                env.cfg.ctrl_dt,
+                sum(cfg.weight for cfg in env.cfg.reward_cfgs().values() if cfg.weight > 0.0),
+                float(self.sampling_gamma),
+            )
+            return ReturnTimestepsSampler.from_clip(
+                source,
+                env_fps,
+                env.num_envs,
+                uniform_mix=self.uniform_mix,
+                return_mix=self.return_mix,
+                history_mix=self.history_mix,
+                sampling_gamma=self.sampling_gamma,
+                return_ema=self.return_ema,
+                g_max=g_max,
             )
         raise ValueError(f"commands.motion sampling_mode must be one of {_SAMPLING_MODES}, got {self.sampling_mode!r}.")
 
@@ -243,7 +271,7 @@ class WbtMotionCommandCfg(CommandCfg):
             command=torch.empty((num_envs, 2 * env.num_actuators), dtype=torch.float32),
             target_body_position_relative=torch.empty((num_envs, *tracked_shape), dtype=torch.float32),
             target_body_orientation_relative=torch.empty((num_envs, tracked_shape[0], 4), dtype=torch.float32),
-            sampler=self._build_sampler(source, env_fps),
+            sampler=self._build_sampler(env, source, env_fps),
             start_at_timestep_zero_prob=float(self.start_at_timestep_zero_prob),
             hold_at_clip_end=self.hold_at_clip_end,
             sequential_clips=self.sequential_clips,

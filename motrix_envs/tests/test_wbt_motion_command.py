@@ -22,7 +22,10 @@ from motrix_envs.locomotion.wbt.mdp.command import WbtMotionCommand
 from motrix_envs.motion import WbtMotionClip
 from motrix_envs.motion.sampler import (
     AdaptiveTimestepsSampler,
+    ReturnTimestepsSampler,
     UniformTimestepsSampler,
+    max_discounted_return,
+    per_clip_bins,
 )
 
 
@@ -110,6 +113,7 @@ def _ctx(
     reset_ids: torch.Tensor | None = None,
     reset_episode: torch.Tensor | None = None,
     terminated: torch.Tensor | None = None,
+    reward: torch.Tensor | None = None,
 ) -> ManagerContext:
     num_envs = state.shape[0]
     return ManagerContext(
@@ -125,7 +129,7 @@ def _ctx(
         # Compact reset-pass flags: one entry per lane in ``reset_ids``.
         reset_episode=torch.ones(0, dtype=torch.bool) if reset_episode is None else reset_episode,
         terminated=torch.zeros(num_envs, dtype=torch.bool) if terminated is None else terminated,
-        reward=torch.zeros(num_envs, dtype=torch.float32),
+        reward=torch.zeros(num_envs, dtype=torch.float32) if reward is None else reward,
     )
 
 
@@ -378,3 +382,161 @@ def test_uniform_sampler_draw_count_and_metric_gauges_rebuild():
     )
     command.reset(ctx)  # uniform sampler: folds and rebuilds are no-ops
     assert command.steps[1, 0].item() in range(0, 7)
+
+
+# -- return-mode curriculum ------------------------------------------------------
+
+
+def _return_sampler(num_frames: int, num_envs: int, env_fps: int = 25) -> ReturnTimestepsSampler:
+    return ReturnTimestepsSampler.from_clip(
+        _clip(num_frames),
+        env_fps,
+        num_envs,
+        uniform_mix=0.5,
+        return_mix=0.4,
+        history_mix=0.1,
+        sampling_gamma=0.99,
+        return_ema=0.2,
+        g_max=10.0,
+    )
+
+
+def test_per_clip_bins_cover_clips_without_terminal_frames():
+    start, span = per_clip_bins(_multi_clip((100, 10)), 25)
+    # Clip 0 (frames 0..99): bins at 0/25/50/75, tail span 24 (99 - 75);
+    # clip 1 (frames 100..109): one bin covering its non-terminal span.
+    assert start.tolist() == [0, 25, 50, 75, 100]
+    assert span.tolist() == [25, 25, 25, 24, 9]
+
+
+def test_max_discounted_return_formula():
+    assert max_discounted_return(0.02, 6.0, 0.99) == pytest.approx(0.02 * 6.0 / 0.01)
+
+
+def test_return_fold_step_accumulates_discounted_return():
+    sampler = _return_sampler(100, num_envs=2)
+    ctx = _ctx(torch.zeros((2, 1), dtype=torch.int64))
+    ctx.reward.copy_(torch.tensor([1.0, 0.5]))
+    sampler.fold_step(ctx)
+    sampler.fold_step(ctx)
+    assert sampler.lane_return.tolist() == [pytest.approx(1.0 + 0.99), pytest.approx(0.5 + 0.495)]
+    assert sampler.lane_undiscounted.tolist() == [2.0, 1.0]
+    assert sampler.lane_gamma.tolist() == [pytest.approx(0.9801)] * 2
+    assert sampler.lane_steps.tolist() == [2, 2]
+
+
+def test_return_fold_episode_stats_bootstraps_truncated_only():
+    sampler = _return_sampler(100, num_envs=2)
+    # Lane 0: terminated episode of 2 unit rewards from bin 1 → return 1.99.
+    # Lane 1: truncated episode of 2 unit rewards from bin 3 → return plus
+    # bootstrap gamma^2 * gamma * (2/2) / (1 - gamma).
+    sampler.lane_return[:] = torch.tensor([1.99, 1.99])
+    sampler.lane_undiscounted[:] = 2.0
+    sampler.lane_gamma[:] = 0.9801
+    sampler.lane_steps[:] = 2
+    sampler.lane_start_bin[:] = torch.tensor([1, 3], dtype=torch.int64)
+    idx = torch.tensor([0, 1])
+    sampler.fold_episode_stats(
+        idx,
+        reset_episode=torch.ones(2, dtype=torch.bool),
+        terminated=torch.tensor([True, False]),
+        steps=torch.tensor([50, 90], dtype=torch.int64),
+    )
+    bootstrap = 0.9801 * 0.99 * 1.0 / 0.01
+    expected0 = 0.2 * 1.99
+    expected1 = 0.2 * (1.99 + bootstrap)
+    assert sampler.bin_return[1].item() == pytest.approx(expected0, rel=1e-5)
+    assert sampler.bin_return[3].item() == pytest.approx(expected1, rel=1e-5)
+    # Untouched bins stay at zero.
+    assert sampler.bin_return[0].item() == 0.0
+    assert sampler.bin_return[2].item() == 0.0
+
+
+def test_return_rebuild_matches_previous_attempt_mixture():
+    """The rebuilt distribution is the recovered SuperMimic mixture verbatim."""
+    sampler = _return_sampler(100, num_envs=1)
+    sampler.bin_return.copy_(torch.tensor([1.0, 5.0, 0.2, 5.0]))
+
+    def previous_attempt_probabilities(bin_return, g_max, uniform_mix, return_mix, history_mix, bin_history):
+        scaled = -25.0 * bin_return / max(g_max, 1e-9)
+        soft = torch.exp(scaled - scaled.max())
+        soft = soft / soft.sum()
+        history = bin_history / bin_history.sum()
+        probability = uniform_mix / bin_return.numel() + return_mix * soft + history_mix * history
+        return probability / probability.sum()
+
+    reference = previous_attempt_probabilities(
+        sampler.bin_return,
+        sampler.g_max,
+        sampler.uniform_mix,
+        sampler.return_mix,
+        sampler.history_mix,
+        sampler.bin_history,
+    )
+    sampler.rebuild()
+    torch.testing.assert_close(
+        sampler.sampling_cdf, torch.cumsum(reference, dim=0).to(torch.float32), rtol=1e-6, atol=1e-7
+    )
+    # The lowest-return bin carries the most mass.
+    probabilities = torch.diff(sampler.sampling_cdf, prepend=torch.zeros(1))
+    assert probabilities.argmax().item() == 2
+
+
+def test_return_sample_uses_integer_bin_addressing():
+    sampler = _return_sampler(100, num_envs=1)
+    # All mass on bin 2 (frames [50, 75)): search-left lands every unit in
+    # [0, 1) on bin 2, integer offsets stay inside.
+    cdf = torch.tensor([0.0, 0.0, 1.0, 1.0])
+    sampler.sampling_cdf.copy_(cdf)
+    generator = torch.Generator().manual_seed(5)
+    draws = torch.rand((16, 3), generator=generator) * 2.0 - 1.0
+    steps = sampler.sample(draws, 0.0)
+    assert torch.all(steps >= 50) and torch.all(steps < 75)
+    assert sampler.draw_count == 3
+
+
+def test_return_mark_episode_starts_resets_only_episode_rows():
+    sampler = _return_sampler(100, num_envs=3)
+    sampler.lane_return[:] = 2.0
+    sampler.lane_gamma[:] = 0.5
+    sampler.lane_steps[:] = 4
+    sampler.lane_start_bin[:] = torch.tensor([0, 0, 0], dtype=torch.int64)
+    sampler.mark_episode_starts(
+        torch.tensor([0, 1]),
+        reset_episode=torch.tensor([True, False]),
+        steps=torch.tensor([62, 80], dtype=torch.int64),
+    )
+    assert sampler.lane_start_bin.tolist() == [2, 0, 0]
+    assert sampler.lane_return.tolist() == [0.0, 2.0, 2.0]
+    assert sampler.lane_gamma.tolist() == [1.0, 0.5, 0.5]
+    assert sampler.lane_steps.tolist() == [0, 4, 4]
+
+
+def test_command_return_mode_end_to_end_fold_and_resample():
+    sampler = _return_sampler(100, num_envs=2)
+    command, state = _command(2, 100, sampler=sampler, steps=torch.tensor([[99], [10]]))
+    ctx = _ctx(state, reward=torch.tensor([1.0, 1.0]))
+    # Lane 0 wraps (99 -> beyond clip end): advance accumulates the reward,
+    # then resamples the start inline; lane 1 keeps stepping.
+    command.advance(ctx)
+    assert sampler.lane_steps.tolist() == [1, 1]
+    assert sampler.lane_return.tolist() == [pytest.approx(1.0)] * 2
+    assert command.steps[1, 0].item() == 11
+
+    # Episode reset for lane 1 from frame 11: return folds into bin 0, new
+    # start is drawn and the lane's episode reopens on that bin.
+    ctx = _ctx(
+        state,
+        reset_ids=torch.tensor([1]),
+        reset_episode=torch.tensor([True]),
+        terminated=torch.tensor([False, True]),
+    )
+    command.reset(ctx)
+    # The finished episode's return folded into its START bin (bin 0), and
+    # the lane reopened on the bin containing its newly drawn frame.
+    assert sampler.bin_return[0].item() == pytest.approx(0.2, rel=1e-5)
+    assert sampler.lane_return[1].item() == 0.0
+    assert sampler.lane_steps[1].item() == 0
+    new_step = command.steps[1, 0].item()
+    assert 0 <= new_step <= 98
+    assert sampler.lane_start_bin[1].item() == new_step // 25
