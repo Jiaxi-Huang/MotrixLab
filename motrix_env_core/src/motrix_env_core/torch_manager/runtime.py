@@ -41,6 +41,7 @@ from motrix_env_core.manager.resolver import (
     SimArg,
     SimResetTermCall,
     TerminationTermCall,
+    TruncationTermCall,
 )
 
 if TYPE_CHECKING:
@@ -145,14 +146,15 @@ class TorchManagerRuntime:
 
         # Typed call sequences encode the execution contract structurally:
         # evaluate follows the fixed phase order command update hooks ->
-        # rewards -> terminations -> reward-total publication -> command
-        # advance hooks (rewards and terminations read pre-advance command
-        # state; the published total is what ``ctx.reward`` shows the advance
-        # hooks); each phase keeps its declaration order and reward/termination
-        # indices match ``layout.rewards``/``layout.terminations``.
+        # rewards -> terminations -> truncations -> reward-total publication ->
+        # command advance hooks (rewards and termination/truncation terms read
+        # pre-advance command state; the published total is what ``ctx.reward``
+        # shows the advance hooks); each phase keeps its declaration order and
+        # reward/termination/truncation indices match the ``layout`` ordering.
         self.command_updates: tuple[CommandUpdateHook, ...] = program.command_updates
         self.rewards: tuple[RewardTermCall, ...] = program.rewards
         self.terminations: tuple[TerminationTermCall, ...] = program.terminations
+        self.truncations: tuple[TruncationTermCall, ...] = program.truncations
         self.command_advances: tuple[CommandAdvanceHook, ...] = program.command_advances
         self.command_reset_hooks: tuple[CommandResetHook, ...] = program.command_reset_hooks
         self.observations: dict[str, tuple[ObservationTermCall, ...]] = program.observations
@@ -223,11 +225,13 @@ class TorchManagerRuntime:
         raw_terms = buffers[0]
         weighted_terms = buffers[1]
         termination_masks = buffers[2]
+        truncation_masks = buffers[3]
         dt = ctx.dt
         update_hooks = self.command_updates
         advance_hooks = self.command_advances
         reward_plan = tuple((term, self._invocation_args(term)) for term in self.rewards)
         termination_plan = tuple((term, self._invocation_args(term)) for term in self.terminations)
+        truncation_plan = tuple((term, self._invocation_args(term)) for term in self.truncations)
 
         def kernel(reward_view: torch.Tensor, terminated_view: torch.Tensor) -> None:
             for hook in update_hooks:
@@ -245,11 +249,20 @@ class TorchManagerRuntime:
                 mask = term.function(ctx, *args).to(torch.bool)
                 termination_masks[:, term.index] = mask
                 terminated = mask if terminated is None else terminated | mask
+            truncated = None
+            for term, args in truncation_plan:
+                mask = term.function(ctx, *args).to(torch.bool)
+                truncation_masks[:, term.index] = mask
+                truncated = mask if truncated is None else truncated | mask
             # Publish the reward total before the advance hooks: the buffer
             # aliases ``ctx.reward``/``state.reward``, so a per-step curriculum
             # accumulator in ``advance`` folds the transition's own reward,
             # not the previous one.
             reward_view.copy_(total if total is not None else torch.zeros_like(reward_view))
+            # Same one-tensor-from-birth pattern for the truncation-term
+            # union (``ctx.truncated``/``state.truncated``); the env folds the
+            # time-limit mask on top after the kernel.
+            ctx.truncated.copy_(truncated if truncated is not None else torch.zeros_like(ctx.truncated))
             for hook in advance_hooks:
                 receiver = ctx.commands[hook.receiver_key]
                 hook.function(receiver, ctx)
@@ -391,7 +404,7 @@ class TorchManagerRuntime:
 
     def _invocation_args(
         self,
-        call: RewardTermCall | TerminationTermCall | ObservationTermCall | SimResetTermCall,
+        call: RewardTermCall | TerminationTermCall | TruncationTermCall | ObservationTermCall | SimResetTermCall,
     ) -> tuple[Any, ...]:
         args: list[Any] = []
         for arg in call.args:

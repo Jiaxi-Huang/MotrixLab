@@ -36,6 +36,7 @@ from motrix_env_core.manager.kernel_data import (
 from motrix_env_core.manager.observations import ObservationGroupEntry, ObsTerm
 from motrix_env_core.manager.rewards import RewardTerm
 from motrix_env_core.manager.terminations import TerminationTerm
+from motrix_env_core.manager.truncations import TruncationTerm
 from motrix_env_core.sim import PhysicsReadProgram, SimDataQuery
 
 logger = logging.getLogger(__name__)
@@ -93,6 +94,7 @@ class ManagerLayout:
     observations: dict[str, ObservationGroupLayout]
     rewards: tuple[ScalarTermLayout, ...]
     terminations: tuple[ScalarTermLayout, ...]
+    truncations: tuple[ScalarTermLayout, ...]
     metrics: tuple[MetricFieldLayout, ...]
 
     def dump(self) -> str:
@@ -118,6 +120,8 @@ class ManagerLayout:
         lines.extend(f"  [{term.index}] {term.name}" for term in self.rewards)
         lines.append("terminations:")
         lines.extend(f"  [{term.index}] {term.name}" for term in self.terminations)
+        lines.append("truncations:")
+        lines.extend(f"  [{term.index}] {term.name}" for term in self.truncations)
         lines.append("metrics:")
         lines.extend(f"  [{metric.index}] dtype={metric.dtype} {metric.name}" for metric in self.metrics)
         return "\n".join(lines)
@@ -188,6 +192,15 @@ class TerminationTermCall:
 
 
 @dataclass(frozen=True)
+class TruncationTermCall:
+    """One truncation term call with its resolver-assigned buffer column."""
+
+    index: int
+    function: Callable
+    args: tuple[PreparedArg, ...]
+
+
+@dataclass(frozen=True)
 class ObservationTermCall:
     """One observation term call writing its group slice."""
 
@@ -235,6 +248,7 @@ class ResolvedManagerProgram:
     command_updates: tuple[CommandUpdateHook, ...]
     rewards: tuple[RewardTermCall, ...]
     terminations: tuple[TerminationTermCall, ...]
+    truncations: tuple[TruncationTermCall, ...]
     command_advances: tuple[CommandAdvanceHook, ...]
     command_reset_hooks: tuple[CommandResetHook, ...]
     sim_reset_terms: tuple[ResolvedSimReset, ...]
@@ -262,6 +276,7 @@ __all__ = [
     "SimInputLayout",
     "SimResetTermCall",
     "TerminationTermCall",
+    "TruncationTermCall",
 ]
 
 
@@ -308,7 +323,15 @@ class ManagerProgramResolver:
         observation_terms, observation_layout = self._resolve_observations(observation_groups)
         reward_calls, reward_layout, _ = self._resolve_rewards(self._env.cfg, reward_terms)
         termination_calls, termination_layout = self._resolve_terminations(termination_terms)
+        truncation_calls, truncation_layout = self._resolve_truncations(self._env.truncation_manager.terms)
         sim_reset_terms = self._resolve_resets()
+        # Termination and truncation mask columns share the flat metrics
+        # namespace, so a shared name would silently shadow one group's column.
+        shared_names = {term.name for term in termination_layout} & {term.name for term in truncation_layout}
+        if shared_names:
+            raise ValueError(
+                f"Manager termination and truncation term names must be distinct; shared: {sorted(shared_names)}."
+            )
         per_env_metric_layout = tuple(
             MetricFieldLayout(name, index, value.dtype)
             for index, (name, value) in enumerate(self._env.metrics.items())
@@ -338,6 +361,7 @@ class ManagerProgramResolver:
             observations=observation_layout,
             rewards=reward_layout,
             terminations=termination_layout,
+            truncations=truncation_layout,
             metrics=per_env_metric_layout,
         )
         call_count = (
@@ -347,6 +371,7 @@ class ManagerProgramResolver:
             + sum(len(terms) for terms in observation_terms.values())
             + len(reward_calls)
             + len(termination_calls)
+            + len(truncation_calls)
             + len(sim_reset_terms)
         )
         logger.info(
@@ -362,6 +387,7 @@ class ManagerProgramResolver:
             command_updates=command_updates,
             rewards=reward_calls,
             terminations=termination_calls,
+            truncations=truncation_calls,
             command_advances=command_advances,
             command_reset_hooks=command_reset_hooks,
             sim_reset_terms=sim_reset_terms,
@@ -452,6 +478,11 @@ class ManagerProgramResolver:
             reset_ids=torch.zeros(0, dtype=torch.int64),
             reset_episode=torch.zeros((self._env.num_envs, 1), dtype=torch.bool),
             terminated=torch.zeros(self._env.num_envs, dtype=torch.bool),
+            # Truncation-term union mirror over the state's buffer (same
+            # one-tensor-from-birth pattern as ``terminated``): the evaluate
+            # kernel ORs the truncation terms into it every transition and
+            # the env folds the time-limit mask on top.
+            truncated=torch.zeros(self._env.num_envs, dtype=torch.bool),
             # Reward mirror over the state's buffer (see _new_state): zeros
             # here, written in place by the evaluate kernel every transition.
             reward=torch.zeros(self._env.num_envs, dtype=torch.float32),
@@ -577,6 +608,18 @@ class ManagerProgramResolver:
         for index, (name, term) in enumerate(termination_terms.items()):
             args = self._resolve_dispatch_args("termination", name, term)
             terms.append(TerminationTermCall(index, term.dispatch, args))
+            layout.append(ScalarTermLayout(name, index))
+        return tuple(terms), tuple(layout)
+
+    def _resolve_truncations(
+        self,
+        truncation_terms: dict[str, TruncationTerm],
+    ) -> tuple[tuple[TruncationTermCall, ...], tuple[ScalarTermLayout, ...]]:
+        terms = []
+        layout = []
+        for index, (name, term) in enumerate(truncation_terms.items()):
+            args = self._resolve_dispatch_args("truncation", name, term)
+            terms.append(TruncationTermCall(index, term.dispatch, args))
             layout.append(ScalarTermLayout(name, index))
         return tuple(terms), tuple(layout)
 

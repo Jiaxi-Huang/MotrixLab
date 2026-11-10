@@ -129,6 +129,7 @@ def _ctx(
         # Compact reset-pass flags: one entry per lane in ``reset_ids``.
         reset_episode=torch.ones(0, dtype=torch.bool) if reset_episode is None else reset_episode,
         terminated=torch.zeros(num_envs, dtype=torch.bool) if terminated is None else terminated,
+        truncated=torch.zeros(num_envs, dtype=torch.bool),
         reward=torch.zeros(num_envs, dtype=torch.float32) if reward is None else reward,
     )
 

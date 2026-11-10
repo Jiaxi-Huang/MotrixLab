@@ -59,6 +59,12 @@ class ManagerContext:
     # Read-only mirror of the latest transition's termination union, backing
     # episode-boundary statistics inside reset hooks.
     terminated: torch.Tensor
+    # Read-only mirror of the latest transition's truncation-term union
+    # (time-limit truncation is folded in by the env after the kernel),
+    # sharing storage with ``state.truncated`` (one tensor from state
+    # assembly). Distinguishes time-style episode ends from failures for
+    # bootstrap-correct returns.
+    truncated: torch.Tensor
     # Read-only mirror of the latest transition's weighted reward total,
     # sharing storage with ``state.reward`` (one tensor from state assembly).
     # The evaluate kernel writes it before the command ``advance`` hooks run,

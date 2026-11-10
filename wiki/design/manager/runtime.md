@@ -2,7 +2,7 @@
 
 ## 摘要
 
-`ManagerEnv` 是基于 `ArrayEnv` 的 NumPy 前端，使用配置声明 action、command、observation、reward、termination 和 reset，
+`ManagerEnv` 是基于 `ArrayEnv` 的 NumPy 前端，使用配置声明 action、command、observation、reward、termination、truncation 和 reset，
 数值执行由通用 Torch 执行器按整批张量调度（见 [Torch 执行器设计](./torch-executor.md)）。它保持现有环境公共契约：action 和
 observation 使用 NumPy，状态使用 `ArrayEnvState`，仿真通过 backend-neutral 的 `SimBackend` 访问。
 
@@ -17,7 +17,7 @@ ArrayEnv lifecycle
   ├── action terms（host）
   ├── SimBackend.step / read program（backend）
   ├── task program（Torch executor，整批张量调度）
-  ├── observation / reward / termination outputs
+  ├── observation / reward / termination / truncation outputs
   └── partial reset（host + backend + reset kernel）
 ```
 
@@ -57,7 +57,7 @@ Manager group 的顺序是行为契约的一部分：action slice、observation 
 
 1. backend 构造并完成 scene 编译；
 2. 解析并编译 model、read、write 和 reset declarations；
-3. 创建 action、command、observation、reward 和 termination terms；
+3. 创建 action、command、observation、reward、termination 和 truncation terms；
 4. 为每个 term 执行一次 `canonicalize_kernel_data`；
 5. resolver（`ManagerProgramResolver`）构造 `ManagerContext` layout、read plan 和
    per-term-kind typed call records：term dispatch 以签名校验（`inspect` + 类型标注），不做任何
@@ -72,8 +72,8 @@ Manager group 的顺序是行为契约的一部分：action slice、observation 
 3. backend 推进 `sim_substeps`；
 4. command term 在 host 侧更新 persistent state；
 5. read program 刷新 simulator snapshot；
-6. Torch 执行器执行 command evaluation、observation、reward 和 termination（一次整批调用/term）；
-7. `ArrayEnv` 处理 truncation 和 done reset；`state.metrics` 是常驻活视图（kernel 原地写），跨步持有走 `process_metrics()` 归约快照。
+6. Torch 执行器执行 command evaluation、observation、reward、termination 和 truncation（一次整批调用/term；truncation term 并集写 `ctx.truncated`）；
+7. `ArrayEnv` 处理 truncation（时间上限在 term 并集之上 OR）和 done reset；`state.metrics` 是常驻活视图（kernel 原地写），跨步持有走 `process_metrics()` 归约快照。
 
 ### Partial reset
 
@@ -134,6 +134,7 @@ class ManagerContext:
     reset_ids: torch.Tensor
     reset_episode: torch.Tensor
     terminated: torch.Tensor
+    truncated: torch.Tensor  # 与 state.truncated 同存储的 truncation-term 并集镜像（时间上限由 env 在 kernel 后折入）
     reward: torch.Tensor  # 与 state.reward 同存储的只读镜像
 
 
@@ -158,6 +159,16 @@ class TerminationTerm:
     metrics: dict[str, np.ndarray]
 
     # dispatch(ctx, *args) -> (N,) bool tensor; metrics written via ctx.metrics
+
+
+class TruncationTerm:
+    dispatch: Callable[..., torch.Tensor]
+    args: tuple[Any, ...]
+    metrics: dict[str, np.ndarray]
+
+    # dispatch(ctx, *args) -> (N,) bool tensor; OR 进 ctx.truncated（与
+    # state.truncated 同存储），时间上限截断由 env 在 kernel 后并上；
+    # term mask 列同样以声明名进 metrics（两组名字不得冲突）
 
 
 class CommandTerm:

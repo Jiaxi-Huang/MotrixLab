@@ -35,12 +35,15 @@ from motrix_env_core.manager import (  # noqa: E402
     ManagerObservationsCfg,
     ManagerRewardsCfg,
     ManagerTerminationsCfg,
+    ManagerTruncationsCfg,
     ObservationTermCfg,
     ObsTerm,
     RewardTerm,
     RewardTermCfg,
     TerminationTerm,
     TerminationTermCfg,
+    TruncationTerm,
+    TruncationTermCfg,
     metric,
 )
 from motrix_env_core.manager.observations import create_observation_groups
@@ -188,6 +191,25 @@ class _InjectedTerminationCfg(TerminationTermCfg):
         )
 
 
+def _injected_truncation(ctx: ManagerContext, threshold) -> bool:
+    value = ctx.actions["test"].source[:, 0]
+    ctx.metrics["source_at_truncation"][:, 0] = value
+    return value >= threshold
+
+
+@configclass(kw_only=True)
+class _InjectedTruncationCfg(TruncationTermCfg):
+    threshold: float
+
+    def __call__(self, env: ManagerEnv) -> TruncationTerm:
+        del env
+        return TruncationTerm(
+            _injected_truncation,
+            float(self.threshold),
+            metric_names=("source_at_truncation",),
+        )
+
+
 @configclass(kw_only=True)
 class _TestActionCfg(ActionCfg):
     actuator_names: tuple[str, ...] = ()
@@ -293,6 +315,11 @@ class _ManagerTerminationsCfg(ManagerTerminationsCfg):
     limit: _InjectedTerminationCfg = _InjectedTerminationCfg(threshold=0.5)
 
 
+@configclass
+class _ManagerTruncationsGroupCfg(ManagerTruncationsCfg):
+    time_style: _InjectedTruncationCfg = _InjectedTruncationCfg(threshold=0.5)
+
+
 def _manager_groups(*, scale: float = 3.0, threshold: float = 0.5, reward_weight: float = 2.0) -> ManagerBasedEnvCfg:
     return ManagerBasedEnvCfg(
         observations=_ManagerObservationsCfg(
@@ -321,6 +348,7 @@ class _ManagerEnvCfg(ManagerBasedEnvCfg):
     observations: _ManagerObservationsCfg = _manager_groups().observations
     rewards: _ManagerRewardsCfg = _manager_groups().rewards
     terminations: _ManagerTerminationsCfg = _manager_groups().terminations
+    truncations: dict[str, TruncationTermCfg] = dataclass_field(default_factory=dict)
 
 
 class _ManagerEnv(ManagerEnv[EnvCfg]):
@@ -761,6 +789,65 @@ def test_truncated_envs_reset_before_observation() -> None:
     np.testing.assert_array_equal(state.episode_steps, 0)
     np.testing.assert_array_equal(state.obs.policy[:, 0], 1.75)
     np.testing.assert_allclose(state.reward, 0.005)
+
+
+def test_truncation_terms_or_into_truncated_and_publish_masks() -> None:
+    cfg = _ManagerEnvCfg(truncations={"time_style": _InjectedTruncationCfg(threshold=0.5)})
+    env = ManagerEnv(cfg, num_envs=3)
+
+    state = env.step(torch.tensor([[0.25], [0.75], [0.5]], dtype=torch.float32))
+
+    # The truncation-term union ORs into the shared truncated buffer (one
+    # tensor with ctx.truncated from birth), independent of terminations.
+    np.testing.assert_array_equal(state.truncated, [False, True, True])
+    np.testing.assert_array_equal(state.terminated, [False, True, True])
+    context = env._compiled_manager_program.context
+    assert context.truncated is state.truncated
+    # The per-term mask column surfaces under the declaration name and the
+    # diagnostic metric tensor allocated at build time is written in place.
+    np.testing.assert_array_equal(state.metrics["time_style"], [False, True, True])
+    np.testing.assert_allclose(state.metrics["source_at_truncation"], [0.25, 0.75, 0.5])
+
+
+def test_truncation_terms_or_with_time_limit_and_capture_final_obs() -> None:
+    cfg = _ManagerEnvCfg(truncations={"time_style": _InjectedTruncationCfg(threshold=0.5)})
+    cfg.max_episode_seconds = 0.03
+    env = ManagerEnv(cfg, num_envs=2)
+    env.init_state()
+
+    # Step 1 of 3: only the term-truncated lane ends; its final observation
+    # is captured exactly like a time-limit truncation's.
+    first = env.step(torch.tensor([[0.25], [0.75]], dtype=torch.float32))
+    np.testing.assert_array_equal(first.truncated, [False, True])
+    assert first.final_obs is not None
+    np.testing.assert_array_equal(first.final_obs.env_ids, [1])
+
+    # Steps 2-3: the time limit folds in on top of the term union without
+    # overwriting it. Lane 0 reaches its 3-step limit; lane 1's episode
+    # restarted at its step-1 truncation, so it is only on step 2 and stays
+    # alive — the mask column attributes every end to the right source.
+    env.step(torch.tensor([[0.25], [0.25]], dtype=torch.float32))
+    third = env.step(torch.tensor([[0.25], [0.25]], dtype=torch.float32))
+    np.testing.assert_array_equal(third.truncated, [True, False])
+    np.testing.assert_array_equal(third.metrics["time_style"], [False, False])
+    assert third.final_obs is not None
+    np.testing.assert_array_equal(third.final_obs.env_ids, [0])
+
+
+def test_truncation_terms_accept_typed_group_and_reject_shared_names() -> None:
+    cfg = _ManagerEnvCfg(truncations=_ManagerTruncationsGroupCfg())
+    env = ManagerEnv(cfg, num_envs=2)
+    state = env.step(torch.tensor([[0.25], [0.75]], dtype=torch.float32))
+    np.testing.assert_array_equal(state.truncated, [False, True])
+
+    # Termination and truncation mask columns share the flat metrics
+    # namespace; a shared declaration name fails fast at program resolution.
+    clash = _ManagerEnvCfg(
+        truncations={"limit": _InjectedTruncationCfg(threshold=0.5)},
+    )
+    env = ManagerEnv(clash, num_envs=2)
+    with pytest.raises(ValueError, match="must be distinct"):
+        env.init_state()
 
 
 @pytest.mark.parametrize("with_value", [False, True])
