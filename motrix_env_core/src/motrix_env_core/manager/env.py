@@ -428,11 +428,14 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         The resolver's context is already live (the task program builds
         before the base lifecycle runs), so ``ctx.terminated``, the evaluate
         kernel's output, and ``state.terminated`` are one tensor from birth —
-        the manager state is the only named holder on the env side.
+        the manager state is the only named holder on the env side. The
+        reward mirror follows the same pattern: the incoming zero buffer is
+        discarded for the context's, which the evaluate kernel rewrites in
+        place every transition.
         """
         context = self._compiled_manager_program.context
         context.terminated.fill_(True)  # keep the seed-all-lanes init contract
-        return super()._new_state(obs, reward, context.terminated, truncated, episode_steps)
+        return super()._new_state(obs, context.reward, context.terminated, truncated, episode_steps)
 
     def init_state(self) -> ArrayEnvState:
         startup_started = perf_counter()

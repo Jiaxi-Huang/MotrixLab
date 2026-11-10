@@ -452,6 +452,9 @@ class ManagerProgramResolver:
             reset_ids=torch.zeros(0, dtype=torch.int64),
             reset_episode=torch.zeros((self._env.num_envs, 1), dtype=torch.bool),
             terminated=torch.zeros(self._env.num_envs, dtype=torch.bool),
+            # Reward mirror over the state's buffer (see _new_state): zeros
+            # here, written in place by the evaluate kernel every transition.
+            reward=torch.zeros(self._env.num_envs, dtype=torch.float32),
         )
         self._validate_context_leaves(value)
         return value

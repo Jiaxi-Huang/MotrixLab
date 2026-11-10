@@ -145,10 +145,11 @@ class TorchManagerRuntime:
 
         # Typed call sequences encode the execution contract structurally:
         # evaluate follows the fixed phase order command update hooks ->
-        # rewards -> terminations -> command advance hooks (rewards and
-        # terminations read pre-advance command state); each phase keeps its
-        # declaration order and reward/termination indices match
-        # ``layout.rewards``/``layout.terminations``.
+        # rewards -> terminations -> reward-total publication -> command
+        # advance hooks (rewards and terminations read pre-advance command
+        # state; the published total is what ``ctx.reward`` shows the advance
+        # hooks); each phase keeps its declaration order and reward/termination
+        # indices match ``layout.rewards``/``layout.terminations``.
         self.command_updates: tuple[CommandUpdateHook, ...] = program.command_updates
         self.rewards: tuple[RewardTermCall, ...] = program.rewards
         self.terminations: tuple[TerminationTermCall, ...] = program.terminations
@@ -244,10 +245,14 @@ class TorchManagerRuntime:
                 mask = term.function(ctx, *args).to(torch.bool)
                 termination_masks[:, term.index] = mask
                 terminated = mask if terminated is None else terminated | mask
+            # Publish the reward total before the advance hooks: the buffer
+            # aliases ``ctx.reward``/``state.reward``, so a per-step curriculum
+            # accumulator in ``advance`` folds the transition's own reward,
+            # not the previous one.
+            reward_view.copy_(total if total is not None else torch.zeros_like(reward_view))
             for hook in advance_hooks:
                 receiver = ctx.commands[hook.receiver_key]
                 hook.function(receiver, ctx)
-            reward_view.copy_(total if total is not None else torch.zeros_like(reward_view))
             terminated_view.copy_(terminated if terminated is not None else torch.zeros_like(terminated_view))
 
         if self.compile_enabled:

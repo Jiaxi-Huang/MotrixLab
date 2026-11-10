@@ -59,6 +59,12 @@ class ManagerContext:
     # Read-only mirror of the latest transition's termination union, backing
     # episode-boundary statistics inside reset hooks.
     terminated: torch.Tensor
+    # Read-only mirror of the latest transition's weighted reward total,
+    # sharing storage with ``state.reward`` (one tensor from state assembly).
+    # The evaluate kernel writes it before the command ``advance`` hooks run,
+    # so a hook observes the current step's reward — per-step curriculum
+    # accumulators (return-based start sampling) fold it in place.
+    reward: torch.Tensor
 
 
 class BuildContext:

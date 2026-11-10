@@ -43,6 +43,7 @@ def _ctx() -> ManagerContext:
         reset_ids=_RESET_IDS,
         reset_episode=torch.ones(len(_RESET_IDS), dtype=torch.bool),
         terminated=torch.zeros(_NUM_ENVS, dtype=torch.bool),
+        reward=torch.zeros(_NUM_ENVS, dtype=torch.float32),
     )
 
 

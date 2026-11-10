@@ -225,6 +225,7 @@ class _CounterCommandCfg(CommandCfg):
         shape = (env.num_envs, 1)
         return _CounterCommand(
             double=torch.zeros(shape, dtype=torch.float32),
+            reward_sum=torch.zeros(shape, dtype=torch.float32),
             command=torch.zeros(shape, dtype=torch.float32),
         )
 
@@ -232,12 +233,14 @@ class _CounterCommandCfg(CommandCfg):
 @dataclass(frozen=True, slots=True)
 class _CounterCommand(CommandTerm):
     double: torch.Tensor = metric()
+    reward_sum: torch.Tensor = metric(name="reward_sum")
 
     def update(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.double[:, 0] = 2.0 * ctx.actions["test"].source[:, 0]
 
     def advance(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.command[:, 0] += ctx.dt
+        self.reward_sum[:, 0] += ctx.reward
 
     def reset(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.command[ctx.reset_ids, 0] = -1.0
@@ -592,6 +595,25 @@ def test_manager_context_is_injected_once_and_reused_across_all_term_kinds() -> 
     np.testing.assert_allclose(np.ravel(state.metrics["double"]), [0.5, 1.5])
     np.testing.assert_allclose(state.reward_terms["source"], [0.005, 0.015])
     assert env._compiled_manager_program is not None
+
+
+def test_context_reward_mirrors_state_reward_in_advance_hook() -> None:
+    env = _ManagerEnv(num_envs=2)
+    command = _counter_command(env)
+    first = env.step(torch.full((2, 1), 0.1, dtype=torch.float32))
+    assert env._compiled_manager_program is not None
+    context = env._compiled_manager_program.context
+    first_reward = first.reward.clone()
+    # The mirror shares storage with the state reward from birth, and the
+    # advance hook already saw the transition the evaluate kernel just wrote
+    # (not the previous step's total).
+    assert context.reward is first.reward
+    np.testing.assert_allclose(command.reward_sum[:, 0], first_reward)
+    np.testing.assert_allclose(context.reward, first_reward)
+
+    second = env.step(torch.full((2, 1), 0.2, dtype=torch.float32))
+    assert context.reward is second.reward
+    np.testing.assert_allclose(command.reward_sum[:, 0], first_reward + second.reward)
 
 
 def test_reset_keeps_command_metric_alias_for_direct_context() -> None:

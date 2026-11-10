@@ -126,8 +126,15 @@ class ManagerContext:
     env_id: np.ndarray
     actions: Map
     commands: Map
+    metrics: Map
     rand: RandValue
     sim: Map
+    dt: float
+    sim_reset_requested: torch.Tensor
+    reset_ids: torch.Tensor
+    reset_episode: torch.Tensor
+    terminated: torch.Tensor
+    reward: torch.Tensor  # 与 state.reward 同存储的只读镜像
 
 
 class ObservationTerm:

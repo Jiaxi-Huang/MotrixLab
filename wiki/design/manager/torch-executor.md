@@ -39,7 +39,9 @@ compile=False)` 或 `runtime.compile_enabled = False` 回到逐 term eager 执�
 
 - evaluate 按固定语句顺序调度：command `update` → rewards
   （raw、`weighted = raw * weight * dt`、Σ）→ terminations（masks、OR）→
-  command `advance`（rewards/terminations 读 pre-advance command state）；
+  reward 总量发布（写入 `state.reward`，即 `ctx.reward` 镜像）→
+  command `advance`（rewards/terminations 读 pre-advance command state；
+  advance 内读 `ctx.reward` 得到本步 reward 总量——每步课程累积器的消费点）；
   observe 按 group/term 顺序写 obs 切片；reset = command `reset`
   （compact）→ sim-reset terms 写 compact 行。
 - RNG：per-lane SplitMix64（`manager.rand.draw_uniform`），批量语义为
@@ -71,6 +73,8 @@ ctx（`ManagerContext` 宿主实例）字段全部是**整批**张量：
 - `ctx.rand.next_uniform(count=k)` → `(N, k)`，`[-1,1)`，原地推进状态；
   `ctx.rand.uniform_range(count, low, high)` 同理
 - `ctx.dt` float、`ctx.env_id` `(N,)`、`ctx.sim_reset_requested` `(N,1)` bool
+- `ctx.reward` `(N,)` float32：与 `state.reward` 同存储的只读镜像，
+  advance/reset hook 可读最近一步（evaluate 内）的加权 reward 总量
 
 函数签名约定（第一个参数注解为 `ManagerContext`，observation 的 `out`
 注解为 `torch.Tensor`（`(N, size)` 切片），reset 的 `sim_writes` 注解为
