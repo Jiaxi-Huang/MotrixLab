@@ -460,7 +460,7 @@ P5 packed 多 clip：独立于主线，单独设计单独评审
 | P3.3 go2 端到端跑通 | trainer 任务无关（第二任务零 trainer 改动） |
 | P4.1 async 与 sync 等步数损失曲线对齐 | 规模化不损样本效率 |
 
-### Phase 1 — WBT 采样器统一（环境侧课程基建）
+### Phase 1 — WBT 采样器统一（环境侧课程基建）✅ 已落地（31cb4c8 / 5ff2d87 / 53882c5）
 
 以现有 WBT 任务（g1 单/多 clip）为验证载体，不引入任何 trainer 概念。
 
