@@ -220,6 +220,11 @@ class _SecondActionCfg(ActionCfg):
         )
 
 
+# Static three-wide noise the reset-hook cover broadcasts compact rows against
+# (mirrors the WBT reset terms' per-axis noise amplitude).
+_RESET_NOISE = torch.ones(3, dtype=torch.float32)
+
+
 @configclass(kw_only=True)
 class _CounterCommandCfg(CommandCfg):
     def __call__(self, env: ManagerEnv) -> "_CounterCommand":
@@ -227,6 +232,7 @@ class _CounterCommandCfg(CommandCfg):
         return _CounterCommand(
             double=torch.zeros(shape, dtype=torch.float32),
             reward_sum=torch.zeros(shape, dtype=torch.float32),
+            reset_cover=torch.zeros(shape, dtype=torch.float32),
             command=torch.zeros(shape, dtype=torch.float32),
         )
 
@@ -242,6 +248,7 @@ class _CounterGauges:
 class _CounterCommand(CommandTerm):
     double: torch.Tensor = metric()
     reward_sum: torch.Tensor = metric(name="reward_sum")
+    reset_cover: torch.Tensor = metric()
     gauges: _CounterGauges = dataclass_field(default_factory=_CounterGauges)
 
     def update(self: "_CounterCommand", ctx: ManagerContext) -> None:
@@ -254,6 +261,14 @@ class _CounterCommand(CommandTerm):
 
     def reset(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.command[ctx.reset_ids, 0] = -1.0
+        # Compact-axis broadcast cover: both ops mix this pass's compact (K,)
+        # rows with full-batch tensors and a static component width. The
+        # compiled reset kernel must keep them valid for every K — duck-shaped
+        # or unmarked dynamic dimensions pin K to a constant here and fail
+        # guard production at construction.
+        episode_done = ctx.reset_episode & ctx.terminated[ctx.reset_ids]
+        noise = ctx.rand.next_uniform(3)[ctx.reset_ids] * _RESET_NOISE
+        self.reset_cover[ctx.reset_ids, 0] = noise.sum(dim=1) + episode_done.to(torch.float32)
 
 
 @configclass
@@ -638,6 +653,25 @@ def test_context_reward_mirrors_state_reward_in_advance_hook() -> None:
     second = env.step(torch.full((2, 1), 0.2, dtype=torch.float32))
     assert context.reward is second.reward
     np.testing.assert_allclose(command.reward_sum[:, 0], first_reward + second.reward)
+
+
+def test_reset_kernel_keeps_compact_axis_symbolic_across_batch_and_component_widths() -> None:
+    """The compiled reset kernel's compact axis must stay the only symbol.
+
+    At num_envs=3 the compact axis collides with the xyz component width:
+    construction runs the first full reset (K == N == 3) through the compiled
+    kernel, so duck-shaped dynamic dimensions or an unmarked lane-context
+    input conflate K with the batch axis or the static width, guard production
+    pins K to a constant, and ConstraintViolationError aborts the build. The
+    same compiled kernel must then serve subset reset passes of every size.
+    """
+    env = _ManagerEnv(num_envs=3)
+    state = env.init_state()
+    env.reset(torch.tensor([1]))
+    env.reset(torch.tensor([0, 2]))
+    command = _counter_command(env)
+    assert command.reset_cover.shape == (3, 1)
+    assert state is not None
 
 
 def test_reset_keeps_command_metric_alias_for_direct_context() -> None:

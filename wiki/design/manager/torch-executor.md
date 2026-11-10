@@ -51,8 +51,16 @@ compile=False)` 或 `runtime.compile_enabled = False` 回到逐 term eager 执�
   宿主对象本身（graph-break-free 编译的关键：无转译层，guard 落在对象
   identity 上）。
 - reset 路径是 **dynamic gather-compact** 设计：`ctx.reset_ids` 携带本 pass 的
-  K 个 reset 行（动态长度，`mark_dynamic` 防 0/1 特化，一次 `dynamic=True`
-  编译覆盖所有 K）。command `reset` 钩子直接在常驻实例上按 ids
+  K 个 reset 行（动态长度，`mark_dynamic` 防 0/1 特化——`ids` 与由它派生进图的
+  `reset_episode` 都要标——一次编译覆盖所有 K）。编译用 `dynamic=False` +
+  `mark_dynamic`：compact 轴是**唯一**符号维。曾经的 `dynamic=True` 会把所有
+  同值维度 duck-shape 到一个符号上，首次全量 reset 追踪时 K==N，num_envs 为
+  3/4 时 K 又与 xyz/四元数分量宽度同值，随后 compact 行与静态宽度相乘即加出
+  `Eq(K, const)` guard，把 K 钉成常量并违反 RelaxedUnspec 约束
+  （ConstraintViolationError）。同理，kernel 内 `float(tensor)`/`.item()` 的
+  graph break 会把符号 staging 具体化成静态输入重新进图——reset term 的分支
+  条件必须在构建期标量化（host 端 bool/float）。command
+  `reset` 钩子直接在常驻实例上按 ids
   gather/scatter；sim-reset terms 直接填 `(K, *write_shape)` staging（无
   `stage[ids]` 二次 gather）；wrapper 把 staging 拷到全批 reset buffer 头部。
   RNG 语义：reset pass 在全批流上 draw 后 gather 对应行，pass 之外的 lane

@@ -360,13 +360,26 @@ class TorchManagerRuntime:
             return tuple(staging)
 
         if self.compile_enabled:
-            kernel = torch.compile(kernel, dynamic=True, options=_compile_options())
+            # ``dynamic=False`` plus the ``mark_dynamic`` below keeps the
+            # compact axis the only symbolic dimension. ``dynamic=True``
+            # duck-shapes every same-valued dimension onto one symbol, so when
+            # the first full reset traces K == num_envs == a component width
+            # (xyz 3, quaternion 4), broadcasting compact rows against that
+            # static width pins K to a constant and violates the marked
+            # constraint (ConstraintViolationError at num_envs 3/4).
+            kernel = torch.compile(kernel, dynamic=False, options=_compile_options())
 
         def wrapper(ids: torch.Tensor) -> None:
             # Mark the compact axis symbolic so K=1 (and every other size)
             # shares one compilation instead of specializing and recompiling.
+            # ``reset_episode`` is derived from ``ids`` in this wrapper and
+            # enters the graph as an input, so it carries the same mark —
+            # unmarked, its dim would trace static and broadcasting it against
+            # symbolic compact rows would pin K to a constant.
             torch._dynamo.mark_dynamic(ids, 0)
-            lane_ctx = replace(ctx, reset_ids=ids, reset_episode=ctx.reset_episode[ids, 0])
+            reset_episode = ctx.reset_episode[ids, 0]
+            torch._dynamo.mark_dynamic(reset_episode, 0)
+            lane_ctx = replace(ctx, reset_ids=ids, reset_episode=reset_episode)
             staging = kernel(lane_ctx)
             count = ids.shape[0]
             for buffer, stage in zip(buffer_plan, staging, strict=True):
