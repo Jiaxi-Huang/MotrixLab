@@ -348,6 +348,29 @@ def test_partial_reset_hands_canonical_rows_to_runtime_and_clears_ctrl() -> None
     np.testing.assert_allclose(env._action_writes.buffer("ctrl")[1], np.zeros(1, dtype=np.float32))
 
 
+def test_final_state_sim_rows_capture_pre_reset_reads() -> None:
+    cfg = _FakeManagerCfg()
+    cfg.max_episode_seconds = cfg.ctrl_dt
+    env = ManagerEnv(cfg, num_envs=2, backend="fake-manager", capture_final_state=True)
+
+    # Every lane hits the one-step time limit, so the only done source is the
+    # time-limit truncation folded in before the capture point.
+    state = env.step(torch.full((2, 1), 0.5, dtype=torch.float32))
+    np.testing.assert_array_equal(state.truncated, True)
+
+    final = state.final_state
+    assert final is not None
+    np.testing.assert_array_equal(final.env_ids, [0, 1])
+    assert set(final.sim) == set(env.sim_data.keys) == {"dof_pos"}
+    # Sim rows hold the post-physics, pre-reset snapshot. The reset already
+    # rewrote the fake's rows back to the spawn pose and reread them, so the
+    # live view no longer matches the captured rows.
+    delta = 0.25 * env.cfg.sim_substeps
+    advanced = np.tile(np.asarray([0.5 + delta, -0.5 + delta], dtype=np.float32), (2, 1))
+    np.testing.assert_allclose(final.sim["dof_pos"], advanced)
+    np.testing.assert_allclose(env.sim_data.view("dof_pos"), np.tile(np.asarray([0.5, -0.5], dtype=np.float32), (2, 1)))
+
+
 def test_manager_frontend_does_not_import_motrixsim() -> None:
     code = "import sys\nimport motrix_env_core.manager.env\nsys.exit(0 if 'motrixsim' not in sys.modules else 1)\n"
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)

@@ -42,6 +42,26 @@ class FinalObs:
 
 
 @dataclass
+class FinalState:
+    """Owned pre-reset terminal state of the current transition's done rows.
+
+    Rows in every tensor align with ``env_ids`` (terminated and truncated
+    rows alike). ``sim`` holds one gathered row tensor per declared read key;
+    ``commands`` and ``actions`` hold the resident per-environment term-state
+    rows keyed ``"<term>.<leaf-path>"``. Advanced indexing creates owned
+    snapshots that stay valid across steps; consumers treat them as
+    read-only. The values are the post-evaluate, pre-reset truth: command
+    ``advance`` has already run and the reset kernel has not, so the command
+    rows are exactly the exogenous channels' terminal values.
+    """
+
+    env_ids: torch.Tensor
+    sim: dict[str, torch.Tensor]
+    commands: dict[str, torch.Tensor]
+    actions: dict[str, torch.Tensor]
+
+
+@dataclass
 class ArrayEnvState:
     """Public transition state; all lifecycle values are torch tensors."""
 
@@ -59,6 +79,11 @@ class ArrayEnvState:
     metrics: dict[str, float | torch.Tensor] = dataclasses.field(default_factory=dict)
     # None when no row truncated or the implementation does not capture finals.
     final_obs: FinalObs | None = None
+    # Pre-reset terminal state of the current transition's done rows. None
+    # when capture is not requested (the ``capture_final_state`` constructor
+    # argument), no row is done, or the implementation does not capture
+    # terminal state.
+    final_state: FinalState | None = None
 
     @property
     def done(self) -> torch.Tensor:
@@ -125,9 +150,24 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
     _state: ArrayEnvState | None = None
     _render_spacing: float
 
-    def __init__(self, cfg: EnvCfgType, num_envs: int = 1):
+    def __init__(
+        self,
+        cfg: EnvCfgType,
+        num_envs: int = 1,
+        *,
+        capture_final_state: bool = False,
+    ):
+        """Initialize the lifecycle shared by torch-frontend environments.
+
+        ``capture_final_state`` is a runtime consumer request — sequence-model
+        trainers inject it at construction (the same channel as ``seed``/
+        ``backend``), so task configs never declare it: unrequested
+        environments keep a zero capture footprint.
+        """
         self._cfg = cfg
         self._num_envs = num_envs
+        # Distinct name from the ``_capture_final_state`` hook this gates.
+        self._capture_final_state_enabled = capture_final_state
         self.perf = Perf()
         if cfg.scene is None:
             raise ValueError("EnvCfg.scene must be configured")
@@ -253,6 +293,16 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         """
         return None
 
+    def _capture_final_state(self, env_ids: torch.Tensor) -> FinalState | None:
+        """Capture done rows' terminal state before reset; default is unsupported.
+
+        Called at the same lifecycle point as :meth:`_capture_final_obs`, but
+        for every done row (terminated or truncated) and only when the
+        constructor requested terminal-state capture. Implementations return
+        owned row tensors gathered from the post-evaluate, pre-reset state.
+        """
+        return None
+
     def _max_episode_steps(self) -> int | None:
         return self._cfg.max_episode_steps
 
@@ -296,6 +346,8 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         """Clear per-step transition outputs before advancing physics."""
         if self._state.final_obs is not None:
             self._state = self._state.replace(final_obs=None)
+        if self._state.final_state is not None:
+            self._state = self._state.replace(final_state=None)
         self._state.reward[:] = 0.0
         self._state.terminated[:] = False
         self._state.truncated[:] = False
@@ -319,6 +371,8 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         Timing: ``apply_action`` -> ``physics_step`` -> ``compute_transition``
         (the only full simulator-data refresh) -> episode bookkeeping ->
         optional pre-reset ``final_obs`` capture for truncated rows ->
+        optional pre-reset ``final_state`` capture for done rows (when
+        requested via the ``capture_final_state`` constructor argument) ->
         ``reset(env_ids)`` for done rows (may refresh selected rows) ->
         ``compute_observation`` (whole batch, pure construction).
         """
@@ -339,6 +393,11 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         if trunc_ids.numel():
             with self.perf.scope("final_obs"):
                 self._state = self._state.replace(final_obs=self._capture_final_obs(trunc_ids))
+        if self._capture_final_state_enabled:
+            done_ids = torch.nonzero(self._state.done, as_tuple=False).flatten()
+            if done_ids.numel():
+                with self.perf.scope("final_state"):
+                    self._state = self._state.replace(final_state=self._capture_final_state(done_ids))
         with self.perf.scope("reset"):
             self._reset_done_envs()
         with self.perf.scope("observation"):
@@ -347,4 +406,4 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         return self._state
 
 
-__all__ = ["ArrayEnv", "ArrayEnvState", "EnvCfgType", "FinalObs", "EnvObs"]
+__all__ = ["ArrayEnv", "ArrayEnvState", "EnvCfgType", "FinalObs", "FinalState", "EnvObs"]

@@ -252,10 +252,14 @@ class _CounterCommandCfg(CommandCfg):
     def __call__(self, env: ManagerEnv) -> "_CounterCommand":
         shape = (env.num_envs, 1)
         return _CounterCommand(
+            lanes=_CounterLanes(
+                torch.zeros(shape, dtype=torch.float32),
+                torch.arange(4, dtype=torch.float32),
+            ),
+            command=torch.zeros(shape, dtype=torch.float32),
             double=torch.zeros(shape, dtype=torch.float32),
             reward_sum=torch.zeros(shape, dtype=torch.float32),
             reset_cover=torch.zeros(shape, dtype=torch.float32),
-            command=torch.zeros(shape, dtype=torch.float32),
         )
 
 
@@ -267,7 +271,21 @@ class _CounterGauges:
 
 
 @dataclass(frozen=True, slots=True)
+class _CounterLanes:
+    """Nested command state mixing per-env rows with a shared constant table.
+
+    Mirrors WBT's sampler-in-command shape: ``marks`` is per-lane state the
+    terminal-state capture must gather, ``table`` is episode-independent
+    shared data (clip-scale constants) with no row semantics.
+    """
+
+    marks: torch.Tensor
+    table: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
 class _CounterCommand(CommandTerm):
+    lanes: _CounterLanes
     double: torch.Tensor = metric()
     reward_sum: torch.Tensor = metric(name="reward_sum")
     reset_cover: torch.Tensor = metric()
@@ -848,6 +866,67 @@ def test_truncation_terms_accept_typed_group_and_reject_shared_names() -> None:
     env = ManagerEnv(clash, num_envs=2)
     with pytest.raises(ValueError, match="must be distinct"):
         env.init_state()
+
+
+def test_final_state_capture_off_by_default_keeps_zero_footprint() -> None:
+    cfg = _ManagerEnvCfg(truncations={"time_style": _InjectedTruncationCfg(threshold=0.5)})
+    env = ManagerEnv(cfg, num_envs=3)
+    env.init_state()
+
+    state = env.step(torch.tensor([[0.25], [0.75], [0.5]], dtype=torch.float32))
+
+    np.testing.assert_array_equal(state.done, [False, True, True])
+    # Unrequested capture never builds the plan nor touches the state: the
+    # request is a constructor argument, never a task-config declaration.
+    assert state.final_state is None
+    assert env._final_state_plan is None
+
+
+def test_final_state_captures_done_rows_post_advance_pre_reset() -> None:
+    cfg = _ManagerEnvCfg(
+        terminations={"limit": _InjectedTerminationCfg(threshold=0.6)},
+        truncations={"time_style": _InjectedTruncationCfg(threshold=0.7)},
+    )
+    env = ManagerEnv(cfg, num_envs=3, capture_final_state=True)
+    env.init_state()
+    command = _counter_command(env)
+    command.command[:] = 2.0
+
+    # Lane 1 ends time-style (truncated only) and lane 2 failure-style
+    # (terminated only): both are done rows and both must be captured, while
+    # final_obs keeps its truncated-only contract.
+    state = env.step(torch.tensor([[0.25], [0.75], [0.65]], dtype=torch.float32))
+    np.testing.assert_array_equal(state.truncated, [False, True, False])
+    np.testing.assert_array_equal(state.terminated, [False, True, True])
+    assert state.final_obs is not None
+    np.testing.assert_array_equal(state.final_obs.env_ids, [1])
+
+    final = state.final_state
+    assert final is not None
+    np.testing.assert_array_equal(final.env_ids, [1, 2])
+    # Payload keys: state channels only. Declared metric gauges (double,
+    # reward_sum, reset_cover, gauges.step_sum) and the shared constant table
+    # are excluded; the shared action cursor is not a per-env row.
+    assert set(final.commands) == {"counter.command", "counter.lanes.marks"}
+    assert set(final.actions) == {"test.action_queue", "test.reset_flags", "test.source"}
+    assert set(final.sim) == set(env.sim_data.keys)
+    assert final.commands["counter.lanes.marks"].shape == (2, 1)
+    # Command rows hold the post-advance, pre-reset terminal values: seeded
+    # 2.0 plus one dt of advance. The live rows were already reset to -1.
+    np.testing.assert_allclose(final.commands["counter.command"], np.full((2, 1), 2.0 + env.cfg.ctrl_dt))
+    np.testing.assert_allclose(command.command[[1, 2]], -np.ones((2, 1)))
+    # Action history rows carry this step's raw actions; the same lanes'
+    # live queues were zeroed by the reset that already ran.
+    np.testing.assert_allclose(final.actions["test.action_queue"][:, 1, 0], [0.75, 0.65])
+    np.testing.assert_allclose(env.action_terms["test"].state.action_queue[[1, 2]], 0.0)
+    # Rows are owned snapshots, not views of the resident storage.
+    assert final.commands["counter.command"].data_ptr() != command.command.data_ptr()
+
+    # Snapshots survive later steps; the field clears when no row is done.
+    saved = final.commands["counter.command"].clone()
+    next_state = env.step(torch.full((3, 1), 0.25, dtype=torch.float32))
+    assert next_state.final_state is None
+    np.testing.assert_allclose(final.commands["counter.command"], saved)
 
 
 @pytest.mark.parametrize("with_value", [False, True])

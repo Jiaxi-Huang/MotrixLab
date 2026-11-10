@@ -13,14 +13,14 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from motrix_env_core.array.env import ArrayEnv, ArrayEnvState, EnvCfgType, EnvObs, FinalObs
+from motrix_env_core.array.env import ArrayEnv, ArrayEnvState, EnvCfgType, EnvObs, FinalObs, FinalState
 from motrix_env_core.base import EnvCfg, ObsSpace
 from motrix_env_core.config import configclass
 from motrix_env_core.config.sim_reset import ManagerResetCfg
 from motrix_env_core.manager.actions import ActionCfg, ActionTerm, ManagerActionsCfg
 from motrix_env_core.manager.commands import CommandCfg, CommandTerm, ManagerCommandsCfg
 from motrix_env_core.manager.kernel import KernelOutputs
-from motrix_env_core.manager.kernel_data import validate_kernel_data
+from motrix_env_core.manager.kernel_data import iter_leaves, validate_kernel_data
 
 if TYPE_CHECKING:
     from motrix_env_core.manager.resolver import ManagerLayout, ResolvedManagerProgram
@@ -276,6 +276,21 @@ class SwapObsBuffer:
         return slot.observation, slot.kernel_outputs
 
 
+@dataclass(frozen=True)
+class _FinalStatePlan:
+    """Capture targets for the done rows' pre-reset terminal state.
+
+    Built once at construction: the resident command/action terms are frozen
+    kernel data whose fields are never replaced, and the read program serves
+    stable arena views, so the held tensor references stay valid for the
+    environment's lifetime. Keys pair with the tensors to gather rows from.
+    """
+
+    sim: tuple[tuple[str, torch.Tensor], ...]
+    commands: tuple[tuple[str, torch.Tensor], ...]
+    actions: tuple[tuple[str, torch.Tensor], ...]
+
+
 class ManagerEnv(ArrayEnv[EnvCfgType]):
     """Torch-frontend environment whose task program is generated from manager config."""
 
@@ -285,15 +300,19 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         num_envs: int = 1,
         backend: str | None = None,
         seed: int | None = None,
+        *,
+        capture_final_state: bool = False,
     ):
         """Construct a manager environment using the selected simulator backend.
 
         The numerical task program runs on the generic Torch executor
         (:class:`motrix_env_core.torch_manager.runtime.TorchManagerRuntime`).
+        ``capture_final_state`` is a runtime consumer request injected at
+        construction (sequence-model trainers); task configs never declare it.
         """
         if not isinstance(cfg, ManagerBasedEnvCfg):
             raise TypeError(f"{type(cfg).__name__} must inherit ManagerBasedEnvCfg.")
-        super().__init__(cfg, num_envs)
+        super().__init__(cfg, num_envs, capture_final_state=capture_final_state)
         self._rand_seed = 1 if seed is None else seed
         from motrix_env_core.sim.registry import create_sim_backend, default_sim_backend_name
 
@@ -314,6 +333,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         self._kernel_outputs: KernelOutputs | None = None
         self._observation_buffer: SwapObsBuffer | None = None
         self._final_obs_slot: _ObsBufferSlot | None = None
+        self._final_state_plan: _FinalStatePlan | None = None
         # Persistent kernel-bound sim-reset-request buffer
         # (``ctx.sim_reset_requested``), cleared before each physics step and
         # consumed by _reset_done_envs.
@@ -407,6 +427,8 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             else None
         )
         self._observation_space = ObsSpace(policy=policy_space, value=value_space)
+        if self._capture_final_state_enabled:
+            self._final_state_plan = self._build_final_state_plan()
 
     def create_renderer(self, config: RenderConfig) -> SimRenderer:
         return self.sim.create_renderer(
@@ -531,6 +553,54 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
                 policy=obs.policy[env_ids],
                 value=None if obs.value is None else obs.value[env_ids],
             ),
+        )
+
+    def _build_final_state_plan(self) -> _FinalStatePlan:
+        """Resolve the terminal-state capture plan once at construction.
+
+        Per-environment rows are exactly the kernel-data leaves whose leading
+        dimension is the batch width: shared constants (clip tables) and
+        scalar leaves have no per-lane rows. Declared ``metric()`` tensors
+        are excluded by identity — they are diagnostics, not state — so the
+        captured payload carries the exogenous channels, not the gauges.
+        """
+        num_envs = self.num_envs
+        metric_tensors = {id(value) for value in self.metrics.values()}
+        sim = tuple((key, self.sim_data.view(key)) for key in self.sim_data.keys)
+        commands: list[tuple[str, torch.Tensor]] = []
+        for name, term in self._command_terms.items():
+            for path, _annotation, value in iter_leaves(term):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim
+                    and value.shape[0] == num_envs
+                    and id(value) not in metric_tensors
+                ):
+                    commands.append((f"{name}.{'.'.join(path)}", value))
+        actions: list[tuple[str, torch.Tensor]] = []
+        for name, term in self._action_terms.items():
+            for path, _annotation, value in iter_leaves(term.state):
+                if isinstance(value, torch.Tensor) and value.ndim and value.shape[0] == num_envs:
+                    actions.append((f"{name}.{'.'.join(path)}", value))
+        return _FinalStatePlan(sim=sim, commands=tuple(commands), actions=tuple(actions))
+
+    def _capture_final_state(self, env_ids: torch.Tensor) -> FinalState:
+        """Gather done rows' terminal state after evaluate, before reset.
+
+        The plan's resident tensors are about to be rewritten by the reset
+        kernel; advanced indexing creates the owned snapshots first. No extra
+        kernel runs: the read arena still holds the post-physics values that
+        ``compute_transition`` refreshed, and the command rows are the
+        post-advance values (evaluate already ran the command hooks).
+        """
+        assert self._final_state_plan is not None
+        plan = self._final_state_plan
+        ids = torch.as_tensor(env_ids, dtype=torch.long)
+        return FinalState(
+            env_ids=ids.clone(),
+            sim={key: view[ids] for key, view in plan.sim},
+            commands={key: leaf[ids] for key, leaf in plan.commands},
+            actions={key: leaf[ids] for key, leaf in plan.actions},
         )
 
     def _resolve_action_actuators(self) -> dict[str, tuple[ActuatorSpec, ...] | None]:
