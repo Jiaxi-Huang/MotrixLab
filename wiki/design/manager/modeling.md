@@ -144,9 +144,14 @@ learner 用 program 在想象态上算 reward / obs / survive。
 
 ## 与 P2.4 的边界
 
-read query 语义类型的**可想象性声明**（新增 `SimDataQuery` 子类时声明可否
-想象的框架义务）与 device-mobile FK 在 P2.4 落地；P2.3 的 dry-run 已在执行层
-兜底不可想象访问。FK chain 作为共享常量在 P2.3 即受 D-A 只读共享规则约束。
+read query 语义类型的**可想象性声明已落地**：`SimDataQuery` 子类强制声明
+`modelable: ClassVar[bool]`（`__init_subclass__` 在类定义期拦截漏声明），
+派生在 dry-run 之前做类型级拒绝——read 集含不可想象类型即报错（key + 类型
+名）。可微 FK 本体（`KinematicTree`、MotrixSim loader、`KinematicTreeQuery`
+声明通道、write-program 烘焙的 FK 刷新）已由 #163 上游化进 core，本设计直接
+消费：树作为 D-A 共享常量进想象侧，device 需求经 `KinematicTreeQuery(device=)`
+声明满足。"树 FK(模型态) == sim FK(read 视图)"的 parity fixture 随 P3.2 的
+第一个消费者（supermimic）落地。
 
 ## 文件改动
 

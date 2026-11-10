@@ -69,7 +69,7 @@ class ModelingView:
 
     fields: Mapping[str, FieldDesc]
     exogenous: Mapping[str, ExogenousRule]
-    program: "ModelingProgram"
+    program: ModelingProgram
     action_process: Mapping[str, Callable]
 
 
@@ -148,10 +148,7 @@ def _shadow_action_state(value: Any) -> Any:
         return value.clone()
     if isinstance(value, Map):
         return Map(
-            {
-                key: _shadow_action_state(entry)
-                for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)
-            }
+            {key: _shadow_action_state(entry) for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)}
         )
     if is_kernel_data(value):
         return type(value)(*(_shadow_action_state(getattr(value, f.name)) for f in fields(type(value))))
@@ -226,8 +223,7 @@ class ModelingProgram:
         unknown = sorted(set(state) - set(self._host.field_keys))
         if unknown:
             raise ValueError(
-                f"modeling state carries undeclared fields: {unknown}; "
-                f"declared: {list(self._host.field_keys)}."
+                f"modeling state carries undeclared fields: {unknown}; declared: {list(self._host.field_keys)}."
             )
         return replace(self._host.ctx, sim=Map(state))
 
@@ -357,13 +353,9 @@ class ModelingProgram:
             _guarded("command", f"{hook.receiver_key}.update", hook.function)(receiver, ctx)
         for call, layout_term in zip(self._program.rewards, self._program.layout.rewards, strict=True):
             _guarded("reward", layout_term.name, call.function)(ctx, *self._args(call, ctx))
-        for call, layout_term in zip(
-            self._program.terminations, self._program.layout.terminations, strict=True
-        ):
+        for call, layout_term in zip(self._program.terminations, self._program.layout.terminations, strict=True):
             _guarded("termination", layout_term.name, call.function)(ctx, *self._args(call, ctx))
-        for call, layout_term in zip(
-            self._program.truncations, self._program.layout.truncations, strict=True
-        ):
+        for call, layout_term in zip(self._program.truncations, self._program.layout.truncations, strict=True):
             _guarded("truncation", layout_term.name, call.function)(ctx, *self._args(call, ctx))
         for group_name, group_layout in self._program.layout.observations.items():
             target = torch.zeros((self._host.num_envs, group_layout.size), dtype=torch.float32)
@@ -389,14 +381,21 @@ def derive_modeling_view(env: Any) -> ModelingView:
     num_envs = env.num_envs
     metric_tensors = {id(value) for value in env.metrics.values()}
 
-    fields = {
-        sim_input.key: FieldDesc(sim_input.key, type(env.sim_data.query(sim_input.key)), sim_input.shape)
-        for sim_input in program.layout.sim_inputs
-    }
-    commands = {
-        name: _shadow_kernel_data(term, num_envs, metric_tensors)
-        for name, term in env.command_terms.items()
-    }
+    fields = {}
+    for sim_input in program.layout.sim_inputs:
+        query_type = type(env.sim_data.query(sim_input.key))
+        # Type-level imaginability complements the dry run: a declared query
+        # whose semantic type imagination cannot serve (contact, sensing,
+        # rendering...) aborts derivation with the key and type named,
+        # before any term runs.
+        if not query_type.modelable:
+            raise ModelingDerivationError(
+                f"modeling derivation failed: declared read key {sim_input.key!r} "
+                f"({query_type.__name__}) is not modelable — the modeling state "
+                "cannot serve its semantic type."
+            )
+        fields[sim_input.key] = FieldDesc(sim_input.key, query_type, sim_input.shape)
+    commands = {name: _shadow_kernel_data(term, num_envs, metric_tensors) for name, term in env.command_terms.items()}
     metrics = {name: torch.zeros_like(value) for name, value in env.metrics.items()}
     actions: dict[str, _ShadowAction] = {}
     for name, term in env.action_terms.items():

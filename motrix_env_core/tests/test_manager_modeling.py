@@ -10,7 +10,8 @@ the Phase 2 acceptance line is that the same terms produce the same numbers
 through both context bindings.
 """
 
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 import gymnasium as gym
 import numpy as np
@@ -47,7 +48,6 @@ from motrix_env_core.manager import (  # noqa: E402
     TruncationTermCfg,
     metric,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixture: one action term and one command term with a channel per rule.
@@ -390,10 +390,7 @@ def test_shadow_isolation_after_imagination() -> None:
     program = env.modeling_view().program
     program.sync_from_env()
     real = env.command_terms["phase"]
-    saved = {
-        name: getattr(real, name).clone()
-        for name in ("command", "goal", "bias", "derived", "gauge")
-    }
+    saved = {name: getattr(real, name).clone() for name in ("command", "goal", "bias", "derived", "gauge")}
     saved_table = real.table.clone()
     saved_queue = env.action_terms["test"].state.action_queue.clone()
     saved_ptr = env.action_terms["test"].state.action_ptr.clone()
@@ -466,6 +463,31 @@ def test_dry_run_error_names_term_and_field() -> None:
         env.modeling_view()
 
 
+def test_query_types_must_declare_modelability() -> None:
+    from motrix_env_core.sim.read import SimDataQuery
+
+    with pytest.raises(TypeError, match="modelable"):
+
+        @dataclass(frozen=True, kw_only=True)
+        class _Undeclared(SimDataQuery):
+            def compile_with(self, compiler, *, key: str) -> None:
+                del compiler, key
+
+
+def test_derivation_rejects_non_modelable_queries() -> None:
+    from test_manager_sim_backend import _FakeManagerCfg
+
+    from motrix_env_core.sim import LinkNetContactForceQuery
+
+    cfg = _FakeManagerCfg()
+    cfg.queries.data["contact"] = LinkNetContactForceQuery(link="robot")
+    env = ManagerEnv(cfg, num_envs=2, backend="fake-manager")
+    env.init_state()
+
+    with pytest.raises(ModelingDerivationError, match=r"contact.*LinkNetContactForceQuery.*not modelable"):
+        env.modeling_view()
+
+
 def test_exogenous_annotation_validation() -> None:
     cfg = _ModelingEnvCfg(truncations={})
     cfg.commands.phase.exogenous = {"nope": ExogenousRule(kind=ExogenousKind.INCREMENT)}
@@ -476,9 +498,7 @@ def test_exogenous_annotation_validation() -> None:
         env.modeling_view()
 
     cfg = _ModelingEnvCfg(truncations={})
-    cfg.commands.phase.exogenous = {
-        "command": ExogenousRule(kind=ExogenousKind.COPY_ACTION, action_term="missing")
-    }
+    cfg.commands.phase.exogenous = {"command": ExogenousRule(kind=ExogenousKind.COPY_ACTION, action_term="missing")}
     env = ManagerEnv(cfg, num_envs=2)
     env.physics_step = lambda: None
     env.init_state()
