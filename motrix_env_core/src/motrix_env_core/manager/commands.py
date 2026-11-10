@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, fields
+from dataclasses import field as dataclass_field
 from typing import TYPE_CHECKING
 
 import torch
 
 from motrix_env_core.config import configclass
+from motrix_env_core.manager.exogenous import ExogenousRule
 
 if TYPE_CHECKING:
     from motrix_env_core.manager.context import ManagerContext
@@ -67,7 +69,17 @@ class CommandTerm(abc.ABC):
 
 @configclass(kw_only=True)
 class CommandCfg(abc.ABC):
-    """Configuration that creates one environment-local command term."""
+    """Configuration that creates one environment-local command term.
+
+    ``exogenous`` annotates which per-environment state leaves are exogenous
+    channels (not world-model-predicted) and how imagination advances them —
+    one :class:`ExogenousRule` (kind discriminator) per dotted leaf path.
+    The annotation derives the imagination semantics and never changes real
+    path behavior (see the dual-path modeling design); unannotated leaves
+    stay ordinary state.
+    """
+
+    exogenous: dict[str, ExogenousRule] = dataclass_field(default_factory=dict)
 
     @abc.abstractmethod
     def __call__(self, env: ManagerEnv) -> CommandTerm:

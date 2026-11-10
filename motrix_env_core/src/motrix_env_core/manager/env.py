@@ -23,6 +23,7 @@ from motrix_env_core.manager.kernel import KernelOutputs
 from motrix_env_core.manager.kernel_data import iter_leaves, validate_kernel_data
 
 if TYPE_CHECKING:
+    from motrix_env_core.manager.modeling import ModelingView
     from motrix_env_core.manager.resolver import ManagerLayout, ResolvedManagerProgram
 from motrix_env_core.manager.metrics import collect_metrics, materialize_metrics
 from motrix_env_core.manager.observations import (
@@ -329,6 +330,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
 
         self._task_program: TorchTaskProgram | None = None
         self._kernel_buffers: tuple[Any, ...] | None = None
+        self._modeling_view: Any | None = None
         self.metrics: dict[str, torch.Tensor] = {}
         self._kernel_outputs: KernelOutputs | None = None
         self._observation_buffer: SwapObsBuffer | None = None
@@ -870,6 +872,22 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         self._compiled_manager_program = ManagerProgramResolver(self).build()
         self._torch_runtime = TorchManagerRuntime(self, self._compiled_manager_program)
         return self._torch_runtime.task_program()
+
+    def modeling_view(self) -> ModelingView:
+        """Derive (once) the dual-path modeling view of this environment.
+
+        APG trainability is a derived property of the config: the first call
+        binds the resolved term call records onto a shadow context and
+        dry-runs every group (see the dual-path modeling design). Derivation
+        failure raises :class:`ModelingDerivationError` naming the offending
+        group, term, and field — a task that cannot be imagined fails here,
+        never mid-training. No subclass overrides this.
+        """
+        if self._modeling_view is None:
+            from motrix_env_core.manager.modeling import derive_modeling_view
+
+            self._modeling_view = derive_modeling_view(self)
+        return self._modeling_view
 
     @property
     def observation_groups(self) -> dict[str, ObservationGroupEntry]:

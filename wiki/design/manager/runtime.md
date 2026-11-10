@@ -212,7 +212,17 @@ Observation terms use the host-side ``ObservationTerm(size, dispatch, *args)`` f
 - 首次调用（惰性 specialization）、warm-up 和稳态 step latency 分开统计；绝对性能门槛属于 benchmark，不属于环境行为测试；
 - CI 验证数值行为、reset/step 生命周期和 buffer identity。
 
-## 6. 不变量
+## 6. 双路径建模（派生能力）
+
+Manager 的 term call records 是纯数据，可绑定到第二个 shadow context 再执行一次：
+`ManagerEnv.modeling_view()` 派生 `ModelingView`（字段集 = 声明 read 集、外生通道
+规则、eager `ModelingProgram`、action process 同一函数对象），首调用做 dry-run
+——任一 reward/observation/termination/truncation group 或 command update hook
+不可想象即抛错（报错含 group、term、字段名）。外生规则以 `CommandCfg.exogenous`
+注记声明（`increment`/`copy_action`/`constant`），只描述想象语义，不改变真实路径。
+细节见 [Manager 双路径建模设计](./modeling.md)。
+
+## 7. 不变量
 
 - Manager kernel 只为当前环境配置构建，runtime 不重建另一份 manager 配置；
 - config 不持有 runtime state，concrete term 是其 persistent state 的唯一 owner；

@@ -13,7 +13,14 @@ from motrix_env_core.manager.actions import (
 from motrix_env_core.manager.commands import CommandCfg, CommandTerm, ManagerCommandsCfg
 from motrix_env_core.manager.context import BuildContext, ManagerContext
 from motrix_env_core.manager.env import ManagerBasedEnvCfg, ManagerEnv
+from motrix_env_core.manager.exogenous import ExogenousKind, ExogenousRule
 from motrix_env_core.manager.metrics import metric
+from motrix_env_core.manager.modeling import (
+    FieldDesc,
+    ModelingDerivationError,
+    ModelingProgram,
+    ModelingView,
+)
 from motrix_env_core.manager.observations import (
     ManagerObservationGroupCfg,
     ManagerObservationsCfg,
@@ -58,6 +65,12 @@ __all__ = [
     "ObsTerm",
     "ObservationTermCfg",
     "BaseTerm",
+    "ExogenousKind",
+    "ExogenousRule",
+    "FieldDesc",
+    "ModelingDerivationError",
+    "ModelingProgram",
+    "ModelingView",
     "RewardTerm",
     "RewardTermCfg",
     "ManagerResetCfg",

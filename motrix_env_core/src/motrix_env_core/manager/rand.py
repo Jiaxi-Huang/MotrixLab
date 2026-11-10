@@ -42,6 +42,24 @@ class RandValue:
         return low + (high - low) * 0.5 * (self.next_uniform(count) + 1.0)
 
 
+@dataclass(frozen=True, slots=True)
+class DeterministicRandValue(RandValue):
+    """Zero-fill RNG stand-in for the imagination path.
+
+    Observation noise and any ``ctx.rand`` consumption inside terms evaluate
+    deterministically: ``next_uniform`` returns zeros (``[-1, 1)`` midpoint)
+    and ``uniform_range`` returns the range midpoint, without touching the
+    state tensor. The shadow state never advances, so imagination draws stay
+    reproducible regardless of rollout depth.
+    """
+
+    def next_uniform(self, count: int = 1) -> torch.Tensor:
+        return torch.zeros((self.state.shape[0], count), dtype=torch.float32)
+
+    def uniform_range(self, count: int, low: float, high: float) -> torch.Tensor:
+        return torch.full((self.state.shape[0], count), (low + high) * 0.5, dtype=torch.float32)
+
+
 def initialize_rand_states(num_envs: int, rand_seed: int) -> torch.Tensor:
     """Derive one deterministic, independently mutable SplitMix64 state per environment."""
 
@@ -84,6 +102,7 @@ def draw_uniform(state: torch.Tensor, count: int) -> tuple[torch.Tensor, torch.T
 
 
 __all__ = [
+    "DeterministicRandValue",
     "RandValue",
     "draw_uniform",
     "initialize_rand_states",
