@@ -64,21 +64,28 @@ def _iter_class_leaves(
     path: tuple[str, ...],
     stack: tuple[type, ...],
 ) -> Iterator[tuple[tuple[str, ...], Any, Any]]:
-    if declared_type in stack:
+    value_type = type(value)
+    # The cycle check runs before any value check: a cyclic structure can
+    # surface here with any leaf value (including None) under a repeat type.
+    if declared_type in stack or value_type in stack:
         chain = " -> ".join(item.__name__ for item in (*stack, declared_type))
         raise TypeError(f"KernelData cycle detected: {chain}.")
-    if type(value) is not declared_type:
-        raise TypeError(f"KernelData value must be {declared_type.__name__}, got {type(value).__name__}.")
-    stack = (*stack, declared_type)
-    hints = get_type_hints(declared_type, include_extras=True)
-    for data_field in fields(declared_type):
+    if not isinstance(value, declared_type):
+        raise TypeError(f"KernelData value must be {declared_type.__name__}, got {value_type.__name__}.")
+    # Fields are walked on the runtime type, so a field annotated with a
+    # kernel-data base class accepts any subclass instance and still exposes
+    # the subclass's own tensor leaves (one implementation per variant, e.g.
+    # pluggable curriculum samplers nested in a command term).
+    stack = (*stack, value_type)
+    hints = get_type_hints(value_type, include_extras=True)
+    for data_field in fields(value_type):
         annotation = hints[data_field.name]
         field_path = (*path, data_field.name)
         field_value = getattr(value, data_field.name)
         if annotation is Map or get_origin(annotation) is Map:
             if not isinstance(field_value, Map):
                 raise TypeError(
-                    f"KernelData {declared_type.__name__}.{'.'.join(field_path)} requires a concrete Map value."
+                    f"KernelData {value_type.__name__}.{'.'.join(field_path)} requires a concrete Map value."
                 )
             yield from _iter_map_leaves(field_value, field_path, stack)
         elif is_kernel_data_type(annotation):

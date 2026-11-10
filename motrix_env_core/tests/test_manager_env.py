@@ -10,6 +10,7 @@ without a simulator backend.
 """
 
 from dataclasses import dataclass, fields, replace
+from dataclasses import field as dataclass_field
 
 import gymnasium as gym
 import numpy as np
@@ -231,9 +232,17 @@ class _CounterCommandCfg(CommandCfg):
 
 
 @dataclass(frozen=True, slots=True)
+class _CounterGauges:
+    """Nested kernel-data sub-object carrying its own metric gauge."""
+
+    step_sum: torch.Tensor = metric(name="counter_step_sum", scalar=True)
+
+
+@dataclass(frozen=True, slots=True)
 class _CounterCommand(CommandTerm):
     double: torch.Tensor = metric()
     reward_sum: torch.Tensor = metric(name="reward_sum")
+    gauges: _CounterGauges = dataclass_field(default_factory=_CounterGauges)
 
     def update(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.double[:, 0] = 2.0 * ctx.actions["test"].source[:, 0]
@@ -241,6 +250,7 @@ class _CounterCommand(CommandTerm):
     def advance(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.command[:, 0] += ctx.dt
         self.reward_sum[:, 0] += ctx.reward
+        self.gauges.step_sum.copy_(self.gauges.step_sum + 1.0)
 
     def reset(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.command[ctx.reset_ids, 0] = -1.0
@@ -595,6 +605,20 @@ def test_manager_context_is_injected_once_and_reused_across_all_term_kinds() -> 
     np.testing.assert_allclose(np.ravel(state.metrics["double"]), [0.5, 1.5])
     np.testing.assert_allclose(state.reward_terms["source"], [0.005, 0.015])
     assert env._compiled_manager_program is not None
+
+
+def test_nested_kernel_data_metrics_are_materialized_and_collected() -> None:
+    env = _ManagerEnv(num_envs=2)
+    command = _counter_command(env)
+    state = env.step(torch.zeros((2, 1), dtype=torch.float32))
+
+    # The nested gauge was materialized at construction and registered under
+    # its declared name; the advance hook wrote through it.
+    assert "counter_step_sum" in env.metrics
+    assert env.metrics["counter_step_sum"].data_ptr() == command.gauges.step_sum.data_ptr()
+    assert command.gauges.step_sum.item() == 1.0
+    assert state.metrics["counter_step_sum"].item() == 1.0
+    assert state.process_metrics()["counter_step_sum"] == 1.0
 
 
 def test_context_reward_mirrors_state_reward_in_advance_hook() -> None:

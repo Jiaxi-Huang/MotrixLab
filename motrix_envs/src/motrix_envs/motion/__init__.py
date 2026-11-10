@@ -8,7 +8,11 @@ See `wiki/design/motrixlab-motion-npz-schema.md` for the full specification.
 
 from motrix_envs.motion.library import MotionLibrary
 from motrix_envs.motion.loader import MotrixMotion
-from motrix_envs.motion.sampler import AdaptiveTimestepsSampler
+from motrix_envs.motion.sampler import (
+    AdaptiveTimestepsSampler,
+    MotionStartSampler,
+    UniformTimestepsSampler,
+)
 from motrix_envs.motion.schema import (
     OPTIONAL_FIELDS,
     REQUIRED_FIELDS,
@@ -21,6 +25,8 @@ __all__ = [
     "MotionLibrary",
     "WbtMotionClip",
     "MotionChannel",
+    "MotionStartSampler",
+    "UniformTimestepsSampler",
     "AdaptiveTimestepsSampler",
     "REQUIRED_FIELDS",
     "OPTIONAL_FIELDS",

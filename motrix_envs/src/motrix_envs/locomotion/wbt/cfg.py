@@ -244,7 +244,7 @@ class WbtEnvCfg(ManagerBasedEnvCfg):
     def for_play(self) -> WbtEnvCfg:
         cfg = deepcopy(self)
         cfg.max_episode_seconds = None
-        cfg.commands.motion.adaptive_sampling_enabled = False
+        cfg.commands.motion.sampling_mode = "uniform"
         cfg.commands.motion.start_at_timestep_zero_prob = 1.0
         cfg.commands.motion.sequential_clips = True
         cfg.commands.motion.hold_at_clip_end = False

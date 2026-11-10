@@ -55,12 +55,15 @@ main 上唯一的 motion 消费者是 `WbtMotionCommand`，"单 clip"假设同�
 - kernel 侧复用单元保持为模块级 `@njit` helper（起帧抽样、边界推进），`@dispatch` 方法是薄组合；
   子类可自由增加字段（manager 编译器按具体类编译）。
 
-### 课程平面：v1 冻结现状
+### 课程平面：v1 冻结现状（已被 sampler 族落地取代）
 
 现有计数 EMA + 全局 bin + CDF 原样运行于拼接语料。已知的多 clip 统计缺口（裸计数的自增强偏置、
-全局 bin 跨 clip 边界、无 per-clip 等权、平滑跨 clip 泄漏、缺访问归一）**不在本版解决**；
-后续演进作为独立设计另立文档，届时以可替换的 host 侧 sampler 组件形态进入，kernel 只消费 CDF 的
-契约在泛化时即成立。
+全局 bin 跨 clip 边界、无 per-clip 等权、平滑跨 clip 泄漏、缺访问归一）**不在本版解决**。
+
+> **2026-11 更新**：该演进已由 [APG 设计](./wm-bptt-trainer.md) P1 落地为
+> `motion/sampler.py` 的 torch 原生 `MotionStartSampler` 族（uniform / adaptive /
+> return，`sampling_mode` 驱动，per-clip bins 消除跨 clip 混叠，课程状态驻留
+> sampler 对象而非共享 command term）；单 clip 语料的采样数学与全局 bin 版本逐位一致。
 
 ## 通道声明
 
