@@ -6,7 +6,13 @@
 import torch
 
 from motrix_env_core.config import configclass
-from motrix_env_core.manager import ManagerContext, TerminationTerm, TerminationTermCfg
+from motrix_env_core.manager import (
+    ManagerContext,
+    TerminationTerm,
+    TerminationTermCfg,
+    TruncationTerm,
+    TruncationTermCfg,
+)
 
 
 @configclass(kw_only=True)
@@ -144,3 +150,23 @@ class BadDofPositionTerminationCfg(_WbtTerminationCfg):
             float(self.threshold),
             metric_names=("dof_limit_violation_max",),
         )
+
+
+def motion_clip_end_truncation(ctx: ManagerContext) -> torch.Tensor:
+    """Truncate a lane once its frame index reaches the clip's last frame.
+
+    Time-limit semantics, not failure: the lambda-return bootstraps the value
+    of the truncated state. In imagination this term is what bounds the
+    ``steps`` increment channel — the real advance's clip-end branches
+    (hold/loop/resample) have no imagination counterpart, and the truncation
+    gate masks the imagined tail beyond the last frame.
+    """
+    motion = ctx.commands["motion"]
+    steps = motion.steps[:, 0]
+    return steps + 1 > motion.clip.frame_clip_end[steps]
+
+
+@configclass(kw_only=True)
+class MotionClipEndTruncationCfg(TruncationTermCfg):
+    def __call__(self, ctx) -> TruncationTerm:
+        return TruncationTerm(motion_clip_end_truncation)

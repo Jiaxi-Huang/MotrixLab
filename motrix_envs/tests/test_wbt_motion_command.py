@@ -101,6 +101,9 @@ def _command(
         hold_at_clip_end=hold_at_clip_end,
         sequential_clips=sequential_clips,
         steps=steps if steps is not None else torch.zeros((num_envs, 1), dtype=torch.int64),
+        steps_gauge=(
+            steps[:, 0].to(torch.float32) if steps is not None else torch.zeros(num_envs, dtype=torch.float32)
+        ),
         clip_ended=torch.zeros((num_envs, 1), dtype=torch.bool),
         command=torch.empty((num_envs, 2), dtype=torch.float32),
     )

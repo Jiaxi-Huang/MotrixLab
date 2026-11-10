@@ -102,25 +102,23 @@ class _ShadowHost:
     num_envs: int
 
 
-def _shadow_kernel_data(value: Any, num_envs: int, metric_tensors: set[int]) -> Any:
-    """Rebuild one command kernel-data tree under the frozen shadow rules.
+def _resize_kernel_data(value: Any, old_num_envs: int, new_num_envs: int) -> Any:
+    """Rebuild one shadow tree at a different batch width.
 
-    Per-environment rows (leading dim == num_envs) clone into independent
-    storage so imagination writes never leak back; shared tensors and scalar
-    leaves pass through as the same objects (episode-independent constants,
-    shared read-only); declared metric tensors become fresh zero sinks that
-    terms may write and nobody reads.
+    Per-environment leaves (leading dim == the width the tree was built at)
+    become zero tensors at the new width — the imagination caller seeds the
+    channels and working memory it cares about; shared constants and scalar
+    leaves pass through unchanged. Metric sinks were zeros and stay zeros,
+    resized with the rows.
     """
     if isinstance(value, torch.Tensor):
-        if id(value) in metric_tensors:
-            return torch.zeros_like(value)
-        if value.ndim and value.shape[0] == num_envs:
-            return value.clone()
+        if value.ndim and value.shape[0] == old_num_envs:
+            return torch.zeros((new_num_envs, *value.shape[1:]), dtype=value.dtype, device=value.device)
         return value
     if isinstance(value, Map):
         return Map(
             {
-                key: _shadow_kernel_data(entry, num_envs, metric_tensors)
+                key: _resize_kernel_data(entry, old_num_envs, new_num_envs)
                 for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)
             }
         )
@@ -129,29 +127,68 @@ def _shadow_kernel_data(value: Any, num_envs: int, metric_tensors: set[int]) -> 
         changed = False
         for data_field in fields(type(value)):
             leaf = getattr(value, data_field.name)
-            shadow = _shadow_kernel_data(leaf, num_envs, metric_tensors)
+            resized = _resize_kernel_data(leaf, old_num_envs, new_num_envs)
+            changed = changed or resized is not leaf
+            rebuilt.append(resized)
+        return type(value)(*rebuilt) if changed else value
+    return value
+
+
+def _shadow_kernel_data(value: Any, num_envs: int, metric_tensors: set[int], *, detach: bool = False) -> Any:
+    """Rebuild one command kernel-data tree under the frozen shadow rules.
+
+    Per-environment rows (leading dim == num_envs) clone into independent
+    storage so imagination writes never leak back; shared tensors and scalar
+    leaves pass through as the same objects (episode-independent constants,
+    shared read-only); declared metric tensors become fresh zero sinks that
+    terms may write and nobody reads. ``detach`` cuts the clones from any
+    outer autograd graph (the imagination-batch boundary).
+    """
+    if isinstance(value, torch.Tensor):
+        if id(value) in metric_tensors:
+            return torch.zeros_like(value)
+        if value.ndim and value.shape[0] == num_envs:
+            return value.detach().clone() if detach else value.clone()
+        return value.detach() if detach and value.requires_grad else value
+    if isinstance(value, Map):
+        return Map(
+            {
+                key: _shadow_kernel_data(entry, num_envs, metric_tensors, detach=detach)
+                for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)
+            }
+        )
+    if is_kernel_data(value):
+        rebuilt = []
+        changed = False
+        for data_field in fields(type(value)):
+            leaf = getattr(value, data_field.name)
+            shadow = _shadow_kernel_data(leaf, num_envs, metric_tensors, detach=detach)
             changed = changed or shadow is not leaf
             rebuilt.append(shadow)
         return type(value)(*rebuilt) if changed else value
     return value
 
 
-def _shadow_action_state(value: Any) -> Any:
+def _shadow_action_state(value: Any, *, detach: bool = False) -> Any:
     """Copy every tensor leaf of one action state.
 
     Action state is working memory — the raw-action queue, the shared
     cursor, and custom per-env rows — all of it mutable and none of it an
     episode-independent constant, so sharing any leaf with the real term
-    would let imagination advance the collector's history.
+    would let imagination advance the collector's history. ``detach`` cuts
+    the copies from an outer autograd graph (imagination-batch boundary).
     """
     if isinstance(value, torch.Tensor):
-        return value.clone()
+        return value.detach().clone() if detach else value.clone()
     if isinstance(value, Map):
         return Map(
-            {key: _shadow_action_state(entry) for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)}
+            {
+                key: _shadow_action_state(entry, detach=detach)
+                for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)
+            }
         )
     if is_kernel_data(value):
-        return type(value)(*(_shadow_action_state(getattr(value, f.name)) for f in fields(type(value))))
+        return type(value)(*(_shadow_action_state(getattr(value, f.name), detach=detach) for f in fields(type(value))))
     return value
 
 
@@ -301,10 +338,160 @@ class ModelingProgram:
         for entry in self._exogenous_entries:
             rule = entry.rule
             if rule.kind is ExogenousKind.INCREMENT:
-                entry.tensor.add_(float(rule.step))
+                if entry.tensor.dtype.is_floating_point:
+                    entry.tensor.add_(float(rule.step))
+                else:
+                    # Integer channels (frame indices) step by whole units.
+                    if float(rule.step) != int(rule.step):
+                        raise ValueError(
+                            f"Exogenous channel {entry.channel!r} is integer-valued; "
+                            f"increment step must be a whole number, got {rule.step}."
+                        )
+                    entry.tensor.add_(int(rule.step))
             elif rule.kind is ExogenousKind.COPY_ACTION:
                 assert entry.action_slice is not None
                 entry.tensor.copy_(action[:, entry.action_slice].reshape(entry.tensor.shape))
+
+    def rebind_action_state(self, *, detach: bool = False) -> None:
+        """Swap the shadow action working memory for fresh clones, in place.
+
+        Imagination under autograd writes the action history every step
+        (``process`` is in-place, as in the real env). Cloning before each
+        step's application makes every tensor be written exactly once after
+        its creation, so the version checks of backward stay satisfied while
+        gradients still flow through the clones into the applied actions.
+        """
+        rebuilt = {}
+        for name, shadow in self._host.actions.items():
+            clone = copy.copy(shadow.term)
+            clone.state = _shadow_action_state(shadow.term.state, detach=detach)
+            rebuilt[name] = replace(shadow, term=clone)
+        self._host.actions = rebuilt
+        self._host.ctx.actions = Map({name: shadow.term.state for name, shadow in rebuilt.items()})
+
+    def rebind_shadow_state(self, *, detach: bool = False) -> None:
+        """Fresh clones of the whole mutable shadow state (commands + actions).
+
+        The per-step generalization of :meth:`rebind_action_state`: command
+        hooks also rewrite per-environment leaves in place (derived targets,
+        gauges), so before each imagined step every mutable leaf becomes a
+        clone — written exactly once — while shared constants (clip tables,
+        FK chains) keep their read-only identity. Exogenous entry tensors
+        re-point at the cloned channels, keeping ``advance_exogenous`` and
+        ``seed_exogenous`` addressing the live leaves. ``detach`` cuts the
+        clones from any outer graph: the boundary between imagination
+        batches (the previous batch's graph is already freed).
+        """
+        num_envs = self._host.num_envs
+        commands = {
+            name: _shadow_kernel_data(term, num_envs, set(), detach=detach)
+            for name, term in self._host.commands.items()
+        }
+        self._host.commands = commands
+        self._host.ctx.commands = Map(dict(commands))
+        channels = {}
+        for name, term in commands.items():
+            for path, _annotation, value in iter_leaves(term):
+                channels[f"{name}.{'.'.join(path)}"] = value
+        self._exogenous_entries = tuple(
+            replace(entry, tensor=channels[entry.channel]) if entry.channel in channels else entry
+            for entry in self._exogenous_entries
+        )
+        self._host.ctx.metrics = Map(
+            {
+                name: torch.zeros_like(value)
+                if not detach
+                else torch.zeros(value.shape, dtype=value.dtype, device=value.device)
+                for name, value in self._host.ctx.metrics.items()
+            }
+        )
+        self.rebind_action_state(detach=detach)
+
+    def seed_exogenous(self, values: Mapping[str, torch.Tensor]) -> None:
+        """Write caller-held rows into the shadow exogenous channels.
+
+        The imagination start point for history-derived batches: each value
+        (``"<command>.<leaf-path>"`` → ``(batch, ...)`` rows, e.g. a replayed
+        slot's stored channel values) copies into the shadow leaf in place,
+        after which ``advance_exogenous`` continues from the right phase.
+        """
+        known = {entry.channel: entry.tensor for entry in self._exogenous_entries}
+        unknown = sorted(set(values) - set(known))
+        if unknown:
+            raise ValueError(f"Unknown exogenous channels {unknown}; declared: {sorted(known)}.")
+        for channel, value in values.items():
+            target = known[channel]
+            if tuple(value.shape) != tuple(target.shape):
+                raise ValueError(
+                    f"Exogenous channel {channel!r} shape {tuple(value.shape)} does not match {tuple(target.shape)}."
+                )
+            target.copy_(value)
+
+    def resized(self, num_envs: int) -> ModelingProgram:
+        """A sibling program whose shadow host runs at another batch width.
+
+        Imagination batches are sampled from the replay, so their width is
+        the learner's choice, not the env's lane count. The sibling shares
+        the call records, action process, reward weights, and exogenous
+        rules; every per-environment shadow leaf (command state, action
+        working memory, metric sinks, control mirrors) becomes a zero tensor
+        at the new width for the caller to seed — channel values and action
+        history included. The original program is untouched.
+        """
+        old = self._host.num_envs
+        commands = {name: _resize_kernel_data(term, old, num_envs) for name, term in self._host.commands.items()}
+        actions: dict[str, _ShadowAction] = {}
+        for name, shadow in self._host.actions.items():
+            clone = copy.copy(shadow.term)
+            clone.state = _resize_kernel_data(shadow.term.state, old, num_envs)
+            actions[name] = replace(shadow, term=clone)
+        device = self._host.ctx.terminated.device
+        ctx = replace(
+            self._host.ctx,
+            env_id=torch.zeros((num_envs, 1), dtype=self._host.ctx.env_id.dtype, device=device),
+            actions=Map({name: shadow.term.state for name, shadow in actions.items()}),
+            commands=Map(dict(commands)),
+            metrics=Map(
+                {
+                    name: torch.zeros((num_envs, *value.shape[1:]), dtype=value.dtype, device=device)
+                    for name, value in self._env.metrics.items()
+                }
+            ),
+            rand=DeterministicRandValue(torch.zeros((num_envs, 1), dtype=torch.int64, device=device)),
+            sim=Map({}),
+            sim_reset_requested=torch.zeros((num_envs, 1), dtype=torch.bool, device=device),
+            reset_ids=torch.zeros(0, dtype=torch.int64, device=device),
+            reset_episode=torch.zeros((num_envs, 1), dtype=torch.bool, device=device),
+            terminated=torch.zeros(num_envs, dtype=torch.bool, device=device),
+            truncated=torch.zeros(num_envs, dtype=torch.bool, device=device),
+            reward=torch.zeros(num_envs, dtype=torch.float32, device=device),
+        )
+        host = _ShadowHost(
+            ctx=ctx,
+            commands=commands,
+            actions=actions,
+            field_keys=self._host.field_keys,
+            num_envs=num_envs,
+        )
+        entries = tuple(
+            _ExogenousEntry(
+                channel=entry.channel,
+                tensor=_resize_kernel_data(entry.tensor, old, num_envs)
+                if isinstance(entry.tensor, torch.Tensor) and entry.tensor.ndim and entry.tensor.shape[0] == old
+                else entry.tensor,
+                rule=entry.rule,
+                action_slice=entry.action_slice,
+            )
+            for entry in self._exogenous_entries
+        )
+        return ModelingProgram(
+            env=self._env,
+            program=self._program,
+            host=host,
+            fields=self._fields,
+            exogenous_entries=entries,
+            reward_weights=self._reward_weights,
+        )
 
     def sync_from_env(self) -> None:
         """Seed the shadow copies from the real resident per-environment state.

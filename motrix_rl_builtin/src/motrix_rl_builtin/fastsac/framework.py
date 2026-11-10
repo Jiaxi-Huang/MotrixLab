@@ -41,7 +41,9 @@ class FastSacProvider(AgentProvider[FastSacCfg]):
 
 class MotrixFramework(RlFramework):
     def __init__(self) -> None:
-        super().__init__((FastSacProvider(),))
+        from motrix_rl_builtin.apg.framework import ApgProvider
+
+        super().__init__((FastSacProvider(), ApgProvider()))
 
     @property
     def name(self) -> str:

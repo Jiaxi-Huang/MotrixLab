@@ -144,3 +144,51 @@ def test_fastsac_checkpoint_excludes_runtime_wrappers() -> None:
     for name in ("actor", "qnet", "qnet_target"):
         assert checkpoint[name]
         assert not any(key.startswith("_orig_mod.") for key in checkpoint[name])
+
+
+@pytest.mark.integration
+def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
+    from motrix_rl_builtin.apg.networks import MlpActor
+
+    from motrix_rl.normalize import EmpiricalNormalization
+
+    config = _train_config(
+        "g1-wbt-supermimic/motrix.apg",
+        ["algo.actor.hidden=[16, 16]", "algo.actor.history=2", "algo.trainer.iterations=1"],
+    )
+    actor_cfg = config.algo
+    raw_dim, action_dim, history = 6, 3, actor_cfg.actor.history
+    actor = MlpActor(raw_dim * history, action_dim, actor_cfg.actor.hidden, output_activation="identity")
+    with torch.no_grad():
+        for index, parameter in enumerate(actor.parameters()):
+            parameter.fill_(0.01 * (index + 1))
+    normalizer = EmpiricalNormalization(shape=raw_dim, device="cpu")
+    normalizer._mean.copy_(torch.tensor([[0.5, -0.25, 1.0, 0.0, 0.75, -1.0]]))
+    normalizer._var.copy_(torch.tensor([[4.0, 0.25, 2.0, 1.0, 0.5, 1.0]]))
+    normalizer._std.copy_(torch.sqrt(normalizer._var))
+    normalizer.count.fill_(128)
+    run = _run_with_checkpoint(
+        tmp_path,
+        config,
+        {
+            "actor": actor.state_dict(),
+            "obs_norm": normalizer.state_dict(),
+            "task": {
+                "obs_dim": raw_dim * history,
+                "raw_obs_dim": raw_dim,
+                "action_dim": action_dim,
+                "action_limit": 2.0,
+                "history": history,
+            },
+        },
+    )
+
+    result = export_onnx(run.run_dir, validation_seed=17, validation_samples=8)
+
+    assert result.path.is_file()
+    assert result.report.input_spec.shape == (None, raw_dim * history)
+    assert result.report.output_spec.shape == (None, action_dim)
+    assert result.report.parity.max_abs_error < 1e-5
+    properties = {item.key: item.value for item in onnx.load(result.path).metadata_props}
+    assert properties["rllib"] == "motrix"
+    assert properties["algo"] == "apg"

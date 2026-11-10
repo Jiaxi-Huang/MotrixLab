@@ -4,6 +4,7 @@
 """Command terms for manager-based whole-body tracking."""
 
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 import torch
 from omegaconf import MISSING
@@ -13,6 +14,8 @@ from motrix_env_core.config.scene import RobotCfg
 from motrix_env_core.manager import (
     CommandCfg,
     CommandTerm,
+    ExogenousKind,
+    ExogenousRule,
     ManagerContext,
     ManagerEnv,
     metric,
@@ -84,11 +87,15 @@ class WbtMotionCommand(CommandTerm):
     hold_at_clip_end: bool
     sequential_clips: bool
 
-    # Per-environment frame state exposed through the manager metrics system.
-    # Kept as ``(num_envs, 1)`` whole-batch tensors: the Torch executor hooks
-    # run on the live term instance, so advance/reset update the lanes' frame
-    # indices in place through these tensors.
-    steps: torch.Tensor = metric(name="motion_step", dtype=torch.float32)
+    # Per-environment frame index — term STATE, not a gauge: reset/advance
+    # write it in place, and the exogenous annotation advances it in
+    # imagination. Kept whole-batch ``(num_envs, 1)`` int64.
+    steps: torch.Tensor
+
+    # Published mirror of ``steps`` so the ``motion_step`` metrics series
+    # stays continuous now that the index itself is state; advance/reset
+    # refresh it in place.
+    steps_gauge: torch.Tensor = metric(name="motion_step", dtype=torch.float32)
     clip_ended: torch.Tensor = metric()
 
     # -- Kernel hooks ----------------------------------------------------------
@@ -96,6 +103,10 @@ class WbtMotionCommand(CommandTerm):
     # on the live host instance (the compiled graph guards on its identity).
     # Per-lane state is written in place through the context tensors, so
     # host-visible buffers stay authoritative.
+
+    def _mirror_steps(self: "WbtMotionCommand") -> None:
+        """Refresh the published gauge after any in-place ``steps`` write."""
+        self.steps_gauge.copy_(self.steps[:, 0].to(torch.float32))
 
     def update(self: "WbtMotionCommand", ctx: ManagerContext) -> None:
         """Yaw-align the clip to each lane."""
@@ -132,11 +143,13 @@ class WbtMotionCommand(CommandTerm):
                 next_steps = torch.where(advanced >= num_frames, torch.zeros_like(advanced), advanced)
                 crossing = ended
             steps.copy_(next_steps)
+            self._mirror_steps()
             ctx.sim_reset_requested |= crossing[:, None]
             return
         if bool(self.hold_at_clip_end):
             # Freeze each lane on its own clip's final frame; no reset request.
             steps.copy_(torch.minimum(advanced, clip_end[:, None]))
+            self._mirror_steps()
             return
         # Non-sequential wrap: resample each ended lane inline. Only ended
         # lanes consume sampling draws, so lanes that did not wrap keep their
@@ -144,6 +157,7 @@ class WbtMotionCommand(CommandTerm):
         draws, next_state = draw_uniform(ctx.rand.state, self.sampler.draw_count)
         sampled = self.sampler.sample(draws, self.start_at_timestep_zero_prob)
         steps.copy_(torch.where(ended[:, None], sampled[:, None], advanced))
+        self._mirror_steps()
         ctx.rand.state.copy_(torch.where(ended[:, None], next_state, ctx.rand.state))
         ctx.sim_reset_requested |= ended[:, None]
 
@@ -175,6 +189,7 @@ class WbtMotionCommand(CommandTerm):
         # ``clip_ended`` is intentionally left untouched; advance recomputes it
         # on the following transition.
         self.steps[idx, 0] = steps
+        self._mirror_steps()
         self.sampler.mark_episode_starts(idx, ctx.reset_episode, self.steps[idx, 0])
 
 
@@ -185,6 +200,13 @@ class WbtMotionCommandCfg(CommandCfg):
     joint_names: tuple[str, ...] = MISSING
     tracked_body_names: tuple[str, ...] = MISSING
     reference_body_name: str = MISSING
+    # Imagination semantics of the frame index: one frame per control step
+    # within an episode. Clip-end branches of the real advance have no
+    # imagination counterpart — the clip-end truncation term gates the
+    # imagination tail there instead.
+    exogenous: dict[str, ExogenousRule] = dataclass_field(
+        default_factory=lambda: {"steps": ExogenousRule(kind=ExogenousKind.INCREMENT, step=1.0)}
+    )
     sampling_mode: str = "adaptive"
     start_at_timestep_zero_prob: float = 0.0
     hold_at_clip_end: bool = False
@@ -267,6 +289,7 @@ class WbtMotionCommandCfg(CommandCfg):
             clip=source,
             reference_index=int(reference_index),
             steps=torch.zeros((num_envs, 1), dtype=torch.int64),
+            steps_gauge=torch.zeros(num_envs, dtype=torch.float32),
             clip_ended=torch.zeros((num_envs, 1), dtype=torch.bool),
             command=torch.empty((num_envs, 2 * env.num_actuators), dtype=torch.float32),
             target_body_position_relative=torch.empty((num_envs, *tracked_shape), dtype=torch.float32),

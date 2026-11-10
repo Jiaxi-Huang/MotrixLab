@@ -9,7 +9,7 @@ from motrix_rl import frameworks
 
 
 def test_builtin_plugin_registers_fastsac():
-    assert frameworks.supported_agents("motrix") == ("fastsac",)
+    assert frameworks.supported_agents("motrix") == ("apg", "fastsac")
     assert frameworks.get_config_type("motrix", "fastsac") is FastSacCfg
     assert frameworks.supported_train_backends("motrix", "fastsac") == ("torch",)
     assert isinstance(frameworks.get_agent_provider("motrix", "fastsac", "torch"), FastSacProvider)

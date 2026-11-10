@@ -56,7 +56,9 @@ def test_forward_normalizes_with_frozen_stats() -> None:
     normalizer.update(data)
     normalizer.eval()
     out = normalizer(torch.tensor([[1.0, 1.0]]), update=False)
-    torch.testing.assert_close(out, (torch.tensor([[1.0, 1.0]]) - normalizer._mean) / (normalizer._std + normalizer.eps))
+    torch.testing.assert_close(
+        out, (torch.tensor([[1.0, 1.0]]) - normalizer._mean) / (normalizer._std + normalizer.eps)
+    )
 
 
 def test_local_accumulators_merge_round_trip() -> None:
@@ -72,7 +74,9 @@ def test_local_accumulators_merge_round_trip() -> None:
     fa = a.local_sufficient_stats_flat()
     fb = b.local_sufficient_stats_flat()
     dim = 3
-    merged = torch.cat([fa[0].reshape(1) + fb[0].reshape(1), fa[1 : 1 + dim] + fb[1 : 1 + dim], fa[1 + dim :] + fb[1 + dim :]])
+    merged = torch.cat(
+        [fa[0].reshape(1) + fb[0].reshape(1), fa[1 : 1 + dim] + fb[1 : 1 + dim], fa[1 + dim :] + fb[1 + dim :]]
+    )
     reference = EmpiricalNormalization(shape=3, device="cpu")
     reference.seed_local_accumulators()
     reference.apply_global_sufficient_stats(merged)

@@ -1,0 +1,48 @@
+# @package _global_
+# Task g1-wbt-supermimic: whole-body motion tracking with the APG WM/BPTT
+# provider. Iteration granularity matches the upstream supermimic recipe
+# exactly: 2.5 env steps per iteration (utd 0.4, alternating 2/3), 10
+# world-model window batches, one policy update.
+defaults:
+  - /algo_base@algo: motrix.apg
+  - _self_
+task:
+  env: g1-wbt-supermimic
+  rllib: motrix
+  algo: apg
+num_envs: 2048
+play_num_envs: 16
+seed: 42
+logging:
+  interval: 100
+checkpoint:
+  interval: 2000
+algo:
+  replay:
+    # Upstream buffer_steps: 1000 steps per lane.
+    capacity: 1000
+    # Reference policy-driven replay prefill, also performed after restore.
+    warmup_steps: 64
+  world_model:
+    scheme: floating_base
+    hidden: [2048, 2048, 2048]
+    # Upstream wm_batch / wm_batches per iteration.
+    batch_size: 2048
+    batches_per_iteration: 10
+  actor:
+    # Upstream pi_batch / utd 0.4 (one update per iteration).
+    batch_size: 4096
+    updates_per_iteration: 1
+    hidden: [2048, 1024, 512, 256]
+    # Upstream hist: 10 stacked policy-observation frames.
+    history: 10
+    output_activation: identity
+  trainer:
+    amp: bf16
+    iterations: 30000
+    collect_steps_per_iteration: 2.5
+    warmup_iterations: 500
+    lr_decay_iterations: 30000
+    # Evaluate the full motion library only after training.
+    eval_interval: 0
+    eval_steps: 500
