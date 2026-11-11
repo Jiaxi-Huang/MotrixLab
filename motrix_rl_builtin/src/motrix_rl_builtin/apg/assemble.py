@@ -27,8 +27,9 @@ instead predicts the flat concatenation of every field and skips FK.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 
@@ -200,7 +201,9 @@ class Assembly:
         ang = flat[..., 10:13]
         qpos = flat[..., 13 : 13 + num_joints]
         qvel = flat[..., 13 + num_joints : 13 + 2 * num_joints]
-        p, rotations, v, w = self.tree.forward(position, to_matrix(quaternion), lin, ang, qpos, qvel, bodies=self.fk_rows.tolist())
+        p, rotations, v, w = self.tree.forward(
+            position, to_matrix(quaternion), lin, ang, qpos, qvel, bodies=self.fk_rows.tolist()
+        )
         outputs = {
             _POSITION: p,
             _QUATERNION: matrix_to_quat_xyzw(rotations),
@@ -293,7 +296,9 @@ def build_assembly(view: Any, env: Any, tree: KinematicTree | None, scheme: str)
     try:
         root_row = tracked.index(root_link)
     except ValueError:
-        raise ValueError(f"The tracked body order {tracked} must include the FK tree root link {root_link!r}.") from None
+        raise ValueError(
+            f"The tracked body order {tracked} must include the FK tree root link {root_link!r}."
+        ) from None
     try:
         fk_rows = torch.tensor([tree.link_names.index(link) for link in tracked], dtype=torch.int64)
     except ValueError:

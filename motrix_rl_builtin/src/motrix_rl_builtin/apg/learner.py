@@ -64,6 +64,7 @@ class ApgLearner:
         obs_dim: int,
         value_dim: int,
         action_limit: float,
+        value_max: float | None = None,
     ):
         self.program = program
         self.assembly = assembly
@@ -74,6 +75,9 @@ class ApgLearner:
         self.cfg = cfg
         self.device = device
         self.action_limit = action_limit
+        # Upstream clamps critic outputs (bootstrap and targets alike) at the
+        # task's maximum discounted return, suppressing value overestimation.
+        self.value_max = value_max
         self._dynamics_opt = torch.optim.Adam(dynamics.parameters(), cfg.world_model.learning_rate)
         self._actor_opt = torch.optim.Adam(actor.parameters(), cfg.actor.learning_rate, betas=_ACTOR_BETAS)
         self._critic_opt = torch.optim.Adam(critic.parameters(), cfg.critic.learning_rate)
@@ -168,7 +172,9 @@ class ApgLearner:
             picked = torch.argsort(~mask, stable=True)[: min(remaining, accepted)]
             for name, value in candidate["states"].items():
                 states.setdefault(name, []).append(value[picked].to(self.device))
-            histories.append(self.replay.history(candidate["envs"][picked], candidate["positions"][picked], "obs", history_len))
+            histories.append(
+                self.replay.history(candidate["envs"][picked], candidate["positions"][picked], "obs", history_len)
+            )
             filled += int(picked.shape[0])
         return {name: torch.cat(chunks) for name, chunks in states.items()}, torch.cat(histories).to(self.device)
 
@@ -237,7 +243,7 @@ class ApgLearner:
         _set_trainable(self.critic, False)
         try:
             rewards, gates, value_obs = self._unroll(start_states, history)
-            terminal_value = self.critic(self.value_norm(value_obs[-1], update=False)).squeeze(-1)
+            terminal_value = self._value_of(value_obs[-1], update=False)
             batch_return = self._horizon_return(rewards, gates, terminal_value)
             actor_loss = -batch_return.mean()
             self._actor_opt.zero_grad(set_to_none=True)
@@ -271,6 +277,14 @@ class ApgLearner:
             "apg.value_loss": float(row[4]),
         }
 
+    def _value_of(self, value_obs: torch.Tensor, *, update: bool) -> torch.Tensor:
+        """Critic values on value-group observations, clamped at ``value_max``."""
+        flat = value_obs.reshape(-1, value_obs.shape[-1])
+        values = self.critic(self.value_norm(flat, update=update)).reshape(value_obs.shape[:-1])
+        if self.value_max is not None:
+            values = values.clamp(max=self.value_max)
+        return values
+
     def _update_critic(self, rewards: torch.Tensor, gates: torch.Tensor, value_obs: torch.Tensor) -> torch.Tensor:
         """Lambda-return regression over the imagined rollout, targets detached.
 
@@ -284,10 +298,9 @@ class ApgLearner:
         # regression minibatch. Statistics fold the rollout observations
         # (upstream's critic norm role).
         with torch.no_grad():
-            features = value_obs.flatten(0, 1)
-            self.value_norm.update(features)
+            self.value_norm.update(value_obs.flatten(0, 1))
             inputs_all = self.value_norm(value_obs.flatten(0, 1), update=False).reshape(value_obs.shape)
-            values = self.critic(inputs_all).squeeze(-1)  # (H+1, B)
+            values = self._value_of(value_obs, update=False)  # (H+1, B)
             target = values[-1]
             targets = []
             for step in range(horizon - 1, -1, -1):

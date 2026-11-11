@@ -155,6 +155,13 @@ class Trainer(TrainerBase):
             state_fields.append(TransitionField(channel, tuple(leaf.shape[1:]), torch.float32))
         obs_dim = getattr(env.state.obs, cfg.policy_group).shape[-1]
         value_dim = getattr(env.state.obs, cfg.value_group).shape[-1]
+        # Upstream v_max: the task's maximum discounted return per upstream's
+        # clamp (ctrl_dt * positive weight sum / (1 - gamma)), suppressing
+        # critic overestimation.
+        positive_weight_sum = sum(
+            reward_cfg.weight for reward_cfg in env.cfg.reward_cfgs().values() if reward_cfg.weight > 0.0
+        )
+        value_max = float(env.cfg.ctrl_dt * positive_weight_sum / (1.0 - cfg.gamma))
         schema = wm_transition_schema(state_fields, action_dim, obs_dim=obs_dim)
         replay = SequenceReplay(
             schema=schema,
@@ -181,6 +188,7 @@ class Trainer(TrainerBase):
             obs_dim=obs_dim,
             value_dim=value_dim,
             action_limit=action_limit,
+            value_max=value_max,
         )
         collector = ApgCollector(
             env=env,
@@ -206,6 +214,7 @@ class Trainer(TrainerBase):
             "raw_obs_dim": obs_dim,
             "value_dim": value_dim,
             "history": cfg.actor.history,
+            "value_max": value_max,
             "fields": list(view.fields),
             "channels": list(view.exogenous),
         }
@@ -440,7 +449,9 @@ class Trainer(TrainerBase):
             buffer_capacity=collector.env.num_envs * self._rlcfg.replay.capacity,
             collect_ms=timing.mean_ms("collect"),
             learn_ms=timing.mean_ms("learn"),
-            learn_percent=100.0 * timing.total_seconds("learn") / max(timing.total_seconds("collect") + timing.total_seconds("learn"), 1e-9),
+            learn_percent=100.0
+            * timing.total_seconds("learn")
+            / max(timing.total_seconds("collect") + timing.total_seconds("learn"), 1e-9),
             warming=warming,
             training_metrics=drained,
             reward_terms={},

@@ -48,8 +48,8 @@ def _tiny_cfg():
 def _make_context(tmp_dir, *, resume_from=None):
     import motrix_envs  # noqa: F401
     from motrix_rl.config import LoggingConfig
-    from motrix_rl.metrics import MetricsLogger
     from motrix_rl.contracts import TrainerContext
+    from motrix_rl.metrics import MetricsLogger
     from motrix_rl.runs import create_run_context
 
     cfg = _tiny_cfg()
@@ -102,9 +102,9 @@ def test_training_loop_produces_finite_history(trained) -> None:
 
 
 def test_checkpoint_records_and_resumes(trained, tmp_path) -> None:
-    from motrix_rl import checkpoints
-    from motrix_rl.contracts import TrainerContext
     from motrix_rl_builtin.apg.train import Trainer
+
+    from motrix_rl import checkpoints
 
     context, _trainer, cfg = trained
     final = checkpoints.final_checkpoint_path("pt", context.run_dir)

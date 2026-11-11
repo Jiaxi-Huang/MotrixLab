@@ -179,3 +179,104 @@ class DofVelObsCfg(ObservationTermCfg):
     def __call__(self, ctx) -> ObsTerm:
         num_joints = len(ctx.model.bodies["robot"].joint_names)
         return ObsTerm(num_joints, dof_vel_obs, float(self.noise.amplitude))
+
+
+def motion_future_joint_obs(ctx: ManagerContext, out: torch.Tensor, offsets: tuple[int, ...]) -> None:
+    """Future joint-target window: ``[qj, vj]`` per frame, clamped at the clip end."""
+    motion = ctx.commands["motion"]
+    steps = motion.steps[:, 0]
+    end = motion.clip.frame_clip_end[steps]
+    frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
+    joint_count = motion.clip.joint_pos.shape[1]
+    out[:, 0::2].reshape(out.shape[0], len(offsets), joint_count).copy_(motion.clip.joint_pos[frames])
+    out[:, 1::2].reshape(out.shape[0], len(offsets), joint_count).copy_(motion.clip.joint_vel[frames])
+
+
+@configclass(kw_only=True)
+class MotionFutureJointObsCfg(ObservationTermCfg):
+    """Upstream supermimic goal window: ``window`` future frames at ``stride``.
+
+    Offsets run ``0, stride, ..., (window-1)*stride`` frames (stride 5 at
+    50 Hz ≈ 0.1 s spacing, window 10 ≈ 0.9 s lookahead), each clamped at the
+    current clip's end frame. Reference data carries no observation noise.
+    """
+
+    window: int = 10
+    stride: int = 5
+
+    def __call__(self, ctx) -> ObsTerm:
+        motion = ctx.command_terms["motion"]
+        if not isinstance(motion, WbtMotionCommand):
+            raise TypeError(f"WBT motion command must be WbtMotionCommand, got {type(motion).__name__}.")
+        offsets = tuple(self.stride * index for index in range(self.window))
+        return ObsTerm(self.window * 2 * motion.clip.joint_pos.shape[1], motion_future_joint_obs, offsets)
+
+
+def motion_future_reference_orientation_obs(ctx: ManagerContext, out: torch.Tensor, offsets: tuple[int, ...]) -> None:
+    """Anchor-relative reference orientation window as 6D rotations."""
+    motion = ctx.commands["motion"]
+    steps = motion.steps[:, 0]
+    end = motion.clip.frame_clip_end[steps]
+    frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
+    anchor_quat = ctx.sim["tracked_body_quat"][:, motion.reference_index]
+    local = relative_orientation(anchor_quat[:, None, :], motion.clip.reference_body_quat_w[frames])
+    six = quaternion.matrix6d(local)
+    out.copy_(six.reshape(six.shape[0], -1))
+
+
+@configclass(kw_only=True)
+class MotionFutureReferenceOrientationObsCfg(ObservationTermCfg):
+    window: int = 10
+    stride: int = 5
+
+    def __call__(self, ctx) -> ObsTerm:
+        return ObsTerm(
+            self.window * 6,
+            motion_future_reference_orientation_obs,
+            tuple(self.stride * index for index in range(self.window)),
+        )
+
+
+def motion_future_reference_position_obs(ctx: ManagerContext, out: torch.Tensor, offsets: tuple[int, ...]) -> None:
+    """Anchor-relative reference position window (privileged value input)."""
+    motion = ctx.commands["motion"]
+    steps = motion.steps[:, 0]
+    end = motion.clip.frame_clip_end[steps]
+    frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
+    anchor_pos = ctx.sim["tracked_body_pos"][:, motion.reference_index]
+    anchor_quat = ctx.sim["tracked_body_quat"][:, motion.reference_index]
+    local = rotate_inverse(
+        anchor_quat[:, None, :],
+        motion.clip.reference_body_pos_w[frames] - anchor_pos[:, None, :],
+    )
+    out.copy_(local.reshape(local.shape[0], -1))
+
+
+@configclass(kw_only=True)
+class MotionFutureReferencePositionObsCfg(ObservationTermCfg):
+    window: int = 10
+    stride: int = 5
+
+    def __call__(self, ctx) -> ObsTerm:
+        return ObsTerm(
+            self.window * 3,
+            motion_future_reference_position_obs,
+            tuple(self.stride * index for index in range(self.window)),
+        )
+
+
+def projected_gravity_obs(ctx: ManagerContext, out: torch.Tensor, noise_amplitude: float) -> None:
+    """Gravity direction in the anchor body frame."""
+    anchor_quat = ctx.sim["tracked_body_quat"][:, ctx.commands["motion"].reference_index]
+    gravity = out.new_zeros(out.shape)
+    gravity[:, 2] = -1.0
+    out.copy_(rotate_inverse(anchor_quat, gravity))
+    add_uniform_noise(ctx, out, noise_amplitude)
+
+
+@configclass(kw_only=True)
+class ProjectedGravityObsCfg(ObservationTermCfg):
+    noise: UniformNoiseCfg = UniformNoiseCfg(amplitude=0.05)
+
+    def __call__(self, ctx) -> ObsTerm:
+        return ObsTerm(3, projected_gravity_obs, float(self.noise.amplitude))

@@ -31,7 +31,6 @@ class ApgProvider(AgentProvider[ApgCfg]):
         return int(config.trainer.iterations * config.trainer.collect_steps_per_iteration * num_envs)
 
     def create_policy_exporter(self):
-        from motrix_rl.deploy.api import OnnxPolicyExporter
         from motrix_rl_builtin.apg.export import ApgOnnxExporter
 
         return ApgOnnxExporter()

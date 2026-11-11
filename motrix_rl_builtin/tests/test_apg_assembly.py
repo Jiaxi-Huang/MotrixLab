@@ -17,11 +17,11 @@ Two parity lines pin the FieldDesc-driven assembly:
 
 import pytest
 import torch
+from motrix_rl_builtin.apg.assemble import build_assembly
 
 from motrix_env_core import registry
 from motrix_env_core.base import SimCfg
 from motrix_env_core.manager import ManagerEnv
-from motrix_env_core.math.quaternion import to_matrix
 from motrix_env_core.sim import (
     BodyAngularVelocityWrite,
     BodyJointPositionWrite,
@@ -35,7 +35,6 @@ from motrix_env_core.sim import (
     LinkPositionQuery,
 )
 from motrix_env_core.sim.registry import create_sim_backend
-from motrix_rl_builtin.apg.assemble import build_assembly
 
 
 @pytest.fixture(scope="module")
@@ -43,9 +42,7 @@ def built():
     import motrix_envs  # noqa: F401  (registers g1-wbt-supermimic)
 
     cfg = registry.make_env_config("g1-wbt-supermimic", mode="train")
-    cfg.queries.model["tree"] = KinematicTreeQuery(
-        body=cfg.scene.objs.robot.resolved_base_link_name, device="cpu"
-    )
+    cfg.queries.model["tree"] = KinematicTreeQuery(body=cfg.scene.objs.robot.resolved_base_link_name, device="cpu")
     env = ManagerEnv(cfg, num_envs=2)
     env.init_state()
     env.step(torch.rand(2, env.action_space.shape[0]) * 0.1 - 0.05)
@@ -127,14 +124,17 @@ def test_fk_full_parity_on_reconstructed_state(built) -> None:
     # One consistent snapshot: the FK of the views' own block equals the
     # simulator's evaluation of that same state.
     torch.testing.assert_close(rebuilt["tracked_body_pos"], pushed["tracked_body_pos"], atol=5e-3, rtol=0.0)
-    torch.testing.assert_close(rebuilt["tracked_body_linear_velocity"], pushed["tracked_body_linear_velocity"], atol=5e-3, rtol=0.0)
-    torch.testing.assert_close(rebuilt["tracked_body_angular_velocity"], pushed["tracked_body_angular_velocity"], atol=5e-3, rtol=0.0)
+    torch.testing.assert_close(
+        rebuilt["tracked_body_linear_velocity"], pushed["tracked_body_linear_velocity"], atol=5e-3, rtol=0.0
+    )
+    torch.testing.assert_close(
+        rebuilt["tracked_body_angular_velocity"], pushed["tracked_body_angular_velocity"], atol=5e-3, rtol=0.0
+    )
 
 
 def test_assembly_rejects_uncovered_tree_joints(built) -> None:
     env, view, assembly = built
     # A view missing every joint field cannot serve the tracked paths.
-    from motrix_env_core.manager.modeling import FieldDesc
     from motrix_env_core.sim.read import (
         BodyJointPositionQuery,
         BodyJointVelocityQuery,
