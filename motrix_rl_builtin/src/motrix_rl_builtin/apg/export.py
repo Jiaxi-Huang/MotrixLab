@@ -53,6 +53,12 @@ class ApgOnnxExporter(OnnxPolicyExporter):
         normalizer = EmpiricalNormalization(shape=int(dims["raw_obs_dim"]), device="cpu")
         normalizer.load_state_dict(_module_state(checkpoint, "obs_norm", request.checkpoint), strict=True)
         normalizer.eval()
+        goal_dim = int(dims.get("goal_dim", 0))
+        goal_normalizer = None
+        if goal_dim:
+            goal_normalizer = EmpiricalNormalization(shape=goal_dim, device="cpu")
+            goal_normalizer.load_state_dict(_module_state(checkpoint, "goal_norm", request.checkpoint), strict=True)
+            goal_normalizer.eval()
         action_limit = float(dims["action_limit"])
         history = int(dims["history"])
 
@@ -61,11 +67,16 @@ class ApgOnnxExporter(OnnxPolicyExporter):
                 super().__init__()
                 self.actor = actor
                 self.normalizer = normalizer
+                self.goal_normalizer = goal_normalizer
 
             def forward(self, observations: torch.Tensor) -> torch.Tensor:
-                frames = observations.reshape(observations.shape[0], history, -1)
-                normalized = self.normalizer(frames, update=False)
-                return action_limit * self.actor(normalized.flatten(1))
+                frames = observations[:, : history * int(dims["raw_obs_dim"])]
+                stacked = frames.reshape(frames.shape[0], history, -1)
+                normalized = self.normalizer(stacked, update=False).reshape(frames.shape[0], -1)
+                if goal_dim:
+                    goal = self.goal_normalizer(observations[:, history * int(dims["raw_obs_dim"]) :], update=False)
+                    normalized = torch.cat((normalized, goal), dim=-1)
+                return action_limit * self.actor(normalized)
 
         policy = DeterministicPolicy().eval()
         buffer = io.BytesIO()

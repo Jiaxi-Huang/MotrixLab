@@ -18,6 +18,12 @@ logging:
 checkpoint:
   interval: 2000
 algo:
+  # Upstream convention: the history stack covers the proprioceptive policy
+  # group only; these value-group terms feed the actor as one flat current
+  # goal window (~0.9 s lookahead).
+  goal_terms:
+    - motion_future_joint
+    - motion_future_ref_ori_b
   replay:
     # Upstream buffer_steps: 1000 steps per lane.
     capacity: 1000

@@ -187,9 +187,8 @@ def motion_future_joint_obs(ctx: ManagerContext, out: torch.Tensor, offsets: tup
     steps = motion.steps[:, 0]
     end = motion.clip.frame_clip_end[steps]
     frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
-    joint_count = motion.clip.joint_pos.shape[1]
-    out[:, 0::2].reshape(out.shape[0], len(offsets), joint_count).copy_(motion.clip.joint_pos[frames])
-    out[:, 1::2].reshape(out.shape[0], len(offsets), joint_count).copy_(motion.clip.joint_vel[frames])
+    stacked = torch.cat((motion.clip.joint_pos[frames], motion.clip.joint_vel[frames]), dim=-1)
+    out.copy_(stacked.reshape(stacked.shape[0], -1))
 
 
 @configclass(kw_only=True)

@@ -162,6 +162,28 @@ class Trainer(TrainerBase):
             reward_cfg.weight for reward_cfg in env.cfg.reward_cfgs().values() if reward_cfg.weight > 0.0
         )
         value_max = float(env.cfg.ctrl_dt * positive_weight_sum / (1.0 - cfg.gamma))
+        # Flat goal columns: the declared value-group terms the actor consumes
+        # without stacking (upstream stacks proprioception only).
+        goal_columns = None
+        goal_dim = 0
+        if cfg.goal_terms:
+            group = env.observation_groups[cfg.value_group]
+            cursor = 0
+            columns: list[int] = []
+            found = set()
+            for entry in group.terms:
+                if entry.name in cfg.goal_terms:
+                    columns.extend(range(cursor, cursor + entry.size))
+                    found.add(entry.name)
+                cursor += entry.size
+            missing = sorted(set(cfg.goal_terms) - found)
+            if missing:
+                raise ValueError(
+                    f"goal_terms {missing} are not observation terms of group {cfg.value_group!r}; "
+                    f"available: {[entry.name for entry in group.terms]}."
+                )
+            goal_columns = torch.tensor(columns, dtype=torch.long)
+            goal_dim = len(columns)
         schema = wm_transition_schema(state_fields, action_dim, obs_dim=obs_dim)
         replay = SequenceReplay(
             schema=schema,
@@ -176,7 +198,7 @@ class Trainer(TrainerBase):
             assembly=assembly,
             dynamics=_make_dynamics(cfg, num_joints, assembly.flat_width, action_dim),
             actor=MlpActor(
-                obs_dim * cfg.actor.history,
+                obs_dim * cfg.actor.history + goal_dim,
                 action_dim,
                 cfg.actor.hidden,
                 output_activation=cfg.actor.output_activation,
@@ -189,6 +211,7 @@ class Trainer(TrainerBase):
             value_dim=value_dim,
             action_limit=action_limit,
             value_max=value_max,
+            goal_columns=goal_columns,
         )
         collector = ApgCollector(
             env=env,
@@ -199,6 +222,8 @@ class Trainer(TrainerBase):
             rng=np.random.default_rng(self._context.seed),
             actor=learner.actor,
             obs_norm=learner.obs_norm,
+            goal_norm=learner.goal_norm,
+            goal_columns=goal_columns,
             action_limit=action_limit,
             action_bounds=bounds,
             history_length=cfg.actor.history,
@@ -210,9 +235,10 @@ class Trainer(TrainerBase):
         task_dims = {
             "action_dim": action_dim,
             "action_limit": action_limit,
-            "obs_dim": obs_dim * cfg.actor.history,
+            "obs_dim": obs_dim * cfg.actor.history + goal_dim,
             "raw_obs_dim": obs_dim,
             "value_dim": value_dim,
+            "goal_dim": goal_dim,
             "history": cfg.actor.history,
             "value_max": value_max,
             "fields": list(view.fields),
@@ -512,6 +538,16 @@ class Trainer(TrainerBase):
         env = self._make_env(self._context.play_num_envs, mode="play")
         payload = torch.load(policy, map_location=device, weights_only=False)
         dims = payload["task"]
+        goal_columns_for_play = None
+        if self._rlcfg.goal_terms and dims.get("goal_dim", 0):
+            group = env.observation_groups[self._rlcfg.value_group]
+            cursor = 0
+            columns: list[int] = []
+            for entry in group.terms:
+                if entry.name in self._rlcfg.goal_terms:
+                    columns.extend(range(cursor, cursor + entry.size))
+                cursor += entry.size
+            goal_columns_for_play = torch.tensor(columns, dtype=torch.long, device=device)
         actor = MlpActor(
             dims["obs_dim"],
             dims["action_dim"],
@@ -523,6 +559,15 @@ class Trainer(TrainerBase):
         obs_norm = EmpiricalNormalization(shape=dims["raw_obs_dim"], device=device)
         obs_norm.load_state_dict(payload["obs_norm"])
         obs_norm.eval()
+        goal_dim = int(dims.get("goal_dim", 0))
+        goal_norm = None
+        if goal_dim:
+            goal_norm = EmpiricalNormalization(shape=goal_dim, device=device)
+            goal_norm.load_state_dict(payload["goal_norm"])
+            goal_norm.eval()
+            goal_columns = goal_columns_for_play
+        else:
+            goal_columns = None
         history: torch.Tensor | None = None
         renderer = create_renderer(env, self._context.render)
         try:
@@ -536,7 +581,11 @@ class Trainer(TrainerBase):
                     history = torch.where(fresh[:, None, None], raw_obs.unsqueeze(1).expand_as(pushed), pushed)
                     batch, length, dim = history.shape
                     normalized = obs_norm(history.reshape(batch * length, dim), update=False).reshape(history.shape)
-                    command = dims["action_limit"] * actor(normalized.flatten(1))
+                    features = normalized.flatten(1)
+                    if goal_dim:
+                        goal = getattr(env.state.obs, cfg.value_group).to(device)[:, goal_columns]
+                        features = torch.cat((features, goal_norm(goal, update=False)), dim=-1)
+                    command = dims["action_limit"] * actor(features)
                     env.step(command.to(raw_obs.device))
                     if renderer is not None and renderer.render() is False:
                         return

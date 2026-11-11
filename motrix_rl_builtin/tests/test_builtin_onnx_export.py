@@ -158,7 +158,8 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
     )
     actor_cfg = config.algo
     raw_dim, action_dim, history = 6, 3, actor_cfg.actor.history
-    actor = MlpActor(raw_dim * history, action_dim, actor_cfg.actor.hidden, output_activation="identity")
+    goal_dim = 5  # flat goal window appended to the stacked proprio history
+    actor = MlpActor(raw_dim * history + goal_dim, action_dim, actor_cfg.actor.hidden, output_activation="identity")
     with torch.no_grad():
         for index, parameter in enumerate(actor.parameters()):
             parameter.fill_(0.01 * (index + 1))
@@ -167,18 +168,24 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
     normalizer._var.copy_(torch.tensor([[4.0, 0.25, 2.0, 1.0, 0.5, 1.0]]))
     normalizer._std.copy_(torch.sqrt(normalizer._var))
     normalizer.count.fill_(128)
+    goal_normalizer = EmpiricalNormalization(shape=goal_dim, device="cpu")
+    goal_normalizer._var.copy_(torch.tensor([[1.0, 2.0, 0.5, 1.5, 1.0]]))
+    goal_normalizer._std.copy_(torch.sqrt(goal_normalizer._var))
+    goal_normalizer.count.fill_(64)
     run = _run_with_checkpoint(
         tmp_path,
         config,
         {
             "actor": actor.state_dict(),
             "obs_norm": normalizer.state_dict(),
+            "goal_norm": goal_normalizer.state_dict(),
             "task": {
-                "obs_dim": raw_dim * history,
+                "obs_dim": raw_dim * history + goal_dim,
                 "raw_obs_dim": raw_dim,
                 "action_dim": action_dim,
                 "action_limit": 2.0,
                 "history": history,
+                "goal_dim": goal_dim,
             },
         },
     )
@@ -186,7 +193,7 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
     result = export_onnx(run.run_dir, validation_seed=17, validation_samples=8)
 
     assert result.path.is_file()
-    assert result.report.input_spec.shape == (None, raw_dim * history)
+    assert result.report.input_spec.shape == (None, raw_dim * history + goal_dim)
     assert result.report.output_spec.shape == (None, action_dim)
     assert result.report.parity.max_abs_error < 1e-5
     properties = {item.key: item.value for item in onnx.load(result.path).metadata_props}

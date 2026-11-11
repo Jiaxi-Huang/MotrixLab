@@ -92,12 +92,13 @@ def make_g1_wbt_supermimic_cfg() -> EnvCfg:
         "bad_dof_vel": cfg.terminations.bad_dof_vel,
     }
     cfg.terminations = terminations
-    # Upstream goal-window observations replace the family's current-frame
-    # terms; proprioceptive noise half-widths match upstream sensor noise.
+    # Upstream observation split: the history stack covers proprioception
+    # only; the goal window (future joint targets + anchor-relative reference
+    # orientation) rides in the value group and the trainer feeds it to the
+    # actor as a single flat current frame (apg.goal_terms names the slices).
+    # Proprio noise half-widths match upstream sensor noise.
     cfg.observations = {
         "policy": {
-            "motion_future_joint": MotionFutureJointObsCfg(),
-            "motion_future_ref_ori_b": MotionFutureReferenceOrientationObsCfg(),
             "projected_gravity": ProjectedGravityObsCfg(),
             "base_ang_vel": BodyAngularVelocityObsCfg(noise=UniformNoiseCfg(amplitude=0.2)),
             "dof_pos": DofPosRelObsCfg(noise=UniformNoiseCfg(amplitude=0.01)),

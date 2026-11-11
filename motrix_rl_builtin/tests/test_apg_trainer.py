@@ -42,6 +42,8 @@ def _tiny_cfg():
     cfg.trainer.eval_interval = 0
     cfg.trainer.final_eval = False
     cfg.trainer.lr_decay_iterations = 3
+    # Exercise the flat goal input (upstream: stack proprioception only).
+    cfg.goal_terms = ("motion_future_joint", "motion_future_ref_ori_b")
     return cfg
 
 

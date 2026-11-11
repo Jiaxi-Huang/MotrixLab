@@ -65,6 +65,7 @@ class ApgLearner:
         value_dim: int,
         action_limit: float,
         value_max: float | None = None,
+        goal_columns: torch.Tensor | None = None,
     ):
         self.program = program
         self.assembly = assembly
@@ -78,6 +79,12 @@ class ApgLearner:
         # Upstream clamps critic outputs (bootstrap and targets alike) at the
         # task's maximum discounted return, suppressing value overestimation.
         self.value_max = value_max
+        # Flat goal columns within the value group: the actor consumes them as
+        # a single current frame appended to the stacked proprio history
+        # (upstream stacks sensors only). None disables the goal input.
+        self.goal_columns = None if goal_columns is None else goal_columns.to(device)
+        self.goal_dim = 0 if goal_columns is None else int(goal_columns.shape[0])
+        self.goal_norm = EmpiricalNormalization(shape=max(self.goal_dim, 1), device=device) if self.goal_dim else None
         self._dynamics_opt = torch.optim.Adam(dynamics.parameters(), cfg.world_model.learning_rate)
         self._actor_opt = torch.optim.Adam(actor.parameters(), cfg.actor.learning_rate, betas=_ACTOR_BETAS)
         self._critic_opt = torch.optim.Adam(critic.parameters(), cfg.critic.learning_rate)
@@ -107,6 +114,19 @@ class ApgLearner:
         batch, length, dim = history.shape
         flat = self.obs_norm(history.reshape(batch * length, dim), update=False)
         return flat.reshape(batch, length * dim)
+
+    def _actor_features(self, history: torch.Tensor, goal: torch.Tensor | None) -> torch.Tensor:
+        """Stacked normalized proprio history, with the flat goal appended."""
+        stacked = self._normalize_history(history)
+        if self.goal_norm is None or goal is None:
+            return stacked
+        return torch.cat((stacked, self.goal_norm(goal, update=False)), dim=-1)
+
+    def goal_of(self, value_obs: torch.Tensor) -> torch.Tensor | None:
+        """Goal columns of value-group observations (None without goal terms)."""
+        if self.goal_columns is None:
+            return None
+        return value_obs[..., self.goal_columns]
 
     # -- world model -------------------------------------------------------------
 
@@ -203,10 +223,17 @@ class ApgLearner:
         flat = self.assembly.fields_to_flat(start_states)
         rewards: list[torch.Tensor] = []
         gates: list[torch.Tensor] = []
-        value_obs = [program.observe(self.assembly.flat_to_fields(flat))[cfg.value_group]]
+        first = program.observe(self.assembly.flat_to_fields(flat))
+        value_obs = [first[cfg.value_group]]
         for _ in range(horizon):
+            # The actor consumes the history ending at obs(s_t) plus the
+            # current goal window; the dynamics predicts s_{t+1}; then
+            # evaluate/observe run on s_{t+1} exactly as the real env's
+            # post-physics evaluate does (reward and observations live on the
+            # successor state, the applied action visible in both).
+            action = self.action_limit * self.actor(self._actor_features(history, self.goal_of(value_obs[-1])))
+            flat = self.dynamics(flat, action)
             fields = self.assembly.flat_to_fields(flat)
-            action = self.action_limit * self.actor(self._normalize_history(history))
             # Fresh shadow state: under autograd every mutable leaf must
             # be written exactly once (BPTT version safety).
             program.rebind_shadow_state()
@@ -217,7 +244,6 @@ class ApgLearner:
             observed = program.observe(fields)
             value_obs.append(observed[cfg.value_group])
             history = torch.cat((history[:, 1:], observed[cfg.policy_group].unsqueeze(1)), dim=1)
-            flat = self.dynamics(flat, action)
         return torch.stack(rewards), torch.stack(gates), torch.stack(value_obs)
 
     def _horizon_return(self, rewards: torch.Tensor, gates: torch.Tensor, terminal_value: torch.Tensor) -> torch.Tensor:
@@ -244,6 +270,8 @@ class ApgLearner:
         try:
             rewards, gates, value_obs = self._unroll(start_states, history)
             terminal_value = self._value_of(value_obs[-1], update=False)
+            if self.value_max is not None:
+                terminal_value = terminal_value.clamp(max=self.value_max)
             batch_return = self._horizon_return(rewards, gates, terminal_value)
             actor_loss = -batch_return.mean()
             self._actor_opt.zero_grad(set_to_none=True)
@@ -278,12 +306,10 @@ class ApgLearner:
         }
 
     def _value_of(self, value_obs: torch.Tensor, *, update: bool) -> torch.Tensor:
-        """Critic values on value-group observations, clamped at ``value_max``."""
+        """Critic values on value-group observations (unclamped; upstream clamps
+        only the bootstrap and the regression targets, at their call sites)."""
         flat = value_obs.reshape(-1, value_obs.shape[-1])
-        values = self.critic(self.value_norm(flat, update=update)).reshape(value_obs.shape[:-1])
-        if self.value_max is not None:
-            values = values.clamp(max=self.value_max)
-        return values
+        return self.critic(self.value_norm(flat, update=update)).reshape(value_obs.shape[:-1])
 
     def _update_critic(self, rewards: torch.Tensor, gates: torch.Tensor, value_obs: torch.Tensor) -> torch.Tensor:
         """Lambda-return regression over the imagined rollout, targets detached.
@@ -309,6 +335,8 @@ class ApgLearner:
                 )
                 targets.append(target)
             targets = torch.stack(targets[::-1])  # (H, B)
+            if self.value_max is not None:
+                targets = targets.clamp(max=self.value_max)
 
         inputs = inputs_all[:-1].flatten(0, 1)  # (H*B, D)
         flat_targets = targets.flatten(0, 1)
@@ -347,6 +375,7 @@ class ApgLearner:
         return {
             "obs_norm": self.obs_norm.state_dict(),
             "value_norm": self.value_norm.state_dict(),
+            **({"goal_norm": self.goal_norm.state_dict()} if self.goal_norm is not None else {}),
             "dynamics": self.dynamics.state_dict(),
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
@@ -360,6 +389,8 @@ class ApgLearner:
     def load_learning_state(self, state: dict[str, Any]) -> None:
         self.obs_norm.load_state_dict(state["obs_norm"])
         self.value_norm.load_state_dict(state["value_norm"])
+        if self.goal_norm is not None and state.get("goal_norm") is not None:
+            self.goal_norm.load_state_dict(state["goal_norm"])
         self.dynamics.load_state_dict(state["dynamics"])
         self.actor.load_state_dict(state["actor"])
         self.critic.load_state_dict(state["critic"])

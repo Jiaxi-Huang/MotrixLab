@@ -125,8 +125,12 @@ class ApgCfg:
     gamma: float = 0.99
     # Observation-group names the actor and critic consume; both groups are
     # produced by the same derived program on the imagination side.
+    # ``goal_terms`` names value-group observation terms the actor consumes as
+    # a flat, never-stacked input — the upstream convention: only
+    # proprioception stacks, the goal window enters as a single current frame.
     policy_group: str = "policy"
     value_group: str = "value"
+    goal_terms: tuple[str, ...] = ()
     collector: CollectorCfg = field(default_factory=CollectorCfg)
     replay: ReplayCfg = field(default_factory=ReplayCfg)
     world_model: WorldModelCfg = field(default_factory=WorldModelCfg)

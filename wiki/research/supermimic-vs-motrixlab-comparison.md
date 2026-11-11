@@ -223,3 +223,24 @@ MotrixLab 侧确为上游配方移植的出处证据：
 观测维度变为 policy 733 / value 889；全部窗口/重力 term 经双路径派生（`modeling_view()` dry-run 通过——窗 gather 是 steps 外生通道 + clip 共享常量的纯索引）。
 
 **保留不对齐**（有明确理由）：terminated/truncated 一等区分与 clip 尾 truncation（优于上游 clamp 续跑，D5 冻结）；TD(λ)（同 λ-return 族）；单任务直 MLP actor（GoalConditionedActor 不回收决策）；γ=0.99（上游 AC 变体）；家族关节级保护 term 保留（bad_dof_pos/vel，仿真防爆护）。**待条件成熟再议**：sim_ctx 域随机化条件化（当前无 DR 基建）、多任务编码器、maxcoord 表示、目标语料入库。
+
+### 第二轮（外部评审后，同日）
+
+外部逐项核对确认第一轮对齐成立，另指出三处待决；已全部处置：
+
+1. **goal 窗不再入历史栈**（结构性，评审主发现）：上游历史栈只作用本体感知。落地为
+   `apg.goal_terms`——policy 组仅含本体感知（projected_gravity / ang_vel /
+   dof_pos / dof_vel / actions，93 维 ×10 栈），goal 窗（未来关节目标 +
+   锚点相对姿态，640 维）作为 value 组内具名 term 列切片，平铺单份拼进
+   actor 输入（列范围自 `env.observation_groups` 布局按名推导，任务零硬编码）；
+   goal 独立归一器，play/ONNX 导出同步拆分输入契约（部署侧需按
+   `[proprio 栈 | goal]` 供数）。actor 输入回到上游量级（~1570 vs 7330）。
+2. **未来关节窗改逐帧块布局**：`[qj(N), vj(N)]×帧` 拼接（此前为逐关节标量
+   交错，信息等价但与上游非逐字）。
+3. **v_max 裁剪范围对齐上游**：只裁 bootstrap 与回归目标，TD(λ) 递归内
+   per-step value 不裁（此前裁得更强）。
+
+实施中另自查修复一处评审未覆盖的 unroll 时序 bug：想象步此前在
+pre-dynamics 态上 evaluate/observe 且起点 obs 重复入栈，已改为
+dynamics 先行、reward/obs 落在 s_{t+1}（与真实 env 的 post-physics
+evaluate 时序一致）。

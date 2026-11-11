@@ -53,6 +53,8 @@ class ApgCollector:
         rng: np.random.Generator,
         actor: torch.nn.Module,
         obs_norm: EmpiricalNormalization,
+        goal_norm: EmpiricalNormalization | None,
+        goal_columns: torch.Tensor | None,
         action_limit: float,
         action_bounds: tuple[float, float] | None,
         history_length: int,
@@ -69,6 +71,8 @@ class ApgCollector:
         self.rng = rng
         self.actor = actor
         self.obs_norm = obs_norm
+        self.goal_norm = goal_norm
+        self.goal_columns = None if goal_columns is None else goal_columns.to(device)
         self.action_limit = action_limit
         self.action_bounds = action_bounds
         self.history_length = history_length
@@ -108,6 +112,15 @@ class ApgCollector:
         flat = self.obs_norm(history.reshape(batch * length, dim), update=False)
         return flat.reshape(batch, length * dim)
 
+    def _current_goal(self, *, track_norm: bool) -> torch.Tensor | None:
+        """Goal columns of the current value-group observation, if configured."""
+        if self.goal_columns is None:
+            return None
+        goal = getattr(self.env.state.obs, "value").to(self.device, non_blocking=True)[:, self.goal_columns]
+        if track_norm and self.goal_norm is not None:
+            self.goal_norm.update(goal)
+        return goal
+
     def _policy_command(self, *, track_norm: bool) -> torch.Tensor:
         """The actor's command for the current observation history."""
         raw_obs = getattr(self.env.state.obs, self.policy_group)
@@ -115,6 +128,9 @@ class ApgCollector:
         obs = raw_obs.to(self.device, non_blocking=True)
         history = self._push_history(obs)
         features = self._normalize_history(history, update_from=obs if track_norm else None)
+        goal = self._current_goal(track_norm=track_norm)
+        if goal is not None:
+            features = torch.cat((features, self.goal_norm(goal, update=False)), dim=-1)
         with torch.no_grad():
             command = self.action_limit * self.actor(features)
             if self._command_pin is None or self._command_pin.shape != command.shape:
