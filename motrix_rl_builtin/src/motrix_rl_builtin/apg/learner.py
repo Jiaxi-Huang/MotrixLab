@@ -64,7 +64,7 @@ class ApgLearner:
         obs_dim: int,
         value_dim: int,
         action_limit: float,
-        value_max: float | None = None,
+        value_max: float,
         goal_columns: torch.Tensor | None = None,
     ):
         self.program = program
@@ -76,8 +76,9 @@ class ApgLearner:
         self.cfg = cfg
         self.device = device
         self.action_limit = action_limit
-        # Upstream clamps critic outputs (bootstrap and targets alike) at the
-        # task's maximum discounted return, suppressing value overestimation.
+        # Upstream clamps the critic's bootstrap and regression targets at the
+        # task's maximum discounted return, suppressing value overestimation —
+        # always on, as upstream.
         self.value_max = value_max
         # Flat goal columns within the value group: the actor consumes them as
         # a single current frame appended to the stacked proprio history
@@ -116,7 +117,9 @@ class ApgLearner:
         return flat.reshape(batch, length * dim)
 
     def _actor_features(self, history: torch.Tensor, goal: torch.Tensor | None) -> torch.Tensor:
-        """Stacked normalized proprio history, with the flat goal appended."""
+        """Concatenated actor input: normalized stacked proprio history, then
+        the normalized flat goal — the GoalConditionedActor's contract (the
+        goal slice passes its encoder inside the actor)."""
         stacked = self._normalize_history(history)
         if self.goal_norm is None or goal is None:
             return stacked
@@ -269,9 +272,7 @@ class ApgLearner:
         _set_trainable(self.critic, False)
         try:
             rewards, gates, value_obs = self._unroll(start_states, history)
-            terminal_value = self._value_of(value_obs[-1], update=False)
-            if self.value_max is not None:
-                terminal_value = terminal_value.clamp(max=self.value_max)
+            terminal_value = self._value_of(value_obs[-1], update=False).clamp(max=self.value_max)
             batch_return = self._horizon_return(rewards, gates, terminal_value)
             actor_loss = -batch_return.mean()
             self._actor_opt.zero_grad(set_to_none=True)
@@ -334,9 +335,7 @@ class ApgLearner:
                     (1.0 - cfg.critic.lam) * values[step + 1] + cfg.critic.lam * target
                 )
                 targets.append(target)
-            targets = torch.stack(targets[::-1])  # (H, B)
-            if self.value_max is not None:
-                targets = targets.clamp(max=self.value_max)
+            targets = torch.stack(targets[::-1]).clamp(max=self.value_max)  # (H, B)
 
         inputs = inputs_all[:-1].flatten(0, 1)  # (H*B, D)
         flat_targets = targets.flatten(0, 1)

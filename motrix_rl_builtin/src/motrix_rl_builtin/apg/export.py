@@ -31,7 +31,7 @@ class ApgOnnxExporter(OnnxPolicyExporter):
         except ImportError as error:
             raise RuntimeError("APG ONNX export requires the 'motrix-rl[onnx]' extra") from error
 
-        from motrix_rl_builtin.apg.networks import MlpActor
+        from motrix_rl_builtin.apg.networks import GoalConditionedActor, MlpActor
 
         checkpoint = torch.load(request.checkpoint, map_location="cpu", weights_only=True)
         if not isinstance(checkpoint, Mapping):
@@ -41,11 +41,19 @@ class ApgOnnxExporter(OnnxPolicyExporter):
         obs_dim = int(dims["obs_dim"])
         action_dim = int(dims["action_dim"])
 
-        actor = MlpActor(
-            obs_dim,
-            action_dim,
-            request.task_config.algo.actor.hidden,
-            output_activation=request.task_config.algo.actor.output_activation,
+        actor_cfg = request.task_config.algo.actor
+        goal_dim = int(dims.get("goal_dim", 0))
+        actor = (
+            GoalConditionedActor(
+                obs_dim,
+                goal_dim,
+                action_dim,
+                actor_cfg.hidden,
+                int(dims.get("goal_latent_dim", actor_cfg.goal_latent_dim)),
+                output_activation=actor_cfg.output_activation,
+            )
+            if goal_dim
+            else MlpActor(obs_dim, action_dim, actor_cfg.hidden, output_activation=actor_cfg.output_activation)
         )
         actor.load_state_dict(actor_state, strict=True)
         actor.eval()
@@ -53,7 +61,6 @@ class ApgOnnxExporter(OnnxPolicyExporter):
         normalizer = EmpiricalNormalization(shape=int(dims["raw_obs_dim"]), device="cpu")
         normalizer.load_state_dict(_module_state(checkpoint, "obs_norm", request.checkpoint), strict=True)
         normalizer.eval()
-        goal_dim = int(dims.get("goal_dim", 0))
         goal_normalizer = None
         if goal_dim:
             goal_normalizer = EmpiricalNormalization(shape=goal_dim, device="cpu")

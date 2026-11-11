@@ -226,19 +226,22 @@ MotrixLab 侧确为上游配方移植的出处证据：
 
 ### 第二轮（外部评审后，同日）
 
-外部逐项核对确认第一轮对齐成立，另指出三处待决；已全部处置：
+外部逐项核对确认第一轮对齐成立，另指出三处待决；处置如下：
 
-1. **goal 窗不再入历史栈**（结构性，评审主发现）：上游历史栈只作用本体感知。落地为
-   `apg.goal_terms`——policy 组仅含本体感知（projected_gravity / ang_vel /
-   dof_pos / dof_vel / actions，93 维 ×10 栈），goal 窗（未来关节目标 +
-   锚点相对姿态，640 维）作为 value 组内具名 term 列切片，平铺单份拼进
-   actor 输入（列范围自 `env.observation_groups` 布局按名推导，任务零硬编码）；
-   goal 独立归一器，play/ONNX 导出同步拆分输入契约（部署侧需按
-   `[proprio 栈 | goal]` 供数）。actor 输入回到上游量级（~1570 vs 7330）。
+1. **goal 平铺 + goal 编码器 actor**（结构性，评审主发现）：上游历史栈只
+   作用本体感知、goal 单份平铺、goal 经编码器 MLP（tanh latent 瓶颈）后与
+   栈拼接进 decoder。落地为前一尝试 `GoalConditionedActor` 的回收：policy
+   组仅本体感知（93 维 ×10 栈），goal 窗（未来关节目标 + 锚点相对姿态，
+   640 维）作为 value 组内具名 term 列切片（`apg.goal_terms`，列范围自
+   `env.observation_groups` 布局按名推导）平铺单份，与归一化栈拼接为 actor
+   输入（**1570 维，上游量级**）；actor 内 goal→encoder MLP→latent(32)
+   tanh→decoder（首层 962 = latent + 栈），goal 独立归一器贯通采集/想象/
+   play/ONNX（导出输入契约为 `[proprio 栈 | goal]`，部署侧按任务 obs 规格
+   供 goal 列）。
 2. **未来关节窗改逐帧块布局**：`[qj(N), vj(N)]×帧` 拼接（此前为逐关节标量
    交错，信息等价但与上游非逐字）。
-3. **v_max 裁剪范围对齐上游**：只裁 bootstrap 与回归目标，TD(λ) 递归内
-   per-step value 不裁（此前裁得更强）。
+3. **v_max 裁剪**：无条件常开（同上游默认），裁剪范围对齐上游——只裁
+   bootstrap 与回归目标，TD(λ) 递归内 per-step value 不裁。
 
 实施中另自查修复一处评审未覆盖的 unroll 时序 bug：想象步此前在
 pre-dynamics 态上 evaluate/observe 且起点 obs 重复入栈，已改为

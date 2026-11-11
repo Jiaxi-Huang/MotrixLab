@@ -148,7 +148,7 @@ def test_fastsac_checkpoint_excludes_runtime_wrappers() -> None:
 
 @pytest.mark.integration
 def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
-    from motrix_rl_builtin.apg.networks import MlpActor
+    from motrix_rl_builtin.apg.networks import GoalConditionedActor
 
     from motrix_rl.normalize import EmpiricalNormalization
 
@@ -158,8 +158,15 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
     )
     actor_cfg = config.algo
     raw_dim, action_dim, history = 6, 3, actor_cfg.actor.history
-    goal_dim = 5  # flat goal window appended to the stacked proprio history
-    actor = MlpActor(raw_dim * history + goal_dim, action_dim, actor_cfg.actor.hidden, output_activation="identity")
+    goal_dim, latent_dim = 5, 4  # flat goal window through the encoder MLP
+    actor = GoalConditionedActor(
+        raw_dim * history + goal_dim,
+        goal_dim,
+        action_dim,
+        actor_cfg.actor.hidden,
+        latent_dim,
+        output_activation="identity",
+    )
     with torch.no_grad():
         for index, parameter in enumerate(actor.parameters()):
             parameter.fill_(0.01 * (index + 1))
@@ -186,6 +193,7 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
                 "action_limit": 2.0,
                 "history": history,
                 "goal_dim": goal_dim,
+                "goal_latent_dim": latent_dim,
             },
         },
     )

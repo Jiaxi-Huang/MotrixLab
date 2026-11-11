@@ -342,6 +342,46 @@ class MlpActor(nn.Module):
         return self.output_activation(run_mlp(self.net, features, self.amp_dtype))
 
 
+class GoalConditionedActor(nn.Module):
+    """Goal-encoding actor recovered from the prior ``motrix.mbrl`` attempt.
+
+    Input is the concatenated actor contract: normalized observation history
+    followed by the normalized flat goal window (upstream stacks
+    proprioception only). The goal passes its encoder MLP to a tanh-bounded
+    latent (upstream's bottleneck, 32 by default), and the decoder consumes
+    the latent alongside the history — so the decoder width matches
+    upstream's (latent + stacked proprioception), not the raw goal width.
+    """
+
+    amp_dtype: torch.dtype | None = None
+
+    def __init__(
+        self,
+        input_dim: int,
+        goal_dim: int,
+        action_dim: int,
+        hidden: Sequence[int],
+        latent_dim: int,
+        *,
+        output_activation: str = "tanh",
+    ):
+        super().__init__()
+        if goal_dim <= 0 or latent_dim <= 0:
+            raise ValueError("Goal-conditioned policies require positive goal and latent dimensions")
+        self.goal_dim = goal_dim
+        self.output_activation = _output_activation(output_activation)
+        self.encoder = _mlp(goal_dim, hidden, latent_dim)
+        self.decoder = _mlp(input_dim - goal_dim + latent_dim, hidden, action_dim)
+        with torch.no_grad():
+            self.decoder[-1].weight.mul_(0.01)
+            self.decoder[-1].bias.zero_()
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        history, goal = features[..., : -self.goal_dim], features[..., -self.goal_dim :]
+        latent = torch.tanh(run_mlp(self.encoder, goal, self.amp_dtype))
+        return self.output_activation(run_mlp(self.decoder, torch.cat((latent, history), dim=-1), self.amp_dtype))
+
+
 class MlpCritic(nn.Module):
     """State-value head ``V(obs) -> (..., 1)``."""
 

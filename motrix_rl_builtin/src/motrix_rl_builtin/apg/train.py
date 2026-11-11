@@ -49,7 +49,13 @@ from motrix_rl_builtin.apg.assemble import build_assembly
 from motrix_rl_builtin.apg.collector import ApgCollector, _term_leaves
 from motrix_rl_builtin.apg.config import ApgCfg
 from motrix_rl_builtin.apg.learner import ApgLearner
-from motrix_rl_builtin.apg.networks import FloatingBaseDynamics, MlpActor, MlpCritic, MlpDynamics
+from motrix_rl_builtin.apg.networks import (
+    FloatingBaseDynamics,
+    GoalConditionedActor,
+    MlpActor,
+    MlpCritic,
+    MlpDynamics,
+)
 
 torch.set_float32_matmul_precision("high")
 
@@ -197,11 +203,22 @@ class Trainer(TrainerBase):
             program=view.program,
             assembly=assembly,
             dynamics=_make_dynamics(cfg, num_joints, assembly.flat_width, action_dim),
-            actor=MlpActor(
-                obs_dim * cfg.actor.history + goal_dim,
-                action_dim,
-                cfg.actor.hidden,
-                output_activation=cfg.actor.output_activation,
+            actor=(
+                GoalConditionedActor(
+                    obs_dim * cfg.actor.history + goal_dim,
+                    goal_dim,
+                    action_dim,
+                    cfg.actor.hidden,
+                    cfg.actor.goal_latent_dim,
+                    output_activation=cfg.actor.output_activation,
+                )
+                if goal_dim
+                else MlpActor(
+                    obs_dim * cfg.actor.history,
+                    action_dim,
+                    cfg.actor.hidden,
+                    output_activation=cfg.actor.output_activation,
+                )
             ),
             critic=MlpCritic(value_dim, cfg.critic.hidden),
             replay=replay,
@@ -239,6 +256,7 @@ class Trainer(TrainerBase):
             "raw_obs_dim": obs_dim,
             "value_dim": value_dim,
             "goal_dim": goal_dim,
+            "goal_latent_dim": cfg.actor.goal_latent_dim,
             "history": cfg.actor.history,
             "value_max": value_max,
             "fields": list(view.fields),
@@ -548,11 +566,23 @@ class Trainer(TrainerBase):
                     columns.extend(range(cursor, cursor + entry.size))
                 cursor += entry.size
             goal_columns_for_play = torch.tensor(columns, dtype=torch.long, device=device)
-        actor = MlpActor(
-            dims["obs_dim"],
-            dims["action_dim"],
-            cfg.actor.hidden,
-            output_activation=cfg.actor.output_activation,
+        goal_dim = int(dims.get("goal_dim", 0))
+        actor = (
+            GoalConditionedActor(
+                dims["obs_dim"],
+                goal_dim,
+                dims["action_dim"],
+                cfg.actor.hidden,
+                int(dims.get("goal_latent_dim", cfg.actor.goal_latent_dim)),
+                output_activation=cfg.actor.output_activation,
+            )
+            if goal_dim
+            else MlpActor(
+                dims["obs_dim"],
+                dims["action_dim"],
+                cfg.actor.hidden,
+                output_activation=cfg.actor.output_activation,
+            )
         ).to(device)
         actor.load_state_dict(payload["actor"])
         actor.eval()

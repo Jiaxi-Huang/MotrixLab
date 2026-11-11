@@ -65,6 +65,9 @@ class ActorCfg:
     # "tanh" bounds policy outputs; "identity" does not (the collector scales
     # by the task action limit either way).
     output_activation: str = "tanh"
+    # Goal-encoder latent width (upstream's tanh bottleneck) when the task
+    # declares goal terms; the decoder sees latent + stacked proprioception.
+    goal_latent_dim: int = 32
 
 
 @dataclass
