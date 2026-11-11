@@ -233,7 +233,14 @@ resolver 产出的 `ResolvedManagerProgram` 是纯数据（typed call records + 
 - 派生粒度 **group 级 all-or-nothing**：reward 组 / 各 observation 组 /
   termination 组要么整体可派生，要么整体不可想象（混合会使加权和残缺、观测
   不全）；
-- shadow `rand` 走确定性模式（obs 噪声关闭语义）；modeling program 先 eager
+- shadow `rand` 按 term 声明幅度**真实采样**（2026-11-11 三方对照后修订，
+  替代 v1 的确定性零模式）：policy 组的传感器噪声在想象中同样生效——对齐
+  上游 `_synth_sensor(noisy=True)`，actor 的 BPTT 全程在带噪观测上优化、与
+  部署侧真实传感器一致（joint vel ±0.5 等幅度下训练/部署一致性缺口由此
+  关闭）；goal/value 组项噪声幅度为零，天然保持确定性。噪声对 actor 参数是
+  无梯度的加性项，reward/软终止始终从干净 modeling state 计算。RNG 为
+  per-shadow-host 的设备生成器（philox，CUDA graph 可捕获；不随 resume
+  序列化，与 env RNG 流同属可分歧行）。modeling program 先 eager
   保证正确性，`torch.compile` 为可选优化（独立编译域，guard 落在 shadow 宿主
   对象 identity 上，与真实 kernel 编译缓存互不干扰）。
 
@@ -503,7 +510,7 @@ commit 拆分：
 5. **杂项契约**（`motrix_env_core`）：`target_offset` reset 随机化、action range
    显式放宽（无 ctrl_range → 配置化无界/对称维度 + warning）、resolver term
    参数可携带 kernel_data 载体（FK chain，消除任务侧闭包 workaround）、
-   `math/rotation` 增补。验收：现有 env 全量回归。
+   `math/rotation` 增补。验收：现有 env 全量回归。（对于wbt supermimic任务如为非阻塞项可以先不做）
 
 验收（phase 级）：最小 fixture 任务上**同一 term 双路径数值一致**——真实 kernel
 与 modeling program 在相同输入下 reward / obs / termination 输出一致（含权重
@@ -570,7 +577,8 @@ Phase 3。
   干扰；command kernel_data 的 shadow 拷贝 / 常量共享区分规则是机制复杂点，
   P2 评审冻结；隐式派生（无显式标记）的错误定位完全依赖 dry-run 报错质量，
   报错必须落到具体 term 与字段名；reward term 内使用 `ctx.rand` 的罕见情形
-  需在协议冻结时定义想象侧语义（确定性或注入）；派生不检测数值等价——
+  已随 shadow rand 修订定案：想象侧 rand 一律真实采样（与 obs 噪声同一
+  语义）；派生不检测数值等价——
   等价性由 dry-run + fixture 数值一致性测试兜底；显式意图标记
   （`@modeling` / `@differential`）在真实混合任务出现前不引入；
 - **per-clip bins 的空 bin**：clip 长度差异大时短 clip 的 bin 粒度由

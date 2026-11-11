@@ -219,8 +219,7 @@ def motion_future_reference_orientation_obs(ctx: ManagerContext, out: torch.Tens
     frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
     anchor_quat = ctx.sim["tracked_body_quat"][:, motion.reference_index]
     local = relative_orientation(anchor_quat[:, None, :], motion.clip.reference_body_quat_w[frames])
-    six = quaternion.matrix6d(local)
-    out.copy_(six.reshape(six.shape[0], -1))
+    out.copy_(local.reshape(local.shape[0], -1))
 
 
 @configclass(kw_only=True)
@@ -279,3 +278,57 @@ class ProjectedGravityObsCfg(ObservationTermCfg):
 
     def __call__(self, ctx) -> ObsTerm:
         return ObsTerm(3, projected_gravity_obs, float(self.noise.amplitude))
+
+
+def soft_termination_obs(
+    ctx: ManagerContext,
+    out: torch.Tensor,
+    z_threshold: float,
+    ori_threshold: float,
+    softness: float,
+) -> None:
+    """Soft termination probability of the tracking terminations.
+
+    Upstream supermimic's world-model termination: the anchor z error and
+    the tilt error (both the same quantities the hard ``bad_ref_z`` /
+    ``bad_ref_orientation`` terms threshold) are normalized by their
+    thresholds, and the max feeds one sigmoid. The trainer consumes this
+    value-group channel as the imagination survival gate.
+    """
+    motion = ctx.commands["motion"]
+    steps = motion.steps[:, 0]
+    reference_pos = motion.clip.reference_body_pos_w[steps]
+    reference_quat = motion.clip.reference_body_quat_w[steps]
+    anchor_pos = ctx.sim["tracked_body_pos"][:, motion.reference_index]
+    anchor_quat = ctx.sim["tracked_body_quat"][:, motion.reference_index]
+    z_error = (reference_pos[..., 2] - anchor_pos[..., 2]).abs()
+    # Gravity's z in a body frame is 2(x^2 + y^2) - 1 for a unit quaternion.
+    tilt_error = (
+        2.0 * (reference_quat[..., 0] ** 2 + reference_quat[..., 1] ** 2)
+        - 2.0 * (anchor_quat[..., 0] ** 2 + anchor_quat[..., 1] ** 2)
+    ).abs()
+    normalized = torch.maximum(z_error / z_threshold, tilt_error / ori_threshold)
+    out.copy_(torch.sigmoid((normalized - 1.0) / softness).unsqueeze(-1))
+
+
+@configclass(kw_only=True)
+class SoftTerminationObsCfg(ObservationTermCfg):
+    """Soft tracking-termination probability as a one-dim value-group term.
+
+    Defaults mirror the supermimic variant's hard termination thresholds
+    (reference z 0.25, orientation 0.8) and upstream's termination softness
+    (0.05).
+    """
+
+    z_threshold: float = 0.25
+    ori_threshold: float = 0.8
+    softness: float = 0.05
+
+    def __call__(self, ctx) -> ObsTerm:
+        return ObsTerm(
+            1,
+            soft_termination_obs,
+            float(self.z_threshold),
+            float(self.ori_threshold),
+            float(self.softness),
+        )

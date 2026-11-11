@@ -42,18 +42,18 @@ class ApgOnnxExporter(OnnxPolicyExporter):
         action_dim = int(dims["action_dim"])
 
         actor_cfg = request.task_config.algo.actor
+        goal_slices = tuple(len(columns) for columns in dims.get("goal_columns", ()))
         goal_dim = int(dims.get("goal_dim", 0))
         actor = (
             GoalConditionedActor(
                 obs_dim,
-                goal_dim,
+                goal_slices,
                 action_dim,
                 actor_cfg.hidden,
-                int(dims.get("goal_latent_dim", actor_cfg.goal_latent_dim)),
-                output_activation=actor_cfg.output_activation,
+                int(dims.get("latent_dim", actor_cfg.latent_dim)),
             )
             if goal_dim
-            else MlpActor(obs_dim, action_dim, actor_cfg.hidden, output_activation=actor_cfg.output_activation)
+            else MlpActor(obs_dim, action_dim, actor_cfg.hidden)
         )
         actor.load_state_dict(actor_state, strict=True)
         actor.eval()
@@ -61,11 +61,16 @@ class ApgOnnxExporter(OnnxPolicyExporter):
         normalizer = EmpiricalNormalization(shape=int(dims["raw_obs_dim"]), device="cpu")
         normalizer.load_state_dict(_module_state(checkpoint, "obs_norm", request.checkpoint), strict=True)
         normalizer.eval()
-        goal_normalizer = None
+        goal_normalizers = ()
         if goal_dim:
-            goal_normalizer = EmpiricalNormalization(shape=goal_dim, device="cpu")
-            goal_normalizer.load_state_dict(_module_state(checkpoint, "goal_norm", request.checkpoint), strict=True)
-            goal_normalizer.eval()
+            goal_normalizers = tuple(
+                EmpiricalNormalization(shape=width, device="cpu") for width in goal_slices
+            )
+            for index, goal_normalizer in enumerate(goal_normalizers):
+                goal_normalizer.load_state_dict(
+                    _module_state(checkpoint, f"goal_norm_{index}", request.checkpoint), strict=True
+                )
+                goal_normalizer.eval()
         action_limit = float(dims["action_limit"])
         history = int(dims["history"])
 
@@ -74,15 +79,21 @@ class ApgOnnxExporter(OnnxPolicyExporter):
                 super().__init__()
                 self.actor = actor
                 self.normalizer = normalizer
-                self.goal_normalizer = goal_normalizer
+                self.goal_normalizers = goal_normalizers
 
             def forward(self, observations: torch.Tensor) -> torch.Tensor:
                 frames = observations[:, : history * int(dims["raw_obs_dim"])]
                 stacked = frames.reshape(frames.shape[0], history, -1)
                 normalized = self.normalizer(stacked, update=False).reshape(frames.shape[0], -1)
                 if goal_dim:
-                    goal = self.goal_normalizer(observations[:, history * int(dims["raw_obs_dim"]) :], update=False)
-                    normalized = torch.cat((normalized, goal), dim=-1)
+                    goal = observations[:, history * int(dims["raw_obs_dim"]) :]
+                    blocks = (
+                        goal_normalizer(block, update=False)
+                        for goal_normalizer, block in zip(
+                            self.goal_normalizers, goal.split(goal_slices, dim=-1), strict=True
+                        )
+                    )
+                    normalized = torch.cat((normalized, *blocks), dim=-1)
                 return action_limit * self.actor(normalized)
 
         policy = DeterministicPolicy().eval()

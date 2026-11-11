@@ -3,10 +3,10 @@
 
 """Typed configuration for the APG (world-model + BPTT) provider.
 
-The training recipe mirrors Uni-SuperMimic's ``SuperMimicConfig`` (shared
-learning rate with cosine decay to 3%, horizon-32 imagination, windowed
-world-model supervision, lambda-return critic on imagined rollouts, Gaussian
-action noise), recovered from the prior ``motrix.mbrl`` attempt. Task binding
+The training recipe mirrors Uni-SuperMimic's ``SuperMimicConfig`` (fixed
+shared learning rate, horizon-32 imagination, windowed world-model
+supervision, lambda-return critic on imagined rollouts, Gaussian action
+noise), recovered from the prior ``motrix.mbrl`` attempt. Task binding
 is derived: the trainer asks the env for its modeling view, so no adapter
 paths appear here (D3).
 """
@@ -16,12 +16,12 @@ from dataclasses import dataclass, field
 
 @dataclass
 class CollectorCfg:
-    # Std of Gaussian exploration noise added to policy commands during
-    # collection, as a fraction of the task action limit; evaluation stays
-    # deterministic. Upstream: ``action_noise``.
+    # Std of Gaussian exploration noise added to the raw policy command
+    # during collection, before the env's per-joint action scaling (joint-
+    # space magnitude = std * per-joint scale, as upstream); evaluation stays
+    # deterministic. Upstream: ``action_noise`` (unclamped — the env's own
+    # control-range clamping is the only bound).
     exploration_noise_std: float = 0.1
-    # Collection-only clamp after exploration, in task action-scale units.
-    exploration_clip: float = 1.0
 
 
 @dataclass
@@ -56,18 +56,14 @@ class ActorCfg:
     learning_rate: float = 0.0002
     # Imagination start states per policy update. Upstream: ``pi_batch``.
     batch_size: int = 1024
-    # Policy updates per training iteration.
-    updates_per_iteration: int = 1
     hidden: list[int] = field(default_factory=lambda: [256, 256])
     # Policy-observation history stack length fed to the actor (upstream
     # ``hist``). 1 disables stacking.
     history: int = 1
-    # "tanh" bounds policy outputs; "identity" does not (the collector scales
-    # by the task action limit either way).
-    output_activation: str = "tanh"
-    # Goal-encoder latent width (upstream's tanh bottleneck) when the task
-    # declares goal terms; the decoder sees latent + stacked proprioception.
-    goal_latent_dim: int = 32
+    # Goal-encoder latent width (upstream ``latent_dim``'s tanh bottleneck)
+    # when the task declares goal terms; the decoder sees latent + stacked
+    # proprioception. The actor's output is always unsquashed, as upstream.
+    latent_dim: int = 32
 
 
 @dataclass
@@ -90,33 +86,34 @@ class ImaginationCfg:
     # Actor gradient clipping; upstream additionally clips gradient values to
     # 0.1 (a recipe constant applied in the learner).
     max_grad_norm: float = 1.0
+    # Name of a one-dim value-group observation term carrying the soft
+    # termination probability of the post-step state. When set, the
+    # imagination survival gate is ``1 - p`` (upstream's soft-termination
+    # discounting); truncations never gate imagination (clip-end is
+    # clamp-and-continue). Empty falls back to hard ``terminated`` gates.
+    soft_termination_term: str = ""
 
 
 @dataclass
 class TrainerCfg:
     iterations: int = 150
-    # Reserved; eager execution only in this provider version.
-    compile: bool = False
-    # Real env steps collected per iteration and lane. Fractional values
-    # carry their remainder across iterations (upstream 1/utd): 2.5 yields
-    # alternating 2/3-step iterations.
-    collect_steps_per_iteration: float = 200.0
-    # Learner MLP precision: null keeps fp32; "bf16" runs the MLP forwards
-    # under bf16 autocast and casts outputs back to fp32 (upstream ``amp``).
-    # Geometry and rewards stay fp32. CUDA learners only.
+    # Policy updates per env step per lane, as upstream's steady-state utd
+    # (0.4 => 1/0.4 = 2.5 collected steps per update, alternating 2/3 via
+    # the fractional carry). Upstream derives 0.4 from a replay_ratio
+    # formula coupled to its 4096-env width; the bare utd is the portable
+    # semantic.
+    utd: float = 0.005
+    # Learner MLP precision: null keeps fp32 end to end (upstream trains
+    # fp32); "bf16" is a repo-side throughput option that runs the MLP
+    # forwards under bf16 autocast and casts outputs back to fp32. Geometry
+    # and rewards stay fp32 either way. CUDA learners only.
     amp: str | None = None
-    # WM-only iterations before policy updates start. Upstream:
-    # ``wm_only_iters``.
-    warmup_iterations: int = 5
-    # Cosine lr decay horizon; None decays over ``iterations``. Upstream:
-    # ``lr_decay_iters`` (decaying to 3% of the base learning rate).
-    lr_decay_iterations: int | None = None
     # Deterministic real evaluation every N iterations; 0 evaluates only
     # after training (D9: an evaluation profile, not a framework concept).
     eval_interval: int = 10
     eval_steps: int = 2000
     # Run the trainer's own end-of-training evaluation.
-    final_eval: bool = True
+    final_eval: bool = False
 
 
 @dataclass
@@ -128,11 +125,12 @@ class ApgCfg:
     gamma: float = 0.99
     # Observation-group names the actor and critic consume; both groups are
     # produced by the same derived program on the imagination side.
-    # ``goal_terms`` names value-group observation terms the actor consumes as
-    # a flat, never-stacked input — the upstream convention: only
-    # proprioception stacks, the goal window enters as a single current frame.
     policy_group: str = "policy"
     value_group: str = "value"
+    # Value-group observation terms the actor consumes as flat, never-stacked
+    # goal inputs — the upstream convention: only proprioception stacks,
+    # goals enter as single current frames. All terms share one encoder
+    # (upstream's per-task encoders arrive with a second task, not before).
     goal_terms: tuple[str, ...] = ()
     collector: CollectorCfg = field(default_factory=CollectorCfg)
     replay: ReplayCfg = field(default_factory=ReplayCfg)

@@ -27,7 +27,6 @@ from motrix_env_core.manager.kernel_data import iter_leaves
 from motrix_rl.console import EpisodeWindow, EpisodeWindowStats
 from motrix_rl.normalize import EmpiricalNormalization
 from motrix_rl.replay import SequenceReplay
-from motrix_rl_builtin.apg.assemble import Assembly
 
 
 def _term_leaves(term: Any, num_envs: int) -> dict[str, torch.Tensor]:
@@ -47,38 +46,33 @@ class ApgCollector:
         *,
         env,
         view,
-        assembly: Assembly,
         replay: SequenceReplay,
         device: torch.device,
         rng: np.random.Generator,
         actor: torch.nn.Module,
         obs_norm: EmpiricalNormalization,
-        goal_norm: EmpiricalNormalization | None,
-        goal_columns: torch.Tensor | None,
+        goal_norms: tuple[EmpiricalNormalization, ...],
+        goal_columns: tuple[torch.Tensor, ...],
         action_limit: float,
-        action_bounds: tuple[float, float] | None,
         history_length: int,
         policy_group: str,
         exploration_noise_std: float = 0.0,
-        exploration_clip: float = 1.0,
         on_transition: Callable[[dict, torch.Tensor, dict], None] | None = None,
     ):
         self.env = env
         self.view = view
-        self.assembly = assembly
         self.replay = replay
         self.device = device
         self.rng = rng
         self.actor = actor
         self.obs_norm = obs_norm
-        self.goal_norm = goal_norm
-        self.goal_columns = None if goal_columns is None else goal_columns.to(device)
+        self.goal_norms = goal_norms
+        self.goal_columns = tuple(columns.to(device) for columns in goal_columns)
+        self.goal_slices = tuple(int(columns.shape[0]) for columns in self.goal_columns)
         self.action_limit = action_limit
-        self.action_bounds = action_bounds
         self.history_length = history_length
         self.policy_group = policy_group
         self.exploration_noise_std = exploration_noise_std
-        self.exploration_clip = exploration_clip
         self.on_transition = on_transition
         self.channels = tuple(view.exogenous)
         self._term_name = {channel: channel.split(".", 1)[0] for channel in self.channels}
@@ -112,14 +106,13 @@ class ApgCollector:
         flat = self.obs_norm(history.reshape(batch * length, dim), update=False)
         return flat.reshape(batch, length * dim)
 
-    def _current_goal(self, *, track_norm: bool) -> torch.Tensor | None:
-        """Goal columns of the current value-group observation, if configured."""
-        if self.goal_columns is None:
+    def _current_goal(self) -> torch.Tensor | None:
+        """Concatenated raw goal blocks of the current value-group observation
+        (per-encoder columns, in encoder order), if configured."""
+        if not self.goal_columns:
             return None
-        goal = getattr(self.env.state.obs, "value").to(self.device, non_blocking=True)[:, self.goal_columns]
-        if track_norm and self.goal_norm is not None:
-            self.goal_norm.update(goal)
-        return goal
+        value_obs = getattr(self.env.state.obs, "value").to(self.device, non_blocking=True)
+        return torch.cat([value_obs[:, columns] for columns in self.goal_columns], dim=-1)
 
     def _policy_command(self, *, track_norm: bool) -> torch.Tensor:
         """The actor's command for the current observation history."""
@@ -128,9 +121,16 @@ class ApgCollector:
         obs = raw_obs.to(self.device, non_blocking=True)
         history = self._push_history(obs)
         features = self._normalize_history(history, update_from=obs if track_norm else None)
-        goal = self._current_goal(track_norm=track_norm)
+        goal = self._current_goal()
         if goal is not None:
-            features = torch.cat((features, self.goal_norm(goal, update=False)), dim=-1)
+            if track_norm:
+                for norm, block in zip(self.goal_norms, goal.split(self.goal_slices, dim=-1), strict=True):
+                    norm.update(block)
+            blocks = (
+                norm(block, update=False)
+                for norm, block in zip(self.goal_norms, goal.split(self.goal_slices, dim=-1), strict=True)
+            )
+            features = torch.cat((features, *blocks), dim=-1)
         with torch.no_grad():
             command = self.action_limit * self.actor(features)
             if self._command_pin is None or self._command_pin.shape != command.shape:
@@ -225,7 +225,10 @@ class ApgCollector:
         """Collect ``num_steps`` policy transitions into the replay."""
         rewards: list[float] = []
         terminations = 0
-        noise_std = self.exploration_noise_std * self.action_limit
+        # Upstream adds sigma-0.1 Gaussian noise to the raw action, before the
+        # env's per-joint scaling (joint-space magnitude = std * scale_j); the
+        # env's own control-range clamping is the only bound.
+        noise_std = self.exploration_noise_std
         for _ in range(num_steps):
             obs = getattr(self.env.state.obs, self.policy_group).clone()
             command = self._policy_command(track_norm=True)
@@ -236,9 +239,6 @@ class ApgCollector:
                     device=command.device,
                 )
                 command = command + noise
-                limit = self.exploration_clip * self.action_limit
-                low, high = self.action_bounds if self.action_bounds is not None else (-limit, limit)
-                command = torch.clamp(command, float(low), float(high))
             state_fields = self._read_fields()
             channels = self._read_channels()
             self.env.step(command.to(self._env_device))

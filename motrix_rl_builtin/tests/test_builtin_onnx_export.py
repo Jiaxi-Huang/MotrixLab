@@ -161,11 +161,10 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
     goal_dim, latent_dim = 5, 4  # flat goal window through the encoder MLP
     actor = GoalConditionedActor(
         raw_dim * history + goal_dim,
-        goal_dim,
+        (goal_dim,),
         action_dim,
         actor_cfg.actor.hidden,
         latent_dim,
-        output_activation="identity",
     )
     with torch.no_grad():
         for index, parameter in enumerate(actor.parameters()):
@@ -185,7 +184,7 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
         {
             "actor": actor.state_dict(),
             "obs_norm": normalizer.state_dict(),
-            "goal_norm": goal_normalizer.state_dict(),
+            "goal_norm_0": goal_normalizer.state_dict(),
             "task": {
                 "obs_dim": raw_dim * history + goal_dim,
                 "raw_obs_dim": raw_dim,
@@ -193,7 +192,8 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
                 "action_limit": 2.0,
                 "history": history,
                 "goal_dim": goal_dim,
-                "goal_latent_dim": latent_dim,
+                "goal_columns": [list(range(goal_dim))],
+                "latent_dim": latent_dim,
             },
         },
     )
@@ -203,7 +203,9 @@ def test_apg_export_restores_actor_and_normalizer(tmp_path: Path) -> None:
     assert result.path.is_file()
     assert result.report.input_spec.shape == (None, raw_dim * history + goal_dim)
     assert result.report.output_spec.shape == (None, action_dim)
-    assert result.report.parity.max_abs_error < 1e-5
+    # The upstream-aligned actor carries LayerNorm in encoder/decoder; ONNX
+    # Runtime's LayerNorm numerics drift a hair above the plain-MLP budget.
+    assert result.report.parity.max_abs_error < 5e-5
     properties = {item.key: item.value for item in onnx.load(result.path).metadata_props}
     assert properties["rllib"] == "motrix"
     assert properties["algo"] == "apg"

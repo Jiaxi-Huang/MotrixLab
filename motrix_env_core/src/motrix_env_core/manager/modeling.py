@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import logging
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any
 
 import torch
@@ -29,6 +29,7 @@ from motrix_env_core.manager.exogenous import ExogenousKind, ExogenousRule
 from motrix_env_core.manager.kernel_data import Map, is_kernel_data, iter_leaves
 from motrix_env_core.manager.rand import DeterministicRandValue
 from motrix_env_core.manager.resolver import (
+    ConstantArg,
     ResolvedManagerProgram,
     SimArg,
 )
@@ -79,6 +80,8 @@ class _ExogenousEntry:
     tensor: torch.Tensor
     rule: ExogenousRule
     action_slice: slice | None = None
+    clamp_channel: str | None = None
+    """Resolved sibling channel (same command term) capping an increment."""
 
 
 @dataclass(frozen=True)
@@ -134,7 +137,14 @@ def _resize_kernel_data(value: Any, old_num_envs: int, new_num_envs: int) -> Any
     return value
 
 
-def _shadow_kernel_data(value: Any, num_envs: int, metric_tensors: set[int], *, detach: bool = False) -> Any:
+def _shadow_kernel_data(
+    value: Any,
+    num_envs: int,
+    metric_tensors: set[int],
+    *,
+    detach: bool = False,
+    device: torch.device | None = None,
+) -> Any:
     """Rebuild one command kernel-data tree under the frozen shadow rules.
 
     Per-environment rows (leading dim == num_envs) clone into independent
@@ -142,18 +152,23 @@ def _shadow_kernel_data(value: Any, num_envs: int, metric_tensors: set[int], *, 
     leaves pass through as the same objects (episode-independent constants,
     shared read-only); declared metric tensors become fresh zero sinks that
     terms may write and nobody reads. ``detach`` cuts the clones from any
-    outer autograd graph (the imagination-batch boundary).
+    outer autograd graph (the imagination-batch boundary). ``device`` moves
+    every tensor leaf (clones and shared constants alike) onto the shadow
+    host's device — imagination runs on the learner's device, not the real
+    program's.
     """
     if isinstance(value, torch.Tensor):
         if id(value) in metric_tensors:
-            return torch.zeros_like(value)
+            return torch.zeros(value.shape, dtype=value.dtype, device=device or value.device)
         if value.ndim and value.shape[0] == num_envs:
-            return value.detach().clone() if detach else value.clone()
-        return value.detach() if detach and value.requires_grad else value
+            clone = value.detach().clone() if detach else value.clone()
+            return clone.to(device) if device is not None else clone
+        moved = value.detach() if detach and value.requires_grad else value
+        return moved.to(device) if device is not None and moved.device != device else moved
     if isinstance(value, Map):
         return Map(
             {
-                key: _shadow_kernel_data(entry, num_envs, metric_tensors, detach=detach)
+                key: _shadow_kernel_data(entry, num_envs, metric_tensors, detach=detach, device=device)
                 for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)
             }
         )
@@ -162,33 +177,69 @@ def _shadow_kernel_data(value: Any, num_envs: int, metric_tensors: set[int], *, 
         changed = False
         for data_field in fields(type(value)):
             leaf = getattr(value, data_field.name)
-            shadow = _shadow_kernel_data(leaf, num_envs, metric_tensors, detach=detach)
+            shadow = _shadow_kernel_data(leaf, num_envs, metric_tensors, detach=detach, device=device)
             changed = changed or shadow is not leaf
             rebuilt.append(shadow)
         return type(value)(*rebuilt) if changed else value
     return value
 
 
-def _shadow_action_state(value: Any, *, detach: bool = False) -> Any:
+def _shadow_action_state(value: Any, *, detach: bool = False, device: torch.device | None = None) -> Any:
     """Copy every tensor leaf of one action state.
 
     Action state is working memory — the raw-action queue, the shared
     cursor, and custom per-env rows — all of it mutable and none of it an
     episode-independent constant, so sharing any leaf with the real term
     would let imagination advance the collector's history. ``detach`` cuts
-    the copies from an outer autograd graph (imagination-batch boundary).
+    the copies from an outer autograd graph (imagination-batch boundary);
+    ``device`` places the copies on the shadow host's device.
     """
     if isinstance(value, torch.Tensor):
-        return value.detach().clone() if detach else value.clone()
+        clone = value.detach().clone() if detach else value.clone()
+        return clone.to(device) if device is not None else clone
     if isinstance(value, Map):
         return Map(
             {
-                key: _shadow_action_state(entry, detach=detach)
+                key: _shadow_action_state(entry, detach=detach, device=device)
                 for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)
             }
         )
     if is_kernel_data(value):
-        return type(value)(*(_shadow_action_state(getattr(value, f.name), detach=detach) for f in fields(type(value))))
+        return type(value)(
+            *(_shadow_action_state(getattr(value, f.name), detach=detach, device=device) for f in fields(type(value)))
+        )
+    return value
+
+
+def _to_device_tree(value: Any, device: torch.device) -> Any:
+    """Move every tensor leaf of one static prepared argument onto ``device``.
+
+    The resolver bakes these once (plain tensors, param dataclasses such as
+    reward σ/limit bundles, kernel_data carriers like FK chains) on the real
+    program's device; the shadow program consumes its own moved copies so
+    imagination never mixes devices. Non-tensor leaves pass through.
+    """
+    if isinstance(value, torch.Tensor):
+        return value if value.device == device else value.to(device)
+    if isinstance(value, tuple):
+        moved = tuple(_to_device_tree(entry, device) for entry in value)
+        return value if all(new is old for new, old in zip(moved, value, strict=True)) else moved
+    if isinstance(value, Map):
+        return Map(
+            {
+                key: _to_device_tree(entry, device)
+                for key, entry in zip(value.keys_tuple, value.values_tuple, strict=True)
+            }
+        )
+    if is_dataclass(value) and not isinstance(value, type):
+        rebuilt = []
+        changed = False
+        for data_field in fields(type(value)):
+            leaf = getattr(value, data_field.name)
+            moved_leaf = _to_device_tree(leaf, device)
+            changed = changed or moved_leaf is not leaf
+            rebuilt.append(moved_leaf)
+        return type(value)(*rebuilt) if changed else value
     return value
 
 
@@ -247,8 +298,33 @@ class ModelingProgram:
         self._host = host
         self._fields = dict(fields)
         self._exogenous_entries = exogenous_entries
-        # Same tensor the real kernels weight with — values are never copied.
-        self._reward_weights = reward_weights
+        # The real kernels weight with the resolver's own tensor; the shadow
+        # carries the same values on the host device.
+        self._reward_weights = reward_weights.to(host.ctx.reward.device)
+        # Shadow copies of the term calls: static prepared args (plain
+        # tensors, param dataclasses, kernel_data carriers such as FK
+        # chains) move onto the host device once, here. SimArgs resolve per
+        # call from the caller's state and pass through untouched; the real
+        # program keeps its own calls and tensors.
+        device = host.ctx.reward.device
+
+        def shadow_calls(calls: Any) -> tuple[Any, ...]:
+            shadowed = []
+            for call in calls:
+                args = []
+                for arg in call.args:
+                    if isinstance(arg, ConstantArg):
+                        args.append(replace(arg, value=_to_device_tree(arg.value, device)))
+                    else:
+                        args.append(arg)
+                moved = any(new is not old for new, old in zip(args, call.args, strict=True))
+                shadowed.append(replace(call, args=tuple(args)) if moved else call)
+            return tuple(shadowed)
+
+        self._rewards = shadow_calls(program.rewards)
+        self._terminations = shadow_calls(program.terminations)
+        self._truncations = shadow_calls(program.truncations)
+        self._observations = {group: shadow_calls(calls) for group, calls in program.observations.items()}
 
     # -- binding ---------------------------------------------------------------
 
@@ -294,23 +370,24 @@ class ModelingProgram:
             receiver = ctx.commands[hook.receiver_key]
             hook.function(receiver, ctx)
         total = None
-        for term in self._program.rewards:
+        for term in self._rewards:
             value = term.function(ctx, *self._args(term, ctx)).to(torch.float32)
             weighted = value * self._reward_weights[term.index] * ctx.dt
             total = weighted if total is None else total + weighted
         terminated = None
-        for term in self._program.terminations:
+        for term in self._terminations:
             mask = term.function(ctx, *self._args(term, ctx)).to(torch.bool)
             terminated = mask if terminated is None else terminated | mask
         truncated = None
-        for term in self._program.truncations:
+        for term in self._truncations:
             mask = term.function(ctx, *self._args(term, ctx)).to(torch.bool)
             truncated = mask if truncated is None else truncated | mask
         num_envs = self._host.num_envs
+        device = self._host.ctx.reward.device
         return (
-            total if total is not None else torch.zeros(num_envs, dtype=torch.float32),
-            terminated if terminated is not None else torch.zeros(num_envs, dtype=torch.bool),
-            truncated if truncated is not None else torch.zeros(num_envs, dtype=torch.bool),
+            total if total is not None else torch.zeros(num_envs, dtype=torch.float32, device=device),
+            terminated if terminated is not None else torch.zeros(num_envs, dtype=torch.bool, device=device),
+            truncated if truncated is not None else torch.zeros(num_envs, dtype=torch.bool, device=device),
         )
 
     def observe(self, sim_state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -322,8 +399,10 @@ class ModelingProgram:
         ctx = self._bind(sim_state)
         outputs: dict[str, torch.Tensor] = {}
         for group_name, group_layout in self._program.layout.observations.items():
-            target = torch.zeros((self._host.num_envs, group_layout.size), dtype=torch.float32)
-            calls = self._program.observations[group_name]
+            target = torch.zeros(
+                (self._host.num_envs, group_layout.size), dtype=torch.float32, device=self._host.ctx.reward.device
+            )
+            calls = self._observations[group_name]
             for call, term_layout in zip(calls, group_layout.terms, strict=True):
                 call.function(ctx, target[:, term_layout.output_slice], *self._args(call, ctx))
             outputs[group_name] = target
@@ -335,6 +414,7 @@ class ModelingProgram:
         ``increment`` channels step, ``copy_action`` channels receive their
         action term's slice of ``action``, ``constant`` channels hold.
         """
+        clamp_tensors = {entry.channel: entry.tensor for entry in self._exogenous_entries}
         for entry in self._exogenous_entries:
             rule = entry.rule
             if rule.kind is ExogenousKind.INCREMENT:
@@ -348,6 +428,10 @@ class ModelingProgram:
                             f"increment step must be a whole number, got {rule.step}."
                         )
                     entry.tensor.add_(int(rule.step))
+                if entry.clamp_channel is not None:
+                    # Clamp-and-continue: the increment holds at the sibling
+                    # channel's value instead of running past it.
+                    entry.tensor.clamp_(max=clamp_tensors[entry.clamp_channel].to(entry.tensor.dtype))
             elif rule.kind is ExogenousKind.COPY_ACTION:
                 assert entry.action_slice is not None
                 entry.tensor.copy_(action[:, entry.action_slice].reshape(entry.tensor.shape))
@@ -481,6 +565,7 @@ class ModelingProgram:
                 else entry.tensor,
                 rule=entry.rule,
                 action_slice=entry.action_slice,
+                clamp_channel=entry.clamp_channel,
             )
             for entry in self._exogenous_entries
         )
@@ -529,24 +614,25 @@ class ModelingProgram:
         modeling state aborts derivation with the offending group, term,
         and field.
         """
+        device = self._host.ctx.reward.device
         dummy = {
-            key: torch.zeros((self._host.num_envs, *desc.shape), dtype=torch.float32)
+            key: torch.zeros((self._host.num_envs, *desc.shape), dtype=torch.float32, device=device)
             for key, desc in self._fields.items()
         }
         ctx = self._bind(dummy)
-        self._apply_action(torch.zeros((self._host.num_envs, self._env.action_space.shape[0])))
+        self._apply_action(torch.zeros((self._host.num_envs, self._env.action_space.shape[0]), device=device))
         for hook in self._program.command_updates:
             receiver = ctx.commands[hook.receiver_key]
             _guarded("command", f"{hook.receiver_key}.update", hook.function)(receiver, ctx)
-        for call, layout_term in zip(self._program.rewards, self._program.layout.rewards, strict=True):
+        for call, layout_term in zip(self._rewards, self._program.layout.rewards, strict=True):
             _guarded("reward", layout_term.name, call.function)(ctx, *self._args(call, ctx))
-        for call, layout_term in zip(self._program.terminations, self._program.layout.terminations, strict=True):
+        for call, layout_term in zip(self._terminations, self._program.layout.terminations, strict=True):
             _guarded("termination", layout_term.name, call.function)(ctx, *self._args(call, ctx))
-        for call, layout_term in zip(self._program.truncations, self._program.layout.truncations, strict=True):
+        for call, layout_term in zip(self._truncations, self._program.layout.truncations, strict=True):
             _guarded("truncation", layout_term.name, call.function)(ctx, *self._args(call, ctx))
         for group_name, group_layout in self._program.layout.observations.items():
-            target = torch.zeros((self._host.num_envs, group_layout.size), dtype=torch.float32)
-            calls = self._program.observations[group_name]
+            target = torch.zeros((self._host.num_envs, group_layout.size), dtype=torch.float32, device=device)
+            calls = self._observations[group_name]
             for call, term_layout in zip(calls, group_layout.terms, strict=True):
                 _guarded(f"observation group {group_name}", call.name, call.function)(
                     ctx,
@@ -555,18 +641,27 @@ class ModelingProgram:
                 )
 
 
-def derive_modeling_view(env: Any) -> ModelingView:
+def derive_modeling_view(env: Any, *, device: str | torch.device | None = None) -> ModelingView:
     """Derive the dual-path modeling view of one constructed manager env.
 
     Requires the resolved task program (``init_state()``). Every group must
     derive — a single non-imaginable group aborts with its first failing
     term, so no task trains on a partial reward or observation set.
+    ``device`` places the whole shadow host — ctx leaves, kernel-data and
+    metric copies (shared constants included), action state, observation
+    targets — on the learner's device; None falls back to the real
+    program's context device.
     """
     program: ResolvedManagerProgram | None = env._compiled_manager_program
     if program is None:
         raise RuntimeError("modeling_view() requires init_state() to have resolved the task program.")
     num_envs = env.num_envs
     metric_tensors = {id(value) for value in env.metrics.values()}
+    # The shadow host's device: the learner's when given (imagination runs
+    # there), else the real program's context device. The real reward
+    # buffer is the fallback source of truth — env_id is bookkeeping that
+    # may legitimately stay on CPU while term execution lives elsewhere.
+    host_device = torch.device(device) if device is not None else program.context.reward.device
 
     fields = {}
     for sim_input in program.layout.sim_inputs:
@@ -582,18 +677,27 @@ def derive_modeling_view(env: Any) -> ModelingView:
                 "cannot serve its semantic type."
             )
         fields[sim_input.key] = FieldDesc(sim_input.key, query_type, sim_input.shape)
-    commands = {name: _shadow_kernel_data(term, num_envs, metric_tensors) for name, term in env.command_terms.items()}
-    metrics = {name: torch.zeros_like(value) for name, value in env.metrics.items()}
+    commands = {
+        name: _shadow_kernel_data(term, num_envs, metric_tensors, device=host_device)
+        for name, term in env.command_terms.items()
+    }
+    metrics = {
+        name: torch.zeros(value.shape, dtype=value.dtype, device=host_device) for name, value in env.metrics.items()
+    }
     actions: dict[str, _ShadowAction] = {}
     for name, term in env.action_terms.items():
         clone = copy.copy(term)
-        clone.state = _shadow_action_state(term.state)
+        clone.state = _shadow_action_state(term.state, device=host_device)
         actions[name] = _ShadowAction(
             term=clone,
             process=type(term).process,
             input_slice=env.action_slices[name],
             width=term.action_space.shape[0],
         )
+    # Every freshly allocated ctx leaf matches the host device (a device-less
+    # zeros here leaves the host mixed, which only a non-CPU imagination run
+    # exposes).
+    device = host_device
     ctx = ManagerContext(
         # Read-only shared scalars and views carry over; everything mutable
         # is a shadow buffer. ``sim`` is rebound per call by the program.
@@ -601,16 +705,16 @@ def derive_modeling_view(env: Any) -> ModelingView:
         actions=Map({name: shadow.term.state for name, shadow in actions.items()}),
         commands=Map(dict(commands)),
         metrics=Map(metrics),
-        rand=DeterministicRandValue(torch.zeros((num_envs, 1), dtype=torch.int64)),
+        rand=DeterministicRandValue(torch.zeros((num_envs, 1), dtype=torch.int64, device=device)),
         sim=Map({}),
         dt=program.context.dt,
         # Imagination never rematerializes simulator state.
-        sim_reset_requested=torch.zeros((num_envs, 1), dtype=torch.bool),
-        reset_ids=torch.zeros(0, dtype=torch.int64),
-        reset_episode=torch.zeros((num_envs, 1), dtype=torch.bool),
-        terminated=torch.zeros(num_envs, dtype=torch.bool),
-        truncated=torch.zeros(num_envs, dtype=torch.bool),
-        reward=torch.zeros(num_envs, dtype=torch.float32),
+        sim_reset_requested=torch.zeros((num_envs, 1), dtype=torch.bool, device=device),
+        reset_ids=torch.zeros(0, dtype=torch.int64, device=device),
+        reset_episode=torch.zeros((num_envs, 1), dtype=torch.bool, device=device),
+        terminated=torch.zeros(num_envs, dtype=torch.bool, device=device),
+        truncated=torch.zeros(num_envs, dtype=torch.bool, device=device),
+        reward=torch.zeros(num_envs, dtype=torch.float32, device=device),
     )
     host = _ShadowHost(
         ctx=ctx,
@@ -656,9 +760,19 @@ def derive_modeling_view(env: Any) -> ModelingView:
                         f"action term {rule.action_term!r} width {shadow_action.width}."
                     )
                 action_slice = shadow_action.input_slice
+            clamp_channel = None
+            if rule.kind is ExogenousKind.INCREMENT and rule.clamp:
+                clamp_path = rule.clamp
+                if clamp_path not in declared:
+                    raise ModelingDerivationError(
+                        f"modeling derivation failed: command.{name} exogenous channel {field_path!r} "
+                        f"clamps at sibling {clamp_path!r}, which is not a declared exogenous channel "
+                        f"of the same command; declared: {sorted(declared)}."
+                    )
+                clamp_channel = f"{name}.{clamp_path}"
             channel = f"{name}.{field_path}"
             exogenous[channel] = rule
-            entries.append(_ExogenousEntry(channel, tensor, rule, action_slice))
+            entries.append(_ExogenousEntry(channel, tensor, rule, action_slice, clamp_channel))
 
     modeling = ModelingProgram(
         env=env,

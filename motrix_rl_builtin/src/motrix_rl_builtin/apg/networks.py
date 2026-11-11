@@ -4,22 +4,23 @@
 """Dynamics, actor, and critic networks for the APG world-model chain.
 
 Task-agnostic: dimensions come from the assembly layout and observation
-group widths, no layer carries task-specific slicing. The so(3) integrator,
-invariant features, error floors, and running norms are recovered from the
-prior ``motrix.mbrl`` attempt; the embedded exogenous advance is NOT —
-exogenous channels advance by rule in :class:`ModelingProgram
+group widths, no layer carries task-specific slicing. The floating-base
+dynamics mirrors upstream supermimic's gencoord recipe (invariant rep-state
+features in, acceleration-level deltas out, semi-implicit integration,
+Bryson-weighted channel-group supervision); the embedded exogenous advance
+of the prior ``motrix.mbrl`` attempt is NOT kept — exogenous channels
+advance by rule in :class:`ModelingProgram
 <motrix_env_core.manager.modeling.ModelingProgram>`, and the dynamics
 predicts only the physical block.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
 from torch import nn
-
-from motrix_rl_builtin.apg.assemble import matrix_to_quat_xyzw
 
 
 def _mlp(
@@ -65,57 +66,6 @@ def quat_xyzw_to_mat(quaternion: torch.Tensor) -> torch.Tensor:
         ),
         dim=-1,
     ).reshape(q.shape[:-1] + (3, 3))  # fmt: skip
-
-
-def yaw_mat(rotation: torch.Tensor) -> torch.Tensor:
-    """Heading-only rotation of ``(..., 3, 3)`` orientations."""
-    forward_x, forward_y = rotation[..., 0, 0], rotation[..., 1, 0]
-    norm = torch.sqrt(forward_x * forward_x + forward_y * forward_y + 1e-9)
-    cos, sin = forward_x / norm, forward_y / norm
-    zero, one = torch.zeros_like(cos), torch.ones_like(cos)
-    return torch.stack((cos, -sin, zero, sin, cos, zero, zero, zero, one), -1).reshape(rotation.shape[:-2] + (3, 3))
-
-
-def _quat_wxyz_to_rotvec(quat_wxyz: torch.Tensor) -> torch.Tensor:
-    quat_wxyz = quat_wxyz * torch.where(quat_wxyz[..., :1] < 0, -1.0, 1.0)
-    vector = quat_wxyz[..., 1:]
-    sin_half = torch.linalg.norm(vector, dim=-1, keepdim=True)
-    half = torch.atan2(sin_half, quat_wxyz[..., :1])
-    scale = torch.where(
-        sin_half < 1e-6,
-        2.0 / torch.clamp(quat_wxyz[..., :1], min=1e-6),
-        2 * half / (sin_half + 1e-12),
-    )
-    return vector * scale
-
-
-def so3_log(rotation: torch.Tensor) -> torch.Tensor:
-    """Rotation matrices to rotation vectors via the quaternion branch selection."""
-    quat_wxyz = matrix_to_quat_xyzw(rotation)
-    quat_wxyz = torch.cat((quat_wxyz[..., 3:], quat_wxyz[..., :3]), -1)
-    return _quat_wxyz_to_rotvec(quat_wxyz)
-
-
-def _skew(vector: torch.Tensor) -> torch.Tensor:
-    x, y, z = vector.unbind(-1)
-    zero = torch.zeros_like(x)
-    return torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), -1).reshape(vector.shape[:-1] + (3, 3))
-
-
-def so3_exp(vector: torch.Tensor) -> torch.Tensor:
-    theta2 = (vector * vector).sum(-1, keepdim=True)
-    theta = torch.sqrt(theta2 + 1e-12)
-    small = theta2 < 1e-8
-    a = torch.where(small, 1 - theta2 / 6, torch.sin(theta) / theta)
-    b = torch.where(small, 0.5 - theta2 / 24, (1 - torch.cos(theta)) / (theta2 + 1e-12))
-    skew_matrix = _skew(vector)
-    eye = torch.eye(3, device=vector.device, dtype=vector.dtype).expand(skew_matrix.shape)
-    return eye + a[..., None] * skew_matrix + b[..., None] * (skew_matrix @ skew_matrix)
-
-
-def _mat_to_quat_wxyz(rotation: torch.Tensor) -> torch.Tensor:
-    quat_xyzw = matrix_to_quat_xyzw(rotation)
-    return torch.cat((quat_xyzw[..., 3:], quat_xyzw[..., :3]), -1)
 
 
 class _RunningNorm(nn.Module):
@@ -182,90 +132,115 @@ class MlpDynamics(Dynamics):
         return state + delta
 
 
+def quat_integrate_xyzw(quaternion: torch.Tensor, world_omega: torch.Tensor, dt: float) -> torch.Tensor:
+    """Integrate xyzw quaternions one step by a world-frame angular velocity.
+
+    ``q <- normalize(q + dt/2 · (0, ω) ⊗ q)`` — the same first-order update
+    upstream supermimic's ``quat_integrate`` applies.
+    """
+    x, y, z, w = quaternion.unbind(-1)
+    ox, oy, oz = world_omega.unbind(-1)
+    half = 0.5 * dt
+    return torch.nn.functional.normalize(
+        torch.stack(
+            (
+                x + half * (ox * w + oy * z - oz * y),
+                y + half * (oy * w + oz * x - ox * z),
+                z + half * (oz * w + ox * y - oy * x),
+                w - half * (ox * x + oy * y + oz * z),
+            ),
+            dim=-1,
+        ),
+        dim=-1,
+    )
+
+
 class FloatingBaseDynamics(Dynamics):
-    """Frame-local world model for the physical block of floating-base states.
+    """Acceleration-delta world model for the physical block (upstream gencoord).
 
     Block convention: ``[0:3]`` root position, ``[3:7]`` root quaternion
-    (xyzw), ``[7:10]``/``[10:13]`` root linear/angular velocity, then joint
-    positions/velocities in tree order. The MLP sees only heading/translation
-    -invariant features plus the action and predicts frame-local increments
-    (yaw-frame position, so(3) rotation, body-frame velocities, joint deltas)
-    that integrate in fp32 back into world coordinates, as the SuperMimic
-    recipe. Exogenous channels are NOT part of the block — they advance by
-    rule in the modeling program.
+    (xyzw), ``[7:10]``/``[10:13]`` root linear/angular velocity (world
+    frame), then joint positions/velocities in tree order. Mirrors upstream
+    supermimic's ``GenCoordRepresentation``: the MLP consumes the invariant
+    rep-state features ``[z, g_b, v_b, w_b, qj, vj]`` plus the action and
+    predicts acceleration-level deltas ``[Δv_b, Δw_b, Δvj]`` in the current
+    root body frame; poses integrate analytically with the semi-implicit
+    substep coefficient ``c = (decimation + 1) / (2 · decimation)`` —
+    velocity states advance by the full delta, pose updates weight it by
+    ``c`` to match how the sim composes its substeps. The supervision error
+    is Bryson-weighted per channel group of the integrated state. Exogenous
+    channels are NOT part of the block — they advance by rule in the
+    modeling program.
     """
 
-    def __init__(self, num_joints: int, action_dim: int, hidden: Sequence[int]):
+    def __init__(
+        self,
+        num_joints: int,
+        action_dim: int,
+        hidden: Sequence[int],
+        dt: float,
+        decimation: int,
+    ):
         super().__init__()
         self.num_joints = num_joints
+        self.dt = dt
         joints = 13 + num_joints
         self._pos, self._quat = slice(0, 3), slice(3, 7)
         self._lin, self._ang = slice(7, 10), slice(10, 13)
         self._q, self._qd = slice(13, joints), slice(joints, 13 + 2 * num_joints)
-        invariant_dim = 1 + 6 + 3 + 3 + 2 * num_joints
-        self.out_dim = 12 + 2 * num_joints
-        self.net = _mlp(invariant_dim + action_dim, hidden, self.out_dim, act=nn.SiLU, layer_norm=True)
+        rep_dim = 10 + 2 * num_joints
+        self.out_dim = 6 + num_joints
+        self.net = _mlp(rep_dim + action_dim, hidden, self.out_dim, act=nn.GELU, layer_norm=True)
         output = self.net[-1]
         assert isinstance(output, nn.Linear)
+        # Zero acceleration at init: rollouts start as constant-velocity
+        # continuation. Kept as an evidence-backed deviation from upstream's
+        # default init: with no WM-only warmup (upstream-faithful) the
+        # default-initialized rollout diverges on the first update at full
+        # width — policy_grad_norm NaN at iteration 1 (2026-11-11 GPU run),
+        # NaN weights then panic the sim backend. The zero output keeps the
+        # first unroll physically sane; its implicit short WM warmup is the
+        # price.
         nn.init.zeros_(output.weight)
         nn.init.zeros_(output.bias)
-        self.in_norm = _RunningNorm(invariant_dim + action_dim)
-        self.out_norm = _RunningNorm(self.out_dim, eps=1e-4)
+        self.state_norm = _RunningNorm(rep_dim)
+        self.action_norm = _RunningNorm(action_dim)
+        self.register_buffer("substep_coeff", torch.tensor((decimation + 1) / (2.0 * decimation)))
+        # Bryson's rule: each channel group weights 1 / nominal_error^2 on
+        # upstream's gencoord nominal errors.
         self.register_buffer(
-            "error_floor",
+            "bryson_weight",
             torch.cat(
                 [
-                    torch.full((width,), floor)
-                    for width, floor in (
-                        (3, 0.003),
-                        (3, 0.005),
-                        (3, 0.02),
-                        (3, 0.05),
-                        (num_joints, 0.003),
-                        (num_joints, 0.05),
+                    torch.full((width,), 1.0 / nominal**2)
+                    for width, nominal in (
+                        (3, 0.01),  # root position (world)
+                        (9, 0.02),  # root orientation matrix, scaled by sqrt(1/2)
+                        (num_joints, 0.1),  # joint position
+                        (num_joints, 3.14),  # joint velocity
                     )
                 ]
             ),
             persistent=False,
         )
 
-    def inputs(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        position = state[..., self._pos]
-        rotation = quat_xyzw_to_mat(state[..., self._quat])
-        lin_vel = state[..., self._lin]
-        ang_vel = state[..., self._ang]
-        joint_pos = state[..., self._q]
-        joint_vel = state[..., self._qd]
-
-        rotation_t = rotation.transpose(-1, -2)
-        heading = yaw_mat(rotation)
-        tilt_6d = (heading.transpose(-1, -2) @ rotation)[..., :, :2].reshape(rotation.shape[:-2] + (6,))
-        features = torch.cat(
-            (
-                position[..., 2:3],
-                tilt_6d,
-                (rotation_t @ lin_vel.unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ ang_vel.unsqueeze(-1)).squeeze(-1),
-                joint_pos,
-                joint_vel,
-            ),
-            -1,
-        )
-        return torch.cat((features, action), -1)
-
-    def targets(self, state: torch.Tensor, successor: torch.Tensor) -> torch.Tensor:
-        """Frame-local physical increment."""
+    def _rep_features(self, state: torch.Tensor) -> torch.Tensor:
+        """Invariant features ``[z(1), g_b(3), v_b(3), w_b(3), qj, vj]``."""
         rotation = quat_xyzw_to_mat(state[..., self._quat])
         rotation_t = rotation.transpose(-1, -2)
-        heading_t = yaw_mat(rotation).transpose(-1, -2)
+        lin_b = (rotation_t @ state[..., self._lin].unsqueeze(-1)).squeeze(-1)
+        ang_b = (rotation_t @ state[..., self._ang].unsqueeze(-1)).squeeze(-1)
+        gravity = state.new_zeros(state.shape[:-1] + (3,))
+        gravity[..., 2] = -1.0
+        g_b = (rotation_t @ gravity.unsqueeze(-1)).squeeze(-1)
         return torch.cat(
             (
-                (heading_t @ (successor[..., self._pos] - state[..., self._pos]).unsqueeze(-1)).squeeze(-1),
-                so3_log(rotation_t @ quat_xyzw_to_mat(successor[..., self._quat])),
-                (rotation_t @ (successor[..., self._lin] - state[..., self._lin]).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (successor[..., self._ang] - state[..., self._ang]).unsqueeze(-1)).squeeze(-1),
-                successor[..., self._q] - state[..., self._q],
-                successor[..., self._qd] - state[..., self._qd],
+                state[..., 2:3],
+                g_b,
+                lin_b,
+                ang_b,
+                state[..., self._q],
+                state[..., self._qd],
             ),
             -1,
         )
@@ -276,44 +251,66 @@ class FloatingBaseDynamics(Dynamics):
     def loss_metric(self, loss: torch.Tensor, window: int) -> torch.Tensor:
         return loss / window
 
+    def _loss_channels(self, state: torch.Tensor) -> torch.Tensor:
+        """Bryson-scored channels: world root pos, scaled root rotation
+        matrix (so a plain squared difference is a nominal in radians), and
+        joint positions/velocities."""
+        rotation = quat_xyzw_to_mat(state[..., self._quat]).flatten(-2, -1) * math.sqrt(0.5)
+        return torch.cat(
+            (
+                state[..., self._pos],
+                rotation,
+                state[..., self._q],
+                state[..., self._qd],
+            ),
+            -1,
+        )
+
     def prediction_error(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Scaled physical error in the target state's local coordinates."""
-        scale = torch.maximum(self.out_norm.std(), self.error_floor)
-        return (self.targets(target, prediction) / scale).square().mean(-1)
+        """Bryson-weighted channel-group MSE of the integrated states."""
+        difference = (self._loss_channels(prediction) - self._loss_channels(target)).square()
+        width = difference.shape[-1]
+        return (difference * self.bryson_weight).sum(-1) / width
 
     @torch.no_grad()
     def update_statistics(self, state, action, successor) -> None:
-        self.in_norm.update(self.inputs(state, action))
-        self.out_norm.update(self.targets(state, successor))
+        self.state_norm.update(self._rep_features(state))
+        self.action_norm.update(action)
 
     def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        position = state[..., self._pos]
         rotation = quat_xyzw_to_mat(state[..., self._quat])
-        heading = yaw_mat(rotation)
-        lin_vel, ang_vel = state[..., self._lin], state[..., self._ang]
+        rotation_t = rotation.transpose(-1, -2)
+        lin_b = (rotation_t @ state[..., self._lin].unsqueeze(-1)).squeeze(-1)
+        ang_b = (rotation_t @ state[..., self._ang].unsqueeze(-1)).squeeze(-1)
         joint_pos, joint_vel = state[..., self._q], state[..., self._qd]
-        prediction = run_mlp(self.net, self.in_norm(self.inputs(state, action)), self.amp_dtype)
-        increment = prediction * self.out_norm.std() + self.out_norm.mean
-        d_position, d_rotation, d_lin_vel, d_ang_vel, d_joint_pos, d_joint_vel = increment.split(
-            (3, 3, 3, 3, self.num_joints, self.num_joints), -1
+        prediction = run_mlp(
+            self.net,
+            torch.cat(
+                (self.state_norm(self._rep_features(state)), self.action_norm(action)),
+                -1,
+            ),
+            self.amp_dtype,
         )
+        d_lin, d_ang, d_joint_vel = prediction.split((3, 3, self.num_joints), -1)
+        c = self.substep_coeff
+        dt = self.dt
+
+        next_joint_vel = joint_vel + d_joint_vel
+        next_joint_pos = joint_pos + (joint_vel + c * d_joint_vel) * dt
+        # Next twist in world coordinates; pose increments weight the delta
+        # by the semi-implicit substep coefficient.
+        next_lin = (rotation @ (lin_b + d_lin).unsqueeze(-1)).squeeze(-1)
+        next_ang = (rotation @ (ang_b + d_ang).unsqueeze(-1)).squeeze(-1)
+        pose_lin = (rotation @ (lin_b + c * d_lin).unsqueeze(-1)).squeeze(-1)
+        pose_ang = (rotation @ (ang_b + c * d_ang).unsqueeze(-1)).squeeze(-1)
         next_state = state.clone()
-        next_state[..., self._pos] = position + (heading @ d_position.unsqueeze(-1)).squeeze(-1)
-        next_quat = _mat_to_quat_wxyz(rotation @ so3_exp(d_rotation))
-        next_state[..., self._quat] = torch.cat((next_quat[..., 1:], next_quat[..., :1]), -1)
-        next_state[..., self._lin] = lin_vel + (rotation @ d_lin_vel.unsqueeze(-1)).squeeze(-1)
-        next_state[..., self._ang] = ang_vel + (rotation @ d_ang_vel.unsqueeze(-1)).squeeze(-1)
-        next_state[..., self._q] = joint_pos + d_joint_pos
-        next_state[..., self._qd] = joint_vel + d_joint_vel
+        next_state[..., self._pos] = state[..., self._pos] + pose_lin * dt
+        next_state[..., self._quat] = quat_integrate_xyzw(state[..., self._quat], pose_ang, dt)
+        next_state[..., self._lin] = next_lin
+        next_state[..., self._ang] = next_ang
+        next_state[..., self._q] = next_joint_pos
+        next_state[..., self._qd] = next_joint_vel
         return next_state
-
-
-def _output_activation(name: str) -> nn.Module:
-    if name == "tanh":
-        return nn.Tanh()
-    if name == "identity":
-        return nn.Identity()
-    raise ValueError(f"Unknown actor output activation {name!r}")
 
 
 class MlpActor(nn.Module):
@@ -321,7 +318,7 @@ class MlpActor(nn.Module):
 
     The single action-boundary transform (raw output -> command) is applied
     by the caller as ``action_limit * raw``, consistently in collection,
-    imagination, and export.
+    imagination, and export. The output is unsquashed, as upstream.
     """
 
     amp_dtype: torch.dtype | None = None
@@ -331,26 +328,25 @@ class MlpActor(nn.Module):
         input_dim: int,
         action_dim: int,
         hidden: Sequence[int] = (128, 128),
-        *,
-        output_activation: str = "tanh",
     ):
         super().__init__()
-        self.net = _mlp(input_dim, hidden, action_dim)
-        self.output_activation = _output_activation(output_activation)
+        self.net = _mlp(input_dim, hidden, action_dim, act=nn.GELU, layer_norm=True)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        return self.output_activation(run_mlp(self.net, features, self.amp_dtype))
+        return run_mlp(self.net, features, self.amp_dtype)
 
 
 class GoalConditionedActor(nn.Module):
-    """Goal-encoding actor recovered from the prior ``motrix.mbrl`` attempt.
+    """Multi-goal-encoder actor (upstream MultiEncoderAE, single-policy form).
 
     Input is the concatenated actor contract: normalized observation history
-    followed by the normalized flat goal window (upstream stacks
-    proprioception only). The goal passes its encoder MLP to a tanh-bounded
-    latent (upstream's bottleneck, 32 by default), and the decoder consumes
-    the latent alongside the history — so the decoder width matches
-    upstream's (latent + stacked proprioception), not the raw goal width.
+    followed by the normalized goal blocks of every configured encoder, in
+    encoder order (upstream stacks proprioception only). Each goal block
+    passes its own encoder MLP to a tanh-bounded latent (upstream's
+    bottleneck, 32 by default), and the decoder consumes the concatenated
+    latents alongside the history — so the decoder width matches upstream's
+    (latents + stacked proprioception), not the raw goal widths. One encoder
+    degenerates to the single-goal actor.
     """
 
     amp_dtype: torch.dtype | None = None
@@ -358,38 +354,57 @@ class GoalConditionedActor(nn.Module):
     def __init__(
         self,
         input_dim: int,
-        goal_dim: int,
+        goal_slices: Sequence[int],
         action_dim: int,
         hidden: Sequence[int],
         latent_dim: int,
-        *,
-        output_activation: str = "tanh",
     ):
         super().__init__()
-        if goal_dim <= 0 or latent_dim <= 0:
-            raise ValueError("Goal-conditioned policies require positive goal and latent dimensions")
-        self.goal_dim = goal_dim
-        self.output_activation = _output_activation(output_activation)
-        self.encoder = _mlp(goal_dim, hidden, latent_dim)
-        self.decoder = _mlp(input_dim - goal_dim + latent_dim, hidden, action_dim)
-        with torch.no_grad():
-            self.decoder[-1].weight.mul_(0.01)
-            self.decoder[-1].bias.zero_()
+        self.goal_slices = tuple(goal_slices)
+        if not self.goal_slices or any(width <= 0 for width in self.goal_slices):
+            raise ValueError(f"Goal-conditioned policies require positive goal slices, got {self.goal_slices}")
+        if latent_dim <= 0:
+            raise ValueError("Goal-conditioned policies require a positive latent dimension")
+        self.goal_dim = sum(self.goal_slices)
+        self.encoders = nn.ModuleList(
+            _mlp(width, hidden, latent_dim, act=nn.GELU, layer_norm=True) for width in self.goal_slices
+        )
+        self.decoder = _mlp(
+            input_dim - self.goal_dim + latent_dim * len(self.goal_slices),
+            hidden,
+            action_dim,
+            act=nn.GELU,
+            layer_norm=True,
+        )
+        # Near-zero decoder output init (weights x0.01, bias 0): the collector
+        # multiplies the raw output by the task action limit (~5 rad-scale for
+        # G1), so a default-init output already commands multi-radian targets
+        # on iteration 1 — action-rate penalties explode (rewards ~-8/step,
+        # NaN gradients; 2026-11-11 GPU run). Upstream needs no guard because
+        # it applies no action-limit multiplier.
+        output = self.decoder[-1]
+        assert isinstance(output, nn.Linear)
+        output.weight.data.mul_(0.01)
+        nn.init.zeros_(output.bias)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         history, goal = features[..., : -self.goal_dim], features[..., -self.goal_dim :]
-        latent = torch.tanh(run_mlp(self.encoder, goal, self.amp_dtype))
-        return self.output_activation(run_mlp(self.decoder, torch.cat((latent, history), dim=-1), self.amp_dtype))
+        latents = [
+            torch.tanh(run_mlp(encoder, block, self.amp_dtype))
+            for encoder, block in zip(self.encoders, goal.split(self.goal_slices, dim=-1), strict=True)
+        ]
+        # Unsquashed decoder output, as upstream.
+        return run_mlp(self.decoder, torch.cat((*latents, history), dim=-1), self.amp_dtype)
 
 
 class MlpCritic(nn.Module):
-    """State-value head ``V(obs) -> (..., 1)``."""
+    """State-value head ``V(obs) -> (..., 1)`` (upstream critic: LN + GELU MLP)."""
 
     amp_dtype: torch.dtype | None = None
 
     def __init__(self, obs_dim: int, hidden: Sequence[int] = (128, 128)):
         super().__init__()
-        self.net = _mlp(obs_dim, hidden, 1)
+        self.net = _mlp(obs_dim, hidden, 1, act=nn.GELU, layer_norm=True)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return run_mlp(self.net, obs, self.amp_dtype)

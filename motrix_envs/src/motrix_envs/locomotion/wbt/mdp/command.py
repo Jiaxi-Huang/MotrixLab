@@ -92,6 +92,13 @@ class WbtMotionCommand(CommandTerm):
     # imagination. Kept whole-batch ``(num_envs, 1)`` int64.
     steps: torch.Tensor
 
+    # Per-lane final frame (global index) of the clip each lane currently
+    # plays — refreshed wherever ``steps`` is written. The exogenous
+    # annotation clamps the imagined ``steps`` increment at this value, so
+    # imagination holds on the clip's last frame (upstream supermimic's
+    # clamp-and-continue) instead of bleeding into the next clip.
+    clip_end: torch.Tensor
+
     # Published mirror of ``steps`` so the ``motion_step`` metrics series
     # stays continuous now that the index itself is state; advance/reset
     # refresh it in place.
@@ -105,8 +112,9 @@ class WbtMotionCommand(CommandTerm):
     # host-visible buffers stay authoritative.
 
     def _mirror_steps(self: "WbtMotionCommand") -> None:
-        """Refresh the published gauge after any in-place ``steps`` write."""
+        """Refresh the published mirrors after any in-place ``steps`` write."""
         self.steps_gauge.copy_(self.steps[:, 0].to(torch.float32))
+        self.clip_end.copy_(self.clip.frame_clip_end[self.steps[:, 0]].unsqueeze(-1))
 
     def update(self: "WbtMotionCommand", ctx: ManagerContext) -> None:
         """Yaw-align the clip to each lane."""
@@ -201,11 +209,15 @@ class WbtMotionCommandCfg(CommandCfg):
     tracked_body_names: tuple[str, ...] = MISSING
     reference_body_name: str = MISSING
     # Imagination semantics of the frame index: one frame per control step
-    # within an episode. Clip-end branches of the real advance have no
-    # imagination counterpart — the clip-end truncation term gates the
-    # imagination tail there instead.
+    # within an episode, clamped at the lane's clip-end frame — upstream
+    # supermimic's clamp-and-continue (the goal window freezes on the clip's
+    # last frame; episodes in imagination never end at the clip boundary).
+    # The real env's clip-end truncation is unchanged.
     exogenous: dict[str, ExogenousRule] = dataclass_field(
-        default_factory=lambda: {"steps": ExogenousRule(kind=ExogenousKind.INCREMENT, step=1.0)}
+        default_factory=lambda: {
+            "steps": ExogenousRule(kind=ExogenousKind.INCREMENT, step=1.0, clamp="clip_end"),
+            "clip_end": ExogenousRule(kind=ExogenousKind.CONSTANT),
+        }
     )
     sampling_mode: str = "adaptive"
     start_at_timestep_zero_prob: float = 0.0
@@ -289,6 +301,7 @@ class WbtMotionCommandCfg(CommandCfg):
             clip=source,
             reference_index=int(reference_index),
             steps=torch.zeros((num_envs, 1), dtype=torch.int64),
+            clip_end=torch.full((num_envs, 1), source.frame_clip_end[0].item(), dtype=torch.int64),
             steps_gauge=torch.zeros(num_envs, dtype=torch.float32),
             clip_ended=torch.zeros((num_envs, 1), dtype=torch.bool),
             command=torch.empty((num_envs, 2 * env.num_actuators), dtype=torch.float32),

@@ -14,12 +14,13 @@ truncation）与 P3.1（schema / SequenceReplay / EmpiricalNormalization）。
 
 | 前一尝试（`mbrl/`） | 处置 | 去向 |
 |---|---|---|
-| `networks.py`：MlpDynamics / FloatingBaseDynamics（so(3) 对数/指数映射、heading-frame 不变特征、error floors、in/out RunningNorm、零初始化输出层）、MlpActor / MlpCritic | **回收** | `apg/networks.py` 原数学保留 |
+| `networks.py`：MlpDynamics / FloatingBaseDynamics、MlpActor / MlpCritic | **回收后重写** | `FloatingBaseDynamics` 已对齐上游 gencoord 配方（rep-state 不变特征输入、加速度级 delta `[Δv_b, Δw_b, Δvj]`、半隐式积分 `c=(d+1)/2d`、Bryson 通道组损失、state/action 分离 RunningNorm、LN+GELU）；前一尝试的 so(3) 增量预测、error floors、局部系度量损失已移除 |
 | FloatingBaseDynamics 内嵌的 exogenous 推进（increment/copy/constant 写 state span） | **删除** | 职责移交 `ModelingProgram.advance_exogenous`（P2.3 D-B）；dynamics 只预测物理块 |
 | `learner.py`：三阶段梯度契约（WM 监督 detached targets；actor BPTT 冻结 WM/critic 参数但梯度过输入；critic lambda-return 回归 detached rollout）、reward/gate 扁平化单遍（`(H*B)` 行一次 evaluate）、survival 加权 horizon return、critic epochs/minibatches、共享 cosine lr 衰减（→3%） | **回收** | `apg/learner.py`，`task.*` 调用替换为 program API |
 | `train.py`：TrainerBase 骨架、UTD 交错循环（fractional steps 累加器）、checkpoints/panel/事件 | **回收** | `apg/train.py`（现契约已与该骨架一致） |
 | `collector.py`：actor 面向循环（obs 帧栈、episode 起点广播填充、高斯探索噪声×action_limit、norm 仅真实采集更新、episode 窗统计、deterministic evaluate） | **回收重写** | `apg/collector.py`，recorder/adapter 换 modeling view 装配（见 P-D） |
-| `GoalConditionedActor`、`RunningObsNorm`、`normalizer.py` | **不回收** | goal 经 obs 组进入 actor 输入（单源 observe）；归一器用 P3.1 共享 `EmpiricalNormalization`（D7） |
+| `GoalConditionedActor` | **回收并泛化**（多 goal encoder） | `apg/networks.py` `GoalConditionedActor`：goal 块自 value 组按名切片（`apg.goal_terms` + `apg.goal_encoder_splits` 分块，单块退化为单 encoder），每块经独立 encoder MLP→tanh latent(32) 后与本体感知栈拼接进 decoder（上游 MultiEncoderAE 单策略形态；栈只覆盖本体感知）；见 [对比文档](../research/supermimic-vs-motrixlab-comparison.md) |
+| `RunningObsNorm`、`normalizer.py` | **不回收** | 归一器用 P3.1 共享 `EmpiricalNormalization`（D7） |
 | `TaskModel`/adapter/recorder（`motrix_env_core.modeling` 包）、`async_collection`/`async_transport`、`ActorRolloutGraph`/compile、`panels.py` | **不回收** | 派生式取代（P2.3）；async 属 P4；compile 见 P-H；panel 按新指标名另写 |
 
 ## 冻结决策
@@ -93,9 +94,14 @@ actor 输入 = `policy` 组 obs 帧栈（cfg `actor.history`）；critic 输入 
 
 APG cfg 声明组名（默认 `policy`/`value`）。想象侧 obs 由
 `program.observe` 生成，噪声确定性（D-A rand 语义：`next_uniform`→零）；
-真实侧 obs 噪声照常（收集即含噪）。`EmpiricalNormalization`（obs / value
-两套）只从真实采集更新，想象与评估冻结使用。obs 帧栈断链语义复用
-P3.1 `history()`（episode 头广播填充、缺帧重复最早连续帧）。
+真实侧 obs 噪声照常（收集即含噪）。`EmpiricalNormalization`：policy obs
+一套（仅真实采集更新，想象与评估冻结）+ 每 goal encoder 一套（同源更新）；
+critic 直接消费原始 value 观测，无归一化（上游 supermimic 同）。obs 帧栈
+断链语义复用 P3.1 `history()`（episode 头广播填充、缺帧重复最早连续帧）。
+想象生存门控：cfg `imagination.soft_termination_term` 命名 value 组内一个
+一维软终止 term（任务声明 `SoftTerminationObsCfg`，公式同上游
+`sigmoid((max(err/thr)−1)/softness)`），learner 按名取列，gate = 1 − p；
+未配置时回退硬 `terminated` 门控，truncation 永不门控想象。
 
 ### P-F WBT 家族升格 + supermimic 变体
 
@@ -103,17 +109,21 @@ P3.1 `history()`（episode 头广播填充、缺帧重复最早连续帧）。
   本就是 reset/advance 写的状态，不是仪表）；`advance` 内一行镜像进新增
   `steps_gauge` metric，保持 `motion_step` 指标发布连续性（基线回归可见面
   不变）。term 函数体不动。
-- 家族 cfg 注记 `exogenous = {"steps": ExogenousRule(INCREMENT, step=1.0)}`
-  （帧索引每步 +1；clip 结束处真实侧的分枝语义在想象侧由 truncation 门控
-  掩除，见下）。
+- 家族 cfg 注记 `exogenous = {"steps": ExogenousRule(INCREMENT, step=1.0,
+  clamp="clip_end"), "clip_end": ExogenousRule(CONSTANT)}`：帧索引每步 +1
+  并钳位在该 lane 的 clip 末帧（命令维护 `clip_end` 叶，随 `steps` 同步刷
+  新）——想象侧 clamp-and-continue，对齐上游 WM 语义；clip 结束处真实侧
+  仍走 `motion_clip_end` truncation（D5），但不再门控想象。
 - 新增**家族级** truncation term `motion_clip_end`（读 command `steps` 与
   clip `frame_clip_end`，D5 语义：clip 结束是时间性截断而非失败）；
   supermimic 变体启用（基线变体不声明则行为不变）。
-- `g1/supermimic.py` 单文件变体（与 dance.py 同构）：supermimic 语料目录、
-  启用 clip-end truncation、**移除 `undesired_contact_forces` 查询与
-  `undesired_contacts` reward**（contact 不可想象，P2.4 类型级拒绝的
-  任务侧对应——reward 权重回填由变体 cfg 决定）、`sampling_mode="return"`
-  课程默认值。
+- `g1/supermimic.py` 单文件变体（与 dance.py 同构）：**任务侧数值与观测
+  结构对齐上游 supermimic**（锚点 pelvis、奖励权重 0.5/1.0/−0.1/−2.0、
+  终止 0.25/0.8、`sampling_mode="return"` 课程、未来窗口 + projected
+  gravity + 软终止 obs、value 组特权通道）、启用 clip-end truncation、
+  **移除 `undesired_contact_forces` 查询与 `undesired_contacts` reward**
+  （contact 不可想象，P2.4 类型级拒绝的任务侧对应）；完整对照见
+  [supermimic 对比文档](../research/supermimic-vs-motrixlab-comparison.md)。
 - `reference_index` 等组装元数据由 provider 读常驻 term（P-B），任务侧零
   python。
 

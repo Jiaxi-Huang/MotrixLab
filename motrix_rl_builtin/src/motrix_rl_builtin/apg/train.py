@@ -50,6 +50,7 @@ from motrix_rl_builtin.apg.collector import ApgCollector, _term_leaves
 from motrix_rl_builtin.apg.config import ApgCfg
 from motrix_rl_builtin.apg.learner import ApgLearner
 from motrix_rl_builtin.apg.networks import (
+    Dynamics,
     FloatingBaseDynamics,
     GoalConditionedActor,
     MlpActor,
@@ -76,12 +77,16 @@ def _collect_chunks(steps_per_iteration: float, rounds: int, budget: float) -> t
     return chunks, budget
 
 
-def _make_dynamics(cfg: ApgCfg, num_joints: int | None, flat_width: int, action_dim: int):
+def _make_dynamics(cfg: ApgCfg, num_joints: int | None, flat_width: int, action_dim: int, env) -> Dynamics:
     if cfg.world_model.scheme == "residual":
         return MlpDynamics(flat_width, action_dim, cfg.world_model.hidden)
     if cfg.world_model.scheme == "floating_base":
         assert num_joints is not None
-        return FloatingBaseDynamics(num_joints, action_dim, cfg.world_model.hidden)
+        # dt and sim substeps feed upstream's semi-implicit substep coefficient
+        # c = (substeps + 1) / (2 * substeps).
+        return FloatingBaseDynamics(
+            num_joints, action_dim, cfg.world_model.hidden, dt=env.cfg.ctrl_dt, decimation=env.cfg.sim_substeps
+        )
     raise ValueError(f"Unknown world_model.scheme {cfg.world_model.scheme!r}; expected 'residual' or 'floating_base'.")
 
 
@@ -141,14 +146,15 @@ class Trainer(TrainerBase):
     def _setup(self, env: ManagerEnv) -> _Setup:
         cfg = self._rlcfg
         device = self._device()
-        view = env.modeling_view()
+        # The shadow host (imagination) lives on the learner's device — the
+        # real env's term program may run elsewhere (e.g. CPU manager + GPU
+        # sim backend).
+        view = env.modeling_view(device=device)
         tree = env.model.others.get("apg_kinematic_tree")
         assembly = build_assembly(view, env, tree, cfg.world_model.scheme)
         action_dim = env.action_space.shape[0]
-        low = torch.as_tensor(env.action_space.low, dtype=torch.float32)
         high = torch.as_tensor(env.action_space.high, dtype=torch.float32)
         action_limit = float(high.max())
-        bounds = None if bool(torch.equal(low, -high)) else (float(low.min()), float(high.max()))
 
         # The WM schema's state fields are the declared read set plus the
         # exogenous channels, the latter named BY CHANNEL so imagination
@@ -168,28 +174,38 @@ class Trainer(TrainerBase):
             reward_cfg.weight for reward_cfg in env.cfg.reward_cfgs().values() if reward_cfg.weight > 0.0
         )
         value_max = float(env.cfg.ctrl_dt * positive_weight_sum / (1.0 - cfg.gamma))
-        # Flat goal columns: the declared value-group terms the actor consumes
-        # without stacking (upstream stacks proprioception only).
-        goal_columns = None
-        goal_dim = 0
-        if cfg.goal_terms:
+
+        def columns_of(term_names: tuple[str, ...]) -> tuple[int, ...]:
             group = env.observation_groups[cfg.value_group]
             cursor = 0
             columns: list[int] = []
-            found = set()
+            found: set[str] = set()
             for entry in group.terms:
-                if entry.name in cfg.goal_terms:
+                if entry.name in term_names:
                     columns.extend(range(cursor, cursor + entry.size))
                     found.add(entry.name)
                 cursor += entry.size
-            missing = sorted(set(cfg.goal_terms) - found)
+            missing = sorted(set(term_names) - found)
             if missing:
                 raise ValueError(
-                    f"goal_terms {missing} are not observation terms of group {cfg.value_group!r}; "
+                    f"{missing} are not observation terms of group {cfg.value_group!r}; "
                     f"available: {[entry.name for entry in group.terms]}."
                 )
-            goal_columns = torch.tensor(columns, dtype=torch.long)
-            goal_dim = len(columns)
+            return tuple(columns)
+
+        # The configured goal terms form ONE flat, never-stacked input block
+        # consumed by a single encoder (upstream stacks proprioception only;
+        # its per-task encoders arrive with a second task, not before).
+        all_columns = columns_of(cfg.goal_terms) if cfg.goal_terms else ()
+        goal_columns = (
+            (torch.tensor(all_columns, dtype=torch.long),) if cfg.goal_terms else ()
+        )
+        goal_dim = sum(int(columns.shape[0]) for columns in goal_columns)
+        # Column of the configured soft-termination term, when the task
+        # declares one (upstream's soft WM termination drives the gates).
+        soft_term_column = None
+        if cfg.imagination.soft_termination_term:
+            soft_term_column = columns_of((cfg.imagination.soft_termination_term,))[0]
         schema = wm_transition_schema(state_fields, action_dim, obs_dim=obs_dim)
         replay = SequenceReplay(
             schema=schema,
@@ -202,23 +218,17 @@ class Trainer(TrainerBase):
         learner = ApgLearner(
             program=view.program,
             assembly=assembly,
-            dynamics=_make_dynamics(cfg, num_joints, assembly.flat_width, action_dim),
+            dynamics=_make_dynamics(cfg, num_joints, assembly.flat_width, action_dim, env),
             actor=(
                 GoalConditionedActor(
                     obs_dim * cfg.actor.history + goal_dim,
-                    goal_dim,
+                    tuple(int(columns.shape[0]) for columns in goal_columns),
                     action_dim,
                     cfg.actor.hidden,
-                    cfg.actor.goal_latent_dim,
-                    output_activation=cfg.actor.output_activation,
+                    cfg.actor.latent_dim,
                 )
                 if goal_dim
-                else MlpActor(
-                    obs_dim * cfg.actor.history,
-                    action_dim,
-                    cfg.actor.hidden,
-                    output_activation=cfg.actor.output_activation,
-                )
+                else MlpActor(obs_dim * cfg.actor.history, action_dim, cfg.actor.hidden)
             ),
             critic=MlpCritic(value_dim, cfg.critic.hidden),
             replay=replay,
@@ -229,24 +239,22 @@ class Trainer(TrainerBase):
             action_limit=action_limit,
             value_max=value_max,
             goal_columns=goal_columns,
+            soft_term_column=soft_term_column,
         )
         collector = ApgCollector(
             env=env,
             view=view,
-            assembly=assembly,
             replay=replay,
             device=device,
             rng=np.random.default_rng(self._context.seed),
             actor=learner.actor,
             obs_norm=learner.obs_norm,
-            goal_norm=learner.goal_norm,
+            goal_norms=learner.goal_norms,
             goal_columns=goal_columns,
             action_limit=action_limit,
-            action_bounds=bounds,
             history_length=cfg.actor.history,
             policy_group=cfg.policy_group,
             exploration_noise_std=cfg.collector.exploration_noise_std,
-            exploration_clip=cfg.collector.exploration_clip,
             on_transition=learner.update_dynamics_statistics,
         )
         task_dims = {
@@ -256,7 +264,11 @@ class Trainer(TrainerBase):
             "raw_obs_dim": obs_dim,
             "value_dim": value_dim,
             "goal_dim": goal_dim,
-            "goal_latent_dim": cfg.actor.goal_latent_dim,
+            # Per-encoder column lists, in encoder order: play/export slice
+            # each encoder's goal block by name from this single derivation.
+            "goal_columns": [columns.tolist() for columns in goal_columns],
+            "latent_dim": cfg.actor.latent_dim,
+            "soft_term_column": soft_term_column,
             "history": cfg.actor.history,
             "value_max": value_max,
             "fields": list(view.fields),
@@ -383,7 +395,6 @@ class Trainer(TrainerBase):
         """Interleaved collect-update loop (a few fresh steps per update)."""
         cfg = self._rlcfg
         env_steps = start_env_steps
-        decay_iterations = cfg.trainer.lr_decay_iterations or num_iterations
         start_time = time.time()
         timing = TimingWindow()
         scalars_window = ScalarWindow()
@@ -394,15 +405,15 @@ class Trainer(TrainerBase):
         try:
             for step in range(start_iteration + 1, num_iterations + 1):
                 metrics: dict[str, float] = {"iteration": float(step)}
-                lr_scale = self._lr_scale_at(step, decay_iterations)
-                learner.set_learning_rate_scale(lr_scale)
-                metrics["apg.lr"] = cfg.actor.learning_rate * lr_scale
+                # Upstream keeps a fixed learning rate throughout training.
+                metrics["apg.lr"] = cfg.actor.learning_rate
 
-                policy_updates = cfg.actor.updates_per_iteration if step > cfg.trainer.warmup_iterations else 0
-                rounds = max(policy_updates, 1)
-                chunks, collect_budget = _collect_chunks(
-                    cfg.trainer.collect_steps_per_iteration, rounds, collect_budget
-                )
+                # One policy update per round, as upstream (its Ratio
+                # mechanism only paces how often rounds happen, never how
+                # many updates a round carries).
+                policy_updates = 1
+                rounds = 1
+                chunks, collect_budget = _collect_chunks(1.0 / cfg.trainer.utd, rounds, collect_budget)
                 for index in range(rounds):
                     began = time.perf_counter()
                     round_metrics = collector.collect(chunks[index])
@@ -446,7 +457,6 @@ class Trainer(TrainerBase):
                         start_time=start_time,
                         lr=metrics["apg.lr"],
                         checkpoint_path=last_checkpoint_path,
-                        warming=step <= cfg.trainer.warmup_iterations,
                     )
                 if cfg.trainer.eval_interval and step % cfg.trainer.eval_interval == 0:
                     began = time.perf_counter()
@@ -474,7 +484,6 @@ class Trainer(TrainerBase):
         start_time: float,
         lr: float,
         checkpoint_path: str | None,
-        warming: bool,
     ) -> None:
         drained = scalars_window.drain(include_range=True)
         episode = collector.episode_summary()
@@ -496,7 +505,7 @@ class Trainer(TrainerBase):
             learn_percent=100.0
             * timing.total_seconds("learn")
             / max(timing.total_seconds("collect") + timing.total_seconds("learn"), 1e-9),
-            warming=warming,
+            warming=False,
             training_metrics=drained,
             reward_terms={},
             env_metrics={},
@@ -518,12 +527,6 @@ class Trainer(TrainerBase):
             env_steps=env_steps,
         )
         timing.reset()
-
-    def _lr_scale_at(self, step: int, decay_iterations: int) -> float:
-        """Shared cosine decay to 3% of each optimizer's configured base rate."""
-        if step >= decay_iterations:
-            return 0.03
-        return 0.03 + 0.97 * 0.5 * (1.0 + np.cos(np.pi * step / decay_iterations))
 
     # ------------------------------------------------------------ checkpointing
     def _save(self, path, learner: ApgLearner, task_dims: dict, iteration: int, env_steps: int) -> None:
@@ -556,48 +559,31 @@ class Trainer(TrainerBase):
         env = self._make_env(self._context.play_num_envs, mode="play")
         payload = torch.load(policy, map_location=device, weights_only=False)
         dims = payload["task"]
-        goal_columns_for_play = None
-        if self._rlcfg.goal_terms and dims.get("goal_dim", 0):
-            group = env.observation_groups[self._rlcfg.value_group]
-            cursor = 0
-            columns: list[int] = []
-            for entry in group.terms:
-                if entry.name in self._rlcfg.goal_terms:
-                    columns.extend(range(cursor, cursor + entry.size))
-                cursor += entry.size
-            goal_columns_for_play = torch.tensor(columns, dtype=torch.long, device=device)
+        goal_columns = tuple(
+            torch.tensor(columns, dtype=torch.long, device=device) for columns in dims.get("goal_columns", ())
+        )
+        goal_slices = tuple(int(columns.shape[0]) for columns in goal_columns)
         goal_dim = int(dims.get("goal_dim", 0))
         actor = (
             GoalConditionedActor(
                 dims["obs_dim"],
-                goal_dim,
+                goal_slices,
                 dims["action_dim"],
                 cfg.actor.hidden,
-                int(dims.get("goal_latent_dim", cfg.actor.goal_latent_dim)),
-                output_activation=cfg.actor.output_activation,
+                int(dims.get("latent_dim", cfg.actor.latent_dim)),
             )
             if goal_dim
-            else MlpActor(
-                dims["obs_dim"],
-                dims["action_dim"],
-                cfg.actor.hidden,
-                output_activation=cfg.actor.output_activation,
-            )
+            else MlpActor(dims["obs_dim"], dims["action_dim"], cfg.actor.hidden)
         ).to(device)
         actor.load_state_dict(payload["actor"])
         actor.eval()
         obs_norm = EmpiricalNormalization(shape=dims["raw_obs_dim"], device=device)
         obs_norm.load_state_dict(payload["obs_norm"])
         obs_norm.eval()
-        goal_dim = int(dims.get("goal_dim", 0))
-        goal_norm = None
-        if goal_dim:
-            goal_norm = EmpiricalNormalization(shape=goal_dim, device=device)
-            goal_norm.load_state_dict(payload["goal_norm"])
-            goal_norm.eval()
-            goal_columns = goal_columns_for_play
-        else:
-            goal_columns = None
+        goal_norms = tuple(EmpiricalNormalization(shape=width, device=device) for width in goal_slices)
+        for index, norm in enumerate(goal_norms):
+            norm.load_state_dict(payload[f"goal_norm_{index}"])
+            norm.eval()
         history: torch.Tensor | None = None
         renderer = create_renderer(env, self._context.render)
         try:
@@ -612,9 +598,14 @@ class Trainer(TrainerBase):
                     batch, length, dim = history.shape
                     normalized = obs_norm(history.reshape(batch * length, dim), update=False).reshape(history.shape)
                     features = normalized.flatten(1)
-                    if goal_dim:
-                        goal = getattr(env.state.obs, cfg.value_group).to(device)[:, goal_columns]
-                        features = torch.cat((features, goal_norm(goal, update=False)), dim=-1)
+                    if goal_columns:
+                        value_obs = getattr(env.state.obs, cfg.value_group).to(device)
+                        goal = torch.cat([value_obs[:, columns] for columns in goal_columns], dim=-1)
+                        blocks = (
+                            norm(block, update=False)
+                            for norm, block in zip(goal_norms, goal.split(goal_slices, dim=-1), strict=True)
+                        )
+                        features = torch.cat((features, *blocks), dim=-1)
                     command = dims["action_limit"] * actor(features)
                     env.step(command.to(raw_obs.device))
                     if renderer is not None and renderer.render() is False:

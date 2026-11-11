@@ -42,7 +42,10 @@ shadow context。派生产物 `ModelingView` 经 `ManagerEnv.modeling_view()` �
 ——不取 union of classes 形态：env cfg 树会被转为 schema-driven structured
 config，其值类型不能是 union（实施期由回归发现并定案）：
 
-- `increment(step)`：每步递增（motion phase / 帧索引）；
+- `increment(step, clamp)`：每步递增（motion phase / 帧索引）；可选
+  `clamp` 命名**同命令的 sibling 通道**，递增后钳位在该通道值上（上游
+  supermimic 的 clamp-and-continue：WBT 的 `steps` 钳位在命令维护的
+  `clip_end` 叶，想象中帧指数冻结在 clip 末帧而不是溢入下一 clip）；
 - `copy_action(action_term)`：由 policy action 决定（velocity command 类）；
 - `constant`：episode 内常量、reset 时重采样（终值随 FinalState 捕获，
   learner 接续）。
@@ -50,7 +53,8 @@ config，其值类型不能是 union（实施期由回归发现并定案）：
 increment 的想象侧推进由 `ModelingProgram.advance_exogenous(action)`
 执行，与真实 command `advance` **数值等价**（fixture：H 步递增对齐真实 env）。
 注记描述的是想象语义，不改变真实路径行为；`constant` 型的 reset 采样注记
-落点（reset/randomization term cfg）随 P3.2 的家族升格需要再落。
+落点（reset/randomization term cfg）随 P3.2 的家族升格需要再落。派生期校验
+`clamp` 引用的 sibling 通道确为同命令已声明的外生通道。
 
 ### D-C 编译策略
 

@@ -5,22 +5,31 @@
 
 Stage separation per the roadmap gradient contract:
 
-- world model: supervised multi-step window MSE on detached real targets
-  (the assembly's flat vector; floating base supervises the physical block);
+- world model: supervised multi-step window loss on detached real targets
+  (the assembly's flat vector; floating base scores Bryson-weighted channel
+  groups of the integrated physical block);
 - policy update: BPTT through the frozen dynamics and critic — their
   parameters carry no gradient while derivatives still flow through their
   inputs back to the actor. Imagined transitions run through the SAME term
   call records as the real env: ``evaluate`` for reward/termination/
   truncation, ``advance_exogenous`` for the command channels, ``observe``
-  for both observation groups;
-- critic: lambda-return regression over the same imagined rollout, targets
-  detached (no target network, as upstream).
+  for both observation groups. The survival gate is upstream's soft
+  termination ``1 - p`` (a task-declared value-group term) — truncations
+  never gate imagination (clip-end is clamp-and-continue via the exogenous
+  clamp rule);
+- critic: GAE(lambda) regression over the same imagined rollout, returns
+  detached (no target network, as upstream), clamped at the task's maximum
+  discounted return.
 
 The recipe constants upstream hard-codes live here too: actor Adam betas
-(0.9, 0.95) and the actor gradient-value clip of 0.1. Observation statistics
-come from real collection (policy input) and imagined rollouts (value input,
-as upstream's critic norm role); both stay frozen inside the updates that
-consume them.
+(0.9, 0.95) and the actor gradient-value clip of 0.1. Optimizers follow
+upstream ``build_optimizers``: Muon on the hidden Linear weights of each
+module, fused capturable Adam on everything else, both at the module's lr —
+and the actor steps unconditionally (upstream has no non-finite-grad skip;
+such a check would force a host sync). Policy observation statistics come
+from real collection and stay frozen inside the updates that consume them;
+the critic consumes raw value observations (as upstream, whose critic input
+carries no normalizer).
 """
 
 from __future__ import annotations
@@ -40,6 +49,29 @@ from motrix_rl_builtin.apg.networks import Dynamics, MlpActor, MlpCritic
 _ACTOR_BETAS = (0.9, 0.95)
 _ACTOR_GRAD_VALUE_CLIP = 0.1
 _MAX_START_ROUNDS = 16
+
+
+def _build_optimizers(
+    module: nn.Module, lr: float, betas: tuple[float, float], device: torch.device
+) -> list[torch.optim.Optimizer]:
+    """Upstream ``build_optimizers``: Muon on the hidden Linear weights — every
+    Linear between the first and the last of each ``nn.Sequential`` — and fused
+    capturable Adam on the rest, both at ``lr``. Muon keeps its defaults
+    (momentum 0.95, weight decay 0.1) with ``adjust_lr_fn="match_rms_adamw"``
+    as upstream; its lr is a float fixed for the run (this trainer never
+    schedules lr, matching upstream's frozen-at-capture semantics)."""
+    hidden = [
+        linear.weight
+        for seq in module.modules()
+        if isinstance(seq, nn.Sequential)
+        for linear in [m for m in seq if isinstance(m, nn.Linear)][1:-1]
+    ]
+    hidden_ids = {id(parameter) for parameter in hidden}
+    rest = [p for p in module.parameters() if id(p) not in hidden_ids]
+    adam = torch.optim.Adam(rest, lr=torch.tensor(lr, device=device), betas=betas, fused=True, capturable=True)
+    if not hidden:
+        return [adam]
+    return [adam, torch.optim.Muon(hidden, lr=lr, adjust_lr_fn="match_rms_adamw")]
 
 
 def _set_trainable(module: nn.Module, trainable: bool) -> None:
@@ -65,7 +97,8 @@ class ApgLearner:
         value_dim: int,
         action_limit: float,
         value_max: float,
-        goal_columns: torch.Tensor | None = None,
+        goal_columns: tuple[torch.Tensor, ...] = (),
+        soft_term_column: int | None = None,
     ):
         self.program = program
         self.assembly = assembly
@@ -80,15 +113,23 @@ class ApgLearner:
         # task's maximum discounted return, suppressing value overestimation —
         # always on, as upstream.
         self.value_max = value_max
-        # Flat goal columns within the value group: the actor consumes them as
-        # a single current frame appended to the stacked proprio history
-        # (upstream stacks sensors only). None disables the goal input.
-        self.goal_columns = None if goal_columns is None else goal_columns.to(device)
-        self.goal_dim = 0 if goal_columns is None else int(goal_columns.shape[0])
-        self.goal_norm = EmpiricalNormalization(shape=max(self.goal_dim, 1), device=device) if self.goal_dim else None
-        self._dynamics_opt = torch.optim.Adam(dynamics.parameters(), cfg.world_model.learning_rate)
-        self._actor_opt = torch.optim.Adam(actor.parameters(), cfg.actor.learning_rate, betas=_ACTOR_BETAS)
-        self._critic_opt = torch.optim.Adam(critic.parameters(), cfg.critic.learning_rate)
+        # Per-encoder goal columns within the value group: the actor consumes
+        # each encoder's block as a single current frame appended to the
+        # stacked proprio history (upstream stacks sensors only, one encoder
+        # per goal modality). Empty disables the goal input.
+        self.goal_columns = tuple(columns.to(device) for columns in goal_columns)
+        self.goal_slices = tuple(int(columns.shape[0]) for columns in self.goal_columns)
+        self.goal_norms = tuple(
+            EmpiricalNormalization(shape=width, device=device) for width in self.goal_slices
+        )
+        # Column of the one-dim soft-termination term in the value group;
+        # None falls back to hard ``terminated`` gates.
+        self.soft_term_column = soft_term_column
+        self._optimizers = {
+            "dynamics": _build_optimizers(dynamics, cfg.world_model.learning_rate, (0.9, 0.999), device),
+            "actor": _build_optimizers(actor, cfg.actor.learning_rate, _ACTOR_BETAS, device),
+            "critic": _build_optimizers(critic, cfg.critic.learning_rate, (0.9, 0.999), device),
+        }
         amp = cfg.trainer.amp
         if amp not in (None, "bf16"):
             raise ValueError(f"trainer.amp must be null or 'bf16', got {amp!r}")
@@ -96,7 +137,6 @@ class ApgLearner:
         for module in (self.dynamics, self.actor, self.critic):
             module.amp_dtype = amp_dtype
         self.obs_norm = EmpiricalNormalization(shape=obs_dim, device=device)
-        self.value_norm = EmpiricalNormalization(shape=value_dim, device=device)
         # Imagination runs at the actor batch width, not the env's lane count:
         # one resized shadow host, its exogenous channels re-seeded from every
         # start batch.
@@ -118,18 +158,24 @@ class ApgLearner:
 
     def _actor_features(self, history: torch.Tensor, goal: torch.Tensor | None) -> torch.Tensor:
         """Concatenated actor input: normalized stacked proprio history, then
-        the normalized flat goal — the GoalConditionedActor's contract (the
-        goal slice passes its encoder inside the actor)."""
+        each encoder's normalized flat goal block, in encoder order — the
+        GoalConditionedActor's contract (each block passes its own encoder
+        inside the actor)."""
         stacked = self._normalize_history(history)
-        if self.goal_norm is None or goal is None:
+        if not self.goal_columns or goal is None:
             return stacked
-        return torch.cat((stacked, self.goal_norm(goal, update=False)), dim=-1)
+        blocks = (
+            norm(block, update=False)
+            for norm, block in zip(self.goal_norms, goal.split(self.goal_slices, dim=-1), strict=True)
+        )
+        return torch.cat((stacked, *blocks), dim=-1)
 
     def goal_of(self, value_obs: torch.Tensor) -> torch.Tensor | None:
-        """Goal columns of value-group observations (None without goal terms)."""
-        if self.goal_columns is None:
+        """Concatenated raw goal blocks of value-group observations (None
+        without goal encoders); ``_actor_features`` splits by encoder width."""
+        if not self.goal_columns:
             return None
-        return value_obs[..., self.goal_columns]
+        return torch.cat([value_obs[..., columns] for columns in self.goal_columns], dim=-1)
 
     # -- world model -------------------------------------------------------------
 
@@ -157,10 +203,12 @@ class ApgLearner:
             step_error = self.dynamics.prediction_error(prediction, targets[:, step])
             loss = loss + (step_error * valid[:, step]).sum()
         loss = self.dynamics.reduce_window_loss(loss, valid)
-        self._dynamics_opt.zero_grad(set_to_none=True)
+        for optimizer in self._optimizers["dynamics"]:
+            optimizer.zero_grad(set_to_none=True)
         loss.backward()
         nn.utils.clip_grad_norm_(self.dynamics.parameters(), world.max_grad_norm)
-        self._dynamics_opt.step()
+        for optimizer in self._optimizers["dynamics"]:
+            optimizer.step()
         return {"apg.wm_loss": self.dynamics.loss_metric(loss.detach(), world.window)}
 
     def update_dynamics_statistics(self, states: dict, actions: torch.Tensor, next_states: dict) -> None:
@@ -210,8 +258,15 @@ class ApgLearner:
         history ending at ``obs(s_t)``; the dynamics predicts ``s_{t+1}``;
         ``evaluate(s_{t+1}, a_t)`` applies the action to the shadow state and
         computes reward/termination/truncation; ``advance_exogenous``
-        advances the command channels; ``observe(s_{t+1})`` produces both
-        observation groups and pushes the policy history.
+        advances the command channels (the frame index clamps at the clip
+        end — clamp-and-continue, so truncations never fire in imagination);
+        ``observe(s_{t+1})`` produces both observation groups and pushes the
+        policy history.
+
+        The survival gate is upstream's soft termination ``1 - p(s_{t+1})``,
+        read from the configured one-dim value-group term; without one it
+        falls back to the hard ``terminated`` union (truncations still do
+        not gate — time-limit ends bootstrap rather than kill).
 
         Returns the ``(H, B)`` rewards and survival gates plus the
         ``(H+1, B, D)`` value-group observations of every rollout state.
@@ -240,12 +295,15 @@ class ApgLearner:
             # Fresh shadow state: under autograd every mutable leaf must
             # be written exactly once (BPTT version safety).
             program.rebind_shadow_state()
-            reward, terminated, truncated = program.evaluate(fields, action)
-            rewards.append(reward)
-            gates.append(~(terminated | truncated))
+            reward, terminated, _truncated = program.evaluate(fields, action)
             program.advance_exogenous(action)
             observed = program.observe(fields)
             value_obs.append(observed[cfg.value_group])
+            rewards.append(reward)
+            if self.soft_term_column is not None:
+                gates.append(1.0 - value_obs[-1][..., self.soft_term_column])
+            else:
+                gates.append((~terminated).float())
             history = torch.cat((history[:, 1:], observed[cfg.policy_group].unsqueeze(1)), dim=1)
         return torch.stack(rewards), torch.stack(gates), torch.stack(value_obs)
 
@@ -262,7 +320,7 @@ class ApgLearner:
     # -- policy update ------------------------------------------------------------
 
     def policy_update(self) -> dict[str, float]:
-        """One actor BPTT step plus lambda-return critic regression on the rollout."""
+        """One actor BPTT step plus GAE critic regression on the rollout."""
         cfg = self.cfg
         start_states, history = self._sample_valid_starts()
 
@@ -272,72 +330,68 @@ class ApgLearner:
         _set_trainable(self.critic, False)
         try:
             rewards, gates, value_obs = self._unroll(start_states, history)
-            terminal_value = self._value_of(value_obs[-1], update=False).clamp(max=self.value_max)
+            terminal_value = self.critic(value_obs[-1]).squeeze(-1).clamp(max=self.value_max)
             batch_return = self._horizon_return(rewards, gates, terminal_value)
             actor_loss = -batch_return.mean()
-            self._actor_opt.zero_grad(set_to_none=True)
+            for optimizer in self._optimizers["actor"]:
+                optimizer.zero_grad(set_to_none=True)
             actor_loss.backward()
             grad_norm = nn.utils.clip_grad_norm_(self.actor.parameters(), cfg.imagination.max_grad_norm)
             nn.utils.clip_grad_value_(self.actor.parameters(), _ACTOR_GRAD_VALUE_CLIP)
-            grad_finite = torch.isfinite(grad_norm)
         finally:
             _set_trainable(self.dynamics, True)
             _set_trainable(self.critic, True)
 
         # The critic regresses on the detached rollout while the actor's
         # gradients sit untouched; the parameters are disjoint, so stepping
-        # the actor afterwards is equivalent to stepping before.
+        # the actor afterwards is equivalent to stepping before. Upstream
+        # steps unconditionally — no non-finite-grad skip (it would force a
+        # host sync).
         critic_loss = self._update_critic(rewards.detach(), gates.detach(), value_obs.detach())
         row = torch.stack(
             (
                 actor_loss.detach().mean(),
                 -actor_loss.detach().mean(),
                 grad_norm.detach(),
-                grad_finite.float(),
                 critic_loss,
             )
         ).cpu()
-        if bool(row[3]):
-            self._actor_opt.step()
+        for optimizer in self._optimizers["actor"]:
+            optimizer.step()
         return {
             "apg.policy_loss": float(row[0]),
             "apg.imag_reward": float(row[1]),
             "apg.policy_grad_norm": float(row[2]),
-            "apg.value_loss": float(row[4]),
+            "apg.value_loss": float(row[3]),
         }
 
-    def _value_of(self, value_obs: torch.Tensor, *, update: bool) -> torch.Tensor:
-        """Critic values on value-group observations (unclamped; upstream clamps
-        only the bootstrap and the regression targets, at their call sites)."""
-        flat = value_obs.reshape(-1, value_obs.shape[-1])
-        return self.critic(self.value_norm(flat, update=update)).reshape(value_obs.shape[:-1])
-
     def _update_critic(self, rewards: torch.Tensor, gates: torch.Tensor, value_obs: torch.Tensor) -> torch.Tensor:
-        """Lambda-return regression over the imagined rollout, targets detached.
+        """GAE(lambda) regression over the imagined rollout, targets detached.
+
+        Upstream ``gae_returns`` verbatim with soft-done gates: TD deltas
+        accumulated into advantages, returns ``A_t + V(s_t)`` clamped at the
+        task's maximum discounted return. The critic reads raw value-group
+        observations (upstream's critic input carries no normalizer).
 
         Returns the mean minibatch loss as a device tensor; the caller folds
         it into the round's single metric row.
         """
         cfg = self.cfg
         horizon = cfg.imagination.horizon
-        # Normalize the whole rollout once; the frozen statistics make the
-        # normalized inputs valid for both the value pass and every
-        # regression minibatch. Statistics fold the rollout observations
-        # (upstream's critic norm role).
         with torch.no_grad():
-            self.value_norm.update(value_obs.flatten(0, 1))
-            inputs_all = self.value_norm(value_obs.flatten(0, 1), update=False).reshape(value_obs.shape)
-            values = self._value_of(value_obs, update=False)  # (H+1, B)
-            target = values[-1]
+            values = self.critic(value_obs).squeeze(-1)  # (H+1, B)
+            next_value = values[-1]
+            advantage = torch.zeros_like(next_value)
             targets = []
             for step in range(horizon - 1, -1, -1):
-                target = rewards[step] + cfg.gamma * gates[step] * (
-                    (1.0 - cfg.critic.lam) * values[step + 1] + cfg.critic.lam * target
-                )
-                targets.append(target)
+                not_done = gates[step]
+                delta = rewards[step] + not_done * cfg.gamma * next_value - values[step]
+                advantage = delta + not_done * cfg.gamma * cfg.critic.lam * advantage
+                targets.append(advantage + values[step])
+                next_value = values[step]
             targets = torch.stack(targets[::-1]).clamp(max=self.value_max)  # (H, B)
 
-        inputs = inputs_all[:-1].flatten(0, 1)  # (H*B, D)
+        inputs = value_obs[:-1].flatten(0, 1)  # (H*B, D)
         flat_targets = targets.flatten(0, 1)
         total = inputs.shape[0]
         minibatch_size = total // cfg.critic.minibatches
@@ -350,52 +404,66 @@ class ApgLearner:
             for index in range(cfg.critic.minibatches):
                 picked = permutation[index * minibatch_size : (index + 1) * minibatch_size]
                 loss = nn.functional.mse_loss(self.critic(inputs[picked]).squeeze(-1), flat_targets[picked])
-                self._critic_opt.zero_grad(set_to_none=True)
+                for optimizer in self._optimizers["critic"]:
+                    optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.critic.parameters(), cfg.critic.max_grad_norm)
-                self._critic_opt.step()
+                for optimizer in self._optimizers["critic"]:
+                    optimizer.step()
                 loss_sum = loss_sum + loss.detach()
         return loss_sum / updates
 
     # -- schedule and checkpoint ---------------------------------------------------
 
-    def set_learning_rate_scale(self, scale: float) -> None:
-        """Apply a shared decay factor to each configured base learning rate."""
-        for optimizer, base in (
-            (self._dynamics_opt, self.cfg.world_model.learning_rate),
-            (self._actor_opt, self.cfg.actor.learning_rate),
-            (self._critic_opt, self.cfg.critic.learning_rate),
-        ):
-            for group in optimizer.param_groups:
-                group["lr"] = base * scale
+    def reset_learning_rates(self) -> None:
+        """Reset every optimizer to its configured base learning rate.
+
+        Upstream keeps a fixed lr throughout training; restoring an optimizer
+        state_dict would otherwise import whatever lr the checkpoint carried.
+        Fused capturable Adam carries lr as a device tensor, reset in place.
+        """
+        bases = {
+            "dynamics": self.cfg.world_model.learning_rate,
+            "actor": self.cfg.actor.learning_rate,
+            "critic": self.cfg.critic.learning_rate,
+        }
+        for name, optimizers in self._optimizers.items():
+            for optimizer in optimizers:
+                for group in optimizer.param_groups:
+                    if torch.is_tensor(group["lr"]):
+                        group["lr"].fill_(bases[name])
+                    else:
+                        group["lr"] = bases[name]
 
     def learning_state(self) -> dict[str, Any]:
         """Serializable learning state: modules, normalizers, and optimizers."""
         return {
             "obs_norm": self.obs_norm.state_dict(),
-            "value_norm": self.value_norm.state_dict(),
-            **({"goal_norm": self.goal_norm.state_dict()} if self.goal_norm is not None else {}),
+            **{f"goal_norm_{index}": norm.state_dict() for index, norm in enumerate(self.goal_norms)},
             "dynamics": self.dynamics.state_dict(),
             "actor": self.actor.state_dict(),
             "critic": self.critic.state_dict(),
             "optimizers": {
-                "dynamics": self._dynamics_opt.state_dict(),
-                "actor": self._actor_opt.state_dict(),
-                "critic": self._critic_opt.state_dict(),
+                name: [optimizer.state_dict() for optimizer in optimizers]
+                for name, optimizers in self._optimizers.items()
             },
         }
 
     def load_learning_state(self, state: dict[str, Any]) -> None:
         self.obs_norm.load_state_dict(state["obs_norm"])
-        self.value_norm.load_state_dict(state["value_norm"])
-        if self.goal_norm is not None and state.get("goal_norm") is not None:
-            self.goal_norm.load_state_dict(state["goal_norm"])
+        for index, norm in enumerate(self.goal_norms):
+            key = f"goal_norm_{index}"
+            if state.get(key) is not None:
+                norm.load_state_dict(state[key])
         self.dynamics.load_state_dict(state["dynamics"])
         self.actor.load_state_dict(state["actor"])
         self.critic.load_state_dict(state["critic"])
-        self._dynamics_opt.load_state_dict(state["optimizers"]["dynamics"])
-        self._actor_opt.load_state_dict(state["optimizers"]["actor"])
-        self._critic_opt.load_state_dict(state["optimizers"]["critic"])
+        for name, optimizers in self._optimizers.items():
+            # Optimizer lists are format-locked (Muon split since the sixth
+            # alignment round): pre-split checkpoints fail loudly here.
+            for optimizer, optimizer_state in zip(optimizers, state["optimizers"][name], strict=True):
+                optimizer.load_state_dict(optimizer_state)
+        self.reset_learning_rates()
 
 
 def program_exogenous_channels(program: ModelingProgram) -> list[str]:

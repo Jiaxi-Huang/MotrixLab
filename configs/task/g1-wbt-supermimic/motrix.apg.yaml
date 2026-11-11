@@ -20,10 +20,16 @@ checkpoint:
 algo:
   # Upstream convention: the history stack covers the proprioceptive policy
   # group only; these value-group terms feed the actor as one flat current
-  # goal window (~0.9 s lookahead).
+  # goal window (~0.9 s lookahead) through an encoder MLP to a tanh latent
+  # (upstream MultiEncoderAE's per-task encoders; multiple blocks would be
+  # configured via goal_encoder_splits).
   goal_terms:
     - motion_future_joint
     - motion_future_ref_ori_b
+  imagination:
+    # The task's one-dim soft-termination term drives the imagination
+    # survival gate (upstream: sigmoid((err/threshold - 1) / 0.05)).
+    soft_termination_term: soft_termination
   replay:
     # Upstream buffer_steps: 1000 steps per lane.
     capacity: 1000
@@ -44,11 +50,12 @@ algo:
     history: 10
     output_activation: identity
   trainer:
-    amp: bf16
+    # Upstream trains fp32 end to end (TF32 matmuls via
+    # float32_matmul_precision("high") are already enabled module-level).
+    amp: null
     iterations: 30000
+    # Upstream: fixed lr throughout (no decay schedule, no WM-only warmup).
     collect_steps_per_iteration: 2.5
-    warmup_iterations: 500
-    lr_decay_iterations: 30000
     # Evaluate the full motion library only after training.
     eval_interval: 0
     eval_steps: 500

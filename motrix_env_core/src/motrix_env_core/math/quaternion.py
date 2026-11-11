@@ -15,6 +15,10 @@ import array_api_compat.torch as _torch_namespace
 import numpy as np
 import torch as _torch  # noqa: F401  (namespace check only)
 
+# asin() argument ceiling for geodesic angle math: one representable step
+# below 1.0 so the backward stays finite where the norm rounds onto 1.0f.
+_ASIN_CEILING = 1.0 - 1e-6
+
 
 def _array_namespace(value, *others):
     # A single isinstance check keeps Dynamo specialization possible inside
@@ -182,7 +186,11 @@ def rotation_distance(lhs, rhs):
     dy = -w1 * y2 + x1 * z2 + y1 * w2 - z1 * x2
     dz = -w1 * z2 - x1 * y2 + y1 * x2 + z1 * w2
     imaginary_norm = xp.sqrt(dx * dx + dy * dy + dz * dz)
-    imaginary_norm = xp.where(imaginary_norm < 0.0, 0.0, xp.where(imaginary_norm > 1.0, 1.0, imaginary_norm))
+    # Clamp a hair below 1: asin'(1) is infinite, and a norm that lands on
+    # exactly 1.0f (a 180-degree error, routine at imagination batch scale)
+    # otherwise produces inf-then-NaN gradients while the forward stays
+    # finite. The <= 3e-3 rad forward bias at the clamp is negligible.
+    imaginary_norm = xp.where(imaginary_norm > _ASIN_CEILING, _ASIN_CEILING, imaginary_norm)
     return 2.0 * xp.asin(imaginary_norm)
 
 

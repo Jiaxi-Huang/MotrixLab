@@ -1,9 +1,9 @@
 # Source-of-truth base values for the motrix.apg provider.
 # Framework-neutral runtime settings live in the task recipe root.
-# The recipe mirrors Uni-SuperMimic's SuperMimicConfig (shared learning rate
-# with cosine decay to 3%, horizon-32 imagination, windowed world-model
-# supervision, lambda-return critic on imagined rollouts, Gaussian action
-# noise) at cartpole-sized network and batch widths; task recipes override.
+# The recipe mirrors Uni-SuperMimic's SuperMimicConfig (fixed shared learning
+# rate, horizon-32 imagination, windowed world-model supervision, lambda-return
+# critic on imagined rollouts, Gaussian action noise) at cartpole-sized network
+# and batch widths; task recipes override.
 defaults:
   # Load the shared structured ApgCfg schema registered by the Motrix provider.
   - _motrix_apg_schema
@@ -17,11 +17,12 @@ gamma: 0.99
 policy_group: policy
 value_group: value
 collector:
-  # Std of Gaussian exploration noise on collected commands, as a fraction of
-  # the task action limit; deterministic evaluation never adds noise.
-  # Upstream: action_noise.
+  # Std of Gaussian exploration noise on collected commands, added before the
+  # env's per-joint action scaling (joint-space magnitude = std * scale_j, as
+  # upstream); deterministic evaluation never adds noise. Upstream:
+  # action_noise (unclamped; the env's control-range clamping is the only
+  # bound).
   exploration_noise_std: 0.1
-  exploration_clip: 1.0
 replay:
   # Transition slots per environment lane; a short on-policy window as
   # upstream (buffer_steps), not a large off-policy ring.
@@ -44,12 +45,10 @@ world_model:
 actor:
   # Policy-observation history stack (upstream ``hist``).
   history: 1
-  output_activation: tanh
   learning_rate: 0.0002
   # Imagination start states per policy update. Upstream: pi_batch. Adam betas
   # (0.9, 0.95) are recipe constants applied by the learner.
   batch_size: 1024
-  updates_per_iteration: 1
   hidden: [256, 256]
 critic:
   learning_rate: 0.0002
@@ -69,21 +68,15 @@ imagination:
   max_grad_norm: 1.0
 trainer:
   iterations: 150
-  # Reserved; eager execution only in this provider version.
-  compile: false
-  # Real environment steps collected per iteration and lane. Fractional
-  # values carry their remainder across iterations (upstream 1/utd).
-  collect_steps_per_iteration: 200.0
+  # Policy updates per env step per lane (1/0.005 = 200 collected steps per
+  # update): the cartpole-sized baseline's light-update cadence. The
+  # supermimic recipe runs utd 0.4 (task recipes override).
+  utd: 0.005
   # Learner MLP autocast dtype; null keeps fp32, "bf16" drops only the MLP
   # matmuls to bf16 (geometry/rewards/collection stay fp32).
   amp: null
-  # WM-only iterations before policy updates start. Upstream: wm_only_iters.
-  warmup_iterations: 5
-  # Cosine lr decay horizon; null decays over `iterations` (to 3% of the
-  # base rate). Upstream: lr_decay_iters.
-  lr_decay_iterations: null
   # Deterministic real evaluation every N iterations; 0 disables.
   eval_interval: 10
   eval_steps: 2000
   # Trainer-owned end-of-training evaluation.
-  final_eval: true
+  final_eval: false

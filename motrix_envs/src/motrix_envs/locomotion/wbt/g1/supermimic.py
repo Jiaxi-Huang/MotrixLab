@@ -7,7 +7,7 @@ Same family math as the dance/largebox/backflip variants (shared WBT command,
 rewards, and motion infrastructure; the frame index's exogenous annotation
 comes with the family). The APG-specific deltas are pure configuration, and
 task-side values follow the upstream supermimic configuration exactly (see
-[supermimic-vs-motrixlab-comparison](../../../wiki/research/supermimic-vs-motrixlab-comparison.md)):
+[supermimic-vs-motrixlab-comparison](../../../../../../wiki/research/supermimic-vs-motrixlab-comparison.md)):
 
 - the tracking anchor is the pelvis (upstream re-anchors from the mjlab
   default torso) and terminations are the upstream pair — reference z error
@@ -52,6 +52,7 @@ from ..mdp.observations import (
     ProjectedGravityObsCfg,
     RobotBodyOrientationObsCfg,
     RobotBodyPositionInReferenceFrameObsCfg,
+    SoftTerminationObsCfg,
 )
 from ..mdp.terminations import MotionClipEndTruncationCfg
 from .common import MOTION_DIR, G1WbtEnvCfg
@@ -109,6 +110,7 @@ def make_g1_wbt_supermimic_cfg() -> EnvCfg:
             "motion_future_joint": MotionFutureJointObsCfg(),
             "motion_future_ref_pos_b": MotionFutureReferencePositionObsCfg(),
             "motion_future_ref_ori_b": MotionFutureReferenceOrientationObsCfg(),
+            "soft_termination": SoftTerminationObsCfg(),
             "robot_body_pos_b": RobotBodyPositionInReferenceFrameObsCfg(),
             "robot_body_ori_b": RobotBodyOrientationObsCfg(),
             "base_lin_vel": BodyLinearVelocityObsCfg(),

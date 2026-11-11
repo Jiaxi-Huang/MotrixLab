@@ -94,6 +94,7 @@ def _command(
     command = WbtMotionCommand(
         clip=_clip(num_frames),
         reference_index=0,
+        clip_end=torch.full((num_envs, 1), num_frames - 1, dtype=torch.int64),
         target_body_position_relative=torch.empty((num_envs, 1, 3), dtype=torch.float32),
         target_body_orientation_relative=torch.empty((num_envs, 1, 4), dtype=torch.float32),
         sampler=sampler if sampler is not None else _adaptive_sampler(num_frames),

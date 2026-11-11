@@ -331,6 +331,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         self._task_program: TorchTaskProgram | None = None
         self._kernel_buffers: tuple[Any, ...] | None = None
         self._modeling_view: Any | None = None
+        self._modeling_view_device: torch.device | None = None
         self.metrics: dict[str, torch.Tensor] = {}
         self._kernel_outputs: KernelOutputs | None = None
         self._observation_buffer: SwapObsBuffer | None = None
@@ -873,7 +874,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         self._torch_runtime = TorchManagerRuntime(self, self._compiled_manager_program)
         return self._torch_runtime.task_program()
 
-    def modeling_view(self) -> ModelingView:
+    def modeling_view(self, device: str | torch.device | None = None) -> ModelingView:
         """Derive (once) the dual-path modeling view of this environment.
 
         APG trainability is a derived property of the config: the first call
@@ -882,11 +883,17 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         failure raises :class:`ModelingDerivationError` naming the offending
         group, term, and field — a task that cannot be imagined fails here,
         never mid-training. No subclass overrides this.
+
+        ``device`` places the shadow host (imagination device — the
+        learner's); None keeps the real program's context device. A later
+        call with a different device re-derives.
         """
-        if self._modeling_view is None:
+        wants = None if device is None else torch.device(device)
+        if self._modeling_view is None or wants != self._modeling_view_device:
             from motrix_env_core.manager.modeling import derive_modeling_view
 
-            self._modeling_view = derive_modeling_view(self)
+            self._modeling_view = derive_modeling_view(self, device=wants)
+            self._modeling_view_device = wants
         return self._modeling_view
 
     @property

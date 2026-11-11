@@ -34,7 +34,7 @@ def test_apg_total_env_steps_accounts_fractional_collection() -> None:
 
     cfg = ApgCfg()
     cfg.trainer.iterations = 30000
-    cfg.trainer.collect_steps_per_iteration = 2.5
+    cfg.trainer.utd = 0.4
     provider = frameworks.get_agent_provider("motrix", "apg", "torch")
     assert provider is not None
     assert provider.total_env_steps(cfg, 2048) == 30000 * 2.5 * 2048

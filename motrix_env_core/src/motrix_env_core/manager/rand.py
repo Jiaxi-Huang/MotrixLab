@@ -54,10 +54,12 @@ class DeterministicRandValue(RandValue):
     """
 
     def next_uniform(self, count: int = 1) -> torch.Tensor:
-        return torch.zeros((self.state.shape[0], count), dtype=torch.float32)
+        return torch.zeros((self.state.shape[0], count), dtype=torch.float32, device=self.state.device)
 
     def uniform_range(self, count: int, low: float, high: float) -> torch.Tensor:
-        return torch.full((self.state.shape[0], count), (low + high) * 0.5, dtype=torch.float32)
+        return torch.full(
+            (self.state.shape[0], count), (low + high) * 0.5, dtype=torch.float32, device=self.state.device
+        )
 
 
 def initialize_rand_states(num_envs: int, rand_seed: int) -> torch.Tensor:

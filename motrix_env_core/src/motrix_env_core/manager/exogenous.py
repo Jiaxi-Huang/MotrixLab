@@ -32,17 +32,25 @@ class ExogenousRule:
     """Advance rule for one exogenous channel.
 
     - ``increment``: the channel steps by ``step`` every imagination step
-      (motion phase); ``step`` applies only to this kind.
+      (motion phase); ``step`` applies only to this kind. With ``clamp``
+      naming a sibling channel, the increment holds at that channel's value
+      (upstream supermimic's clip-end clamp-and-continue: the motion frame
+      index freezes at the clip's last frame instead of bleeding into the
+      next clip).
     - ``copy_action``: the channel receives ``action_term``'s latest raw
       policy action (the term's width must equal the channel's trailing
       width); ``action_term`` applies only to this kind.
     - ``constant``: the channel holds its episode-start sampled value;
       terminal values reach the learner through the FinalState capture.
+
+    ``clamp`` stores the sibling channel's leaf path (the same keying as the
+    ``exogenous`` dict itself) and applies only to ``increment`` rules.
     """
 
     kind: ExogenousKind = ExogenousKind.CONSTANT
     step: float = 1.0
     action_term: str = ""
+    clamp: str = ""
 
 
 __all__ = ["ExogenousKind", "ExogenousRule"]

@@ -28,7 +28,7 @@ class ApgProvider(AgentProvider[ApgCfg]):
         return Trainer(context=context)
 
     def total_env_steps(self, config: ApgCfg, num_envs: int) -> int:
-        return int(config.trainer.iterations * config.trainer.collect_steps_per_iteration * num_envs)
+        return int(config.trainer.iterations / config.trainer.utd * num_envs)
 
     def create_policy_exporter(self):
         from motrix_rl_builtin.apg.export import ApgOnnxExporter
