@@ -72,9 +72,14 @@ class ActionTerm(abc.ABC):
     def process(self, actions: torch.Tensor) -> torch.Tensor | None:
         """Record raw tensor actions and process one batched action slice."""
         state = self.state
-        ptr = (int(state.action_ptr[0]) + 1) % state.action_queue.shape[1]
-        state.action_ptr[0] = ptr
-        state.action_queue[:, ptr] = actions
+        queue = state.action_queue
+        # Advance the cursor on tensors: the host-int read this replaced
+        # synced the device cursor on every call — a needless stall in the
+        # eager imagination path and illegal under CUDA-graph capture.
+        ptr = (state.action_ptr + 1) % queue.shape[1]
+        state.action_ptr.copy_(ptr)
+        index = ptr.view(1, 1).expand(queue.shape[0], 1, queue.shape[-1])
+        state.action_queue.scatter_(1, index, actions.unsqueeze(1))
         return self._process(actions)
 
     @abc.abstractmethod

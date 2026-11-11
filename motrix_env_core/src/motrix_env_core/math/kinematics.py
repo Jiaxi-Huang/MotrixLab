@@ -71,6 +71,25 @@ class KinematicTree:
         self.num_bodies = len(self.parent)
         # Leaf rotations cannot affect any link origin, including all-body output.
         self._position_rotation_needed = frozenset(par for par in self.parent if par >= 0)
+        # Depth-grouped index tensors for the batched FK pass: one vectorized
+        # step per tree level (every parent is complete a level above). The
+        # eager per-body loop this replaces spent ~8 kernel launches per body
+        # — the dominant dispatch cost of imagination rollouts.
+        depth = [0] * self.num_bodies
+        for i in range(self.num_bodies):
+            if self.parent[i] >= 0:
+                depth[i] = depth[self.parent[i]] + 1
+        self._levels = tuple(
+            torch.tensor(
+                [i for i in range(self.num_bodies) if depth[i] == level], dtype=torch.long, device=device
+            )
+            for level in range(1, max(depth) + 1)
+        )
+        self._parent_of = torch.tensor(self.parent, dtype=torch.long, device=device)
+        self._joint_of = torch.tensor(self.joint_idx, dtype=torch.long, device=device)
+        self._roots = torch.tensor(
+            [i for i in range(self.num_bodies) if self.parent[i] < 0], dtype=torch.long, device=device
+        )
 
     def positions(
         self,
@@ -132,28 +151,45 @@ class KinematicTree:
             Positions ``(..., M, 3)``, rotations ``(..., M, 3, 3)``, link-origin
             linear velocities ``(..., M, 3)`` and angular velocities ``(..., M, 3)``.
         """
-        P: list[torch.Tensor | None] = [None] * self.num_bodies
-        Rs = P.copy()
-        V = P.copy()
-        W = P.copy()
-        for i in range(self.num_bodies):
-            par = self.parent[i]
-            if par < 0:
-                P[i], Rs[i], V[i], W[i] = p, R, v, w
-                continue
-            j = self.joint_idx[i]
-            Rp = Rs[par]
-            pi = P[par] + (Rp @ self.off_p[i].unsqueeze(-1)).squeeze(-1)
-            R_off = Rp @ self.off_R[i]
-            Ri = R_off @ axis_angle_to_mat(self.axes[i], q[..., j])
-            axis_w = (R_off @ self.axes[i].unsqueeze(-1)).squeeze(-1)
-            wi = W[par] + axis_w * qd[..., j : j + 1]
-            vi = V[par] + torch.cross(W[par], pi - P[par], dim=-1)
-            P[i], Rs[i], V[i], W[i] = pi, Ri, vi, wi
-        idx = range(self.num_bodies) if bodies is None else bodies
+        batch_shape = p.shape[:-1]
+        P_all = p.new_zeros(batch_shape + (self.num_bodies, 3))
+        R_all = R.new_zeros(batch_shape + (self.num_bodies, 3, 3))
+        V_all = v.new_zeros(batch_shape + (self.num_bodies, 3))
+        W_all = w.new_zeros(batch_shape + (self.num_bodies, 3))
+        # Every root body carries the root state itself.
+        P_all[..., self._roots, :] = p.unsqueeze(-2)
+        R_all[..., self._roots, :, :] = R.unsqueeze(-3)
+        V_all[..., self._roots, :] = v.unsqueeze(-2)
+        W_all[..., self._roots, :] = w.unsqueeze(-2)
+        # One batched recursion step per depth level — same per-body math as
+        # the eager loop it replaces (a fixed link's joint index -1 wraps
+        # exactly like the original q[..., -1] read), parents strictly
+        # shallower so the in-place level writes never alias the reads.
+        for level in self._levels:
+            par = self._parent_of[level]
+            joint = self._joint_of[level]
+            Rp = R_all[..., par, :, :]
+            Pp = P_all[..., par, :]
+            Vp = V_all[..., par, :]
+            Wp = W_all[..., par, :]
+            pi = Pp + (Rp @ self.off_p[level].unsqueeze(-1)).squeeze(-1)
+            R_off = Rp @ self.off_R[level]
+            Ri = R_off @ axis_angle_to_mat(self.axes[level], q[..., joint])
+            axis_w = (R_off @ self.axes[level].unsqueeze(-1)).squeeze(-1)
+            wi = Wp + axis_w * qd[..., joint].unsqueeze(-1)
+            vi = Vp + torch.cross(Wp, pi - Pp, dim=-1)
+            P_all[..., level, :] = pi
+            R_all[..., level, :, :] = Ri
+            V_all[..., level, :] = vi
+            W_all[..., level, :] = wi
+        idx = (
+            torch.arange(self.num_bodies, device=p.device)
+            if bodies is None
+            else torch.as_tensor(bodies, device=p.device)
+        )
         return (
-            torch.stack([P[i] for i in idx], -2),
-            torch.stack([Rs[i] for i in idx], -3),
-            torch.stack([V[i] for i in idx], -2),
-            torch.stack([W[i] for i in idx], -2),
+            P_all[..., idx, :],
+            R_all[..., idx, :, :],
+            V_all[..., idx, :],
+            W_all[..., idx, :],
         )

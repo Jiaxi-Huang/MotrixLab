@@ -73,12 +73,14 @@ class JointPositionActionTerm(ActionTerm):
         ``motrix_env_core.torch_manager.actions.process_joint_position_actions``.
         """
         state = self.state
-        ptr = int(state.action_ptr[0])
         target_raw = actions
         if state.delay_hi > 0:
             queue = state.action_queue
             width = queue.shape[1]
-            delay_indices = (ptr - state.delay_steps) % width
+            # The cursor stays a tensor: a host-int read would sync the
+            # device cursor every step (and break CUDA-graph capture); the
+            # (1,) cursor broadcasts against the per-lane delays.
+            delay_indices = (state.action_ptr - state.delay_steps) % width
             target_raw = torch.take_along_dim(queue, delay_indices[:, None, None], dim=1)[:, 0, :]
         return target_raw * state.action_scales + state.default_angles
 

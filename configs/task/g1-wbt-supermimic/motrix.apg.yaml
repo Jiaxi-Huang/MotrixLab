@@ -10,7 +10,12 @@ task:
   env: g1-wbt-supermimic
   rllib: motrix
   algo: apg
-num_envs: 2048
+# Local sizing for a 16 GB GPU (RTX 5060 Ti): half the upstream widths and
+# a quarter of the env count (upstream: 4096 envs, WM [2048]*3, actor
+# [2048,1024,512,256]). The dominant consumer is the replay ring
+# (num_envs * capacity * ~1.5k floats/step incl. the 890-dim value obs);
+# 512 lanes keeps it ~3 GB. If this still OOMs: actor.batch_size 2048.
+num_envs: 512
 play_num_envs: 16
 seed: 42
 logging:
@@ -20,9 +25,8 @@ checkpoint:
 algo:
   # Upstream convention: the history stack covers the proprioceptive policy
   # group only; these value-group terms feed the actor as one flat current
-  # goal window (~0.9 s lookahead) through an encoder MLP to a tanh latent
-  # (upstream MultiEncoderAE's per-task encoders; multiple blocks would be
-  # configured via goal_encoder_splits).
+  # goal window (~0.9 s lookahead) through a single encoder MLP to a tanh
+  # latent (upstream's per-task encoders arrive with a second task).
   goal_terms:
     - motion_future_joint
     - motion_future_ref_ori_b
@@ -37,25 +41,24 @@ algo:
     warmup_steps: 64
   world_model:
     scheme: floating_base
-    hidden: [2048, 2048, 2048]
+    hidden: [1024, 1024, 1024]
     # Upstream wm_batch / wm_batches per iteration.
     batch_size: 2048
     batches_per_iteration: 10
   actor:
-    # Upstream pi_batch / utd 0.4 (one update per iteration).
-    batch_size: 4096
-    updates_per_iteration: 1
-    hidden: [2048, 1024, 512, 256]
+    # Upstream pi_batch 4096; halved for the 16 GB card — the 32-step eager
+    # fp32 BPTT graph is the dominant allocation (batch x horizon x ~75 KB).
+    batch_size: 2048
+    hidden: [1024, 512, 256, 128]
     # Upstream hist: 10 stacked policy-observation frames.
     history: 10
-    output_activation: identity
   trainer:
     # Upstream trains fp32 end to end (TF32 matmuls via
     # float32_matmul_precision("high") are already enabled module-level).
     amp: null
     iterations: 30000
-    # Upstream: fixed lr throughout (no decay schedule, no WM-only warmup).
-    collect_steps_per_iteration: 2.5
+    # Upstream steady-state utd (one update per 2.5 collected steps).
+    utd: 0.4
     # Evaluate the full motion library only after training.
     eval_interval: 0
     eval_steps: 500

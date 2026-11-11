@@ -152,6 +152,11 @@ jsonl 每行一条记录，HTTP 每次发一批记录，两路都启用时是同
 | `train/learning_rate`、`train/action_std` | 预留给后续接入的 on-policy 算法     |
 
 - `reward/*` 的口径是"每步瞬时值在日志窗口内的均值"。
+- `motrix.apg`（WM/BPTT，后接入）同样经 `TrainingLogger` 写出，直接使用规范 key：学习侧
+  `train/wm_loss`、`train/policy_loss`、`train/value_loss`、`train/imag_reward`、`train/policy_grad_norm`、
+  `train/learning_rate`；采集侧 `rollout/env_reward`、`rollout/termination_rate`、`reward/<term>`、`metrics/<k>`
+  （经 ScalarWindow 聚合，含 `{key}_min/_max` 极值后缀键）；性能 `perf/env_steps_per_s`、`perf/collect_ms_per_iter`、
+  `perf/learn_ms_per_iter`、`perf/learn_pct`。评估标量写 `eval/*` tag（TensorBoard 曲线用，不在规范 key 清单内）。
 - `sys/*` 是固定清单，只发到 live，不写 TensorBoard：`sys/cpu_percent`、`sys/mem_used_gb`、`sys/gpu{i}/util_percent`、
   `sys/gpu{i}/mem_used_gb`（内存单位与终端面板一致，为 GiB）。不发每核 CPU 数据，避免大核数机器占用服务端 key 配额。
 
@@ -161,6 +166,7 @@ jsonl 每行一条记录，HTTP 每次发一批记录，两路都启用时是同
 | ------------- | ------------------------------------- | -------------------------------------------------------- | -------------------------- |
 | FastSAC sync  | `global_step`                         | `(global_step + 1) * num_envs`（日志点上第 `global_step` 次迭代已采集完） | `logging.interval`         |
 | FastSAC async | `collector_steps // num_collectors`   | `collector_steps * (num_envs // num_collectors)`，与 `performance.total_env_steps` 同口径 | 与 TensorBoard 写出点一致 |
+| APG           | `iteration`                          | 每迭代收集 chunk 数 × num_envs 的累计值（含 warmup 预填充）      | `logging.interval`         |
 
 `running` 记录里的 `total_steps` 由 `AgentProvider.total_env_steps(config, num_envs)` 给出（默认 `None`）：FastSAC 为
 `num_learning_iterations * num_envs`，FastSAC sync 与 `env_steps` 同口径。

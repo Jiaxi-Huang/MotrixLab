@@ -30,9 +30,13 @@ truncation）与 P3.1（schema / SequenceReplay / EmpiricalNormalization）。
 `ApgProvider(AgentProvider[ApgCfg])`：`agent_name="apg"`、
 `train_backend="torch"`、`checkpoint_format="pt"`。`MotrixFramework` 聚合
 `(FastSacProvider(), ApgProvider())`；删除空置 `mbrl/` 目录。默认任务配置
-`configs/task/g1-wbt-supermimic/motrix.apg.yaml`。metric 标量键 `apg.`
-前缀（`apg.wm_loss`、`apg.policy_loss`、`apg.imag_reward`、`apg.value_loss`、
-`apg.rollout_*`、`apg.eval_*`）——替换前一尝试的 `wm/loss` 式命名。
+`configs/task/g1-wbt-supermimic/motrix.apg.yaml`。metric 标量键遵循
+live-metrics 规范 key 分类（见 [live-metrics.md](./live-metrics.md) §3）：
+学习侧 `train/wm_loss`、`train/policy_loss`、`train/imag_reward`、
+`train/value_loss`、`train/policy_grad_norm`、`train/learning_rate`；采集侧
+`rollout/env_reward`、`rollout/termination_rate`、`rollout/mean_return`、
+`rollout/mean_ep_len`、`reward/<term>`、`metrics/<k>`；性能 `perf/*`；评估
+`eval/*`。（修订：初版冻结的 `apg.` 前缀在接入 live metrics 规范 key 时废除。）
 
 ### P-B 动力学状态组装（FieldDesc 驱动 + FK 派生）
 
@@ -207,8 +211,8 @@ train-mode 拷贝）。
    （直接构造不经 manager 也成立）。
 6. **supermimic 语料**：目标语料未入 assets 前，变体默认指向 dance
    目录（cfg 可覆盖）；端到端验收跑真实语料时替换。
-7. **P-A 落地**：metrics 键 `apg.` 前缀（`apg.wm_loss` 等），dashboard
-   family `rl.worldmodel`（P3.1 T-F）。
+7. **P-A 落地**：metrics 键为 live-metrics 规范 key（`train/wm_loss` 等；初版
+   `apg.` 前缀已废除），dashboard family `rl.worldmodel`（P3.1 T-F）。
 
 ## 与 P3.3 / P4 的边界
 

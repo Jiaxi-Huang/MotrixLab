@@ -98,7 +98,7 @@ def test_training_loop_produces_finite_history(trained) -> None:
     _context, trainer, _cfg = trained
     assert len(trainer.history) == 3
     for row in trainer.history:
-        assert row["apg.wm_loss"] == row["apg.wm_loss"]  # finite
+        assert row["train/wm_loss"] == row["train/wm_loss"]  # finite
 
 
 def test_checkpoint_records_and_resumes(trained, tmp_path) -> None:

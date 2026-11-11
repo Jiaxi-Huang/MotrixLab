@@ -32,6 +32,7 @@ zh_CN: G1 supermimic 全身跟踪任务——WBT 家族的 APG 变体，任务�
 """
 
 from dataclasses import fields
+from pathlib import Path
 
 from motrix_env_core import registry
 from motrix_env_core.base import EnvCfg
@@ -55,7 +56,7 @@ from ..mdp.observations import (
     SoftTerminationObsCfg,
 )
 from ..mdp.terminations import MotionClipEndTruncationCfg
-from .common import MOTION_DIR, G1WbtEnvCfg
+from .common import G1WbtEnvCfg
 
 
 @registry.envcfg("g1-wbt-supermimic")
@@ -63,9 +64,11 @@ def make_g1_wbt_supermimic_cfg() -> EnvCfg:
     """Track the G1 supermimic motion corpus with the APG-trainable variant."""
     cfg = G1WbtEnvCfg()
     # The corpus directory holds the supermimic clips (schema v1 npz, one or
-    # more); the dance corpus is the runnable stand-in until the target
-    # corpus lands in assets.
-    cfg.commands.motion.motion_files = (str(MOTION_DIR / "dance"),)
+    # more). LAFAN1 retargeted to G1 (40 clips, CC BY-NC-ND), converted by
+    # scripts/motion/download_lafan.py into the user cache: the env reads
+    # ~/.cache/motrixlab/lafan1 directly, so checkouts never ship or symlink
+    # the corpus into the package assets.
+    cfg.commands.motion.motion_files = (str(Path.home() / ".cache" / "motrixlab" / "lafan1"),)
     # Upstream anchors tracking on the pelvis, not the mjlab default torso.
     cfg.commands.motion.reference_body_name = "pelvis"
     # The upstream default curriculum: 0.5 uniform + 0.4 low-return focus +
@@ -89,8 +92,9 @@ def make_g1_wbt_supermimic_cfg() -> EnvCfg:
     terminations = {
         "bad_ref_z": type(cfg.terminations.bad_ref_z)(threshold=0.25),
         "bad_ref_ori": cfg.terminations.bad_ref_ori,
-        "bad_dof_pos": cfg.terminations.bad_dof_pos,
-        "bad_dof_vel": cfg.terminations.bad_dof_vel,
+        # remove bad_dof_pos and bad_dof_vel terminations for avoid LTL error
+        # "bad_dof_pos": cfg.terminations.bad_dof_pos,
+        # "bad_dof_vel": cfg.terminations.bad_dof_vel,
     }
     cfg.terminations = terminations
     # Upstream observation split: the history stack covers proprioception

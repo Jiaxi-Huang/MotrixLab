@@ -136,7 +136,7 @@ class WbtMotionCommand(CommandTerm):
     def advance(self: "WbtMotionCommand", ctx: ManagerContext) -> None:
         """Advance every lane one frame."""
         # Per-transition curriculum fold first, so every branch below runs it.
-        self.sampler.fold_step(ctx)
+        self.sampler.fold_step(ctx, self.steps[:, 0])
         steps = self.steps
         clip_end = self.clip.frame_clip_end[steps[:, 0]]
         num_frames = self.clip.joint_pos.shape[0]
@@ -175,15 +175,15 @@ class WbtMotionCommand(CommandTerm):
         Compact semantics: ``ctx.reset_ids`` are this pass's reset rows (K).
         The sampler first folds the episode rows' statistics and rebuilds its
         distribution, then the reset rows draw from it and scatter their new
-        frame indices back; finally the sampler opens new episodes on the
-        episode rows.
+        frame indices back. The estimator windows ride across episode
+        boundaries by design (their done-kind flags break the return chains),
+        so nothing else opens on the reset rows.
         """
         idx = ctx.reset_ids
         self.sampler.fold_episode_stats(idx, ctx.reset_episode, ctx.terminated, self.steps[idx, 0])
         self.sampler.rebuild()
         if bool(self.sequential_clips):
             # Sequential playback rematerializes onto the current frame.
-            self.sampler.mark_episode_starts(idx, ctx.reset_episode, self.steps[idx, 0])
             return
         # Only reset lanes consume sampling draws, so lanes outside this pass
         # keep their RNG stream: mask the batched state advance back for them
@@ -198,7 +198,6 @@ class WbtMotionCommand(CommandTerm):
         # on the following transition.
         self.steps[idx, 0] = steps
         self._mirror_steps()
-        self.sampler.mark_episode_starts(idx, ctx.reset_episode, self.steps[idx, 0])
 
 
 @configclass(kw_only=True)
@@ -228,11 +227,15 @@ class WbtMotionCommandCfg(CommandCfg):
     kernel_size: int = 1
     kernel_lambda: float = 0.8
     # Return-mode mixing and fold parameters (ignored by other modes).
+    # Upstream mixture verbatim.
     uniform_mix: float = 0.5
     return_mix: float = 0.4
     history_mix: float = 0.1
     sampling_gamma: float = 0.99
-    return_ema: float = 0.2
+    # Estimator window in transitions (upstream ``horizon``) and per-bin
+    # sample-memory cap of the value statistic (upstream ``memory``).
+    return_window: int = 20
+    memory: int = 256
 
     def _build_sampler(self, env: ManagerEnv, source: WbtMotionClip, env_fps: int) -> MotionStartSampler:
         if self.sampling_mode == "uniform":
@@ -263,7 +266,8 @@ class WbtMotionCommandCfg(CommandCfg):
                 return_mix=self.return_mix,
                 history_mix=self.history_mix,
                 sampling_gamma=self.sampling_gamma,
-                return_ema=self.return_ema,
+                window=self.return_window,
+                memory=self.memory,
                 g_max=g_max,
             )
         raise ValueError(f"commands.motion sampling_mode must be one of {_SAMPLING_MODES}, got {self.sampling_mode!r}.")

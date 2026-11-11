@@ -4,6 +4,7 @@
 """WBT command-backed observation terms."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -181,12 +182,20 @@ class DofVelObsCfg(ObservationTermCfg):
         return ObsTerm(num_joints, dof_vel_obs, float(self.noise.amplitude))
 
 
+@lru_cache(maxsize=16)
+def _device_offsets(offsets: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    """Window offsets materialized once per (offsets, device) — a per-call
+    ``torch.as_tensor(..., device=...)`` is a CPU->GPU copy every term
+    invocation (and illegal inside CUDA-graph capture)."""
+    return torch.tensor(offsets, device=device)
+
+
 def motion_future_joint_obs(ctx: ManagerContext, out: torch.Tensor, offsets: tuple[int, ...]) -> None:
     """Future joint-target window: ``[qj, vj]`` per frame, clamped at the clip end."""
     motion = ctx.commands["motion"]
     steps = motion.steps[:, 0]
     end = motion.clip.frame_clip_end[steps]
-    frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
+    frames = torch.minimum(steps[:, None] + _device_offsets(tuple(offsets), steps.device), end[:, None])
     stacked = torch.cat((motion.clip.joint_pos[frames], motion.clip.joint_vel[frames]), dim=-1)
     out.copy_(stacked.reshape(stacked.shape[0], -1))
 
@@ -216,7 +225,7 @@ def motion_future_reference_orientation_obs(ctx: ManagerContext, out: torch.Tens
     motion = ctx.commands["motion"]
     steps = motion.steps[:, 0]
     end = motion.clip.frame_clip_end[steps]
-    frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
+    frames = torch.minimum(steps[:, None] + _device_offsets(tuple(offsets), steps.device), end[:, None])
     anchor_quat = ctx.sim["tracked_body_quat"][:, motion.reference_index]
     local = relative_orientation(anchor_quat[:, None, :], motion.clip.reference_body_quat_w[frames])
     out.copy_(local.reshape(local.shape[0], -1))
@@ -240,7 +249,7 @@ def motion_future_reference_position_obs(ctx: ManagerContext, out: torch.Tensor,
     motion = ctx.commands["motion"]
     steps = motion.steps[:, 0]
     end = motion.clip.frame_clip_end[steps]
-    frames = torch.minimum(steps[:, None] + torch.as_tensor(offsets, device=steps.device), end[:, None])
+    frames = torch.minimum(steps[:, None] + _device_offsets(tuple(offsets), steps.device), end[:, None])
     anchor_pos = ctx.sim["tracked_body_pos"][:, motion.reference_index]
     anchor_quat = ctx.sim["tracked_body_quat"][:, motion.reference_index]
     local = rotate_inverse(

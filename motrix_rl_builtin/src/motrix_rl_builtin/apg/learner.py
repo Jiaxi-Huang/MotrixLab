@@ -34,6 +34,7 @@ carries no normalizer).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -43,6 +44,7 @@ from motrix_env_core.manager.modeling import ModelingProgram
 from motrix_rl.normalize import EmpiricalNormalization
 from motrix_rl.replay import SequenceReplay
 from motrix_rl_builtin.apg.assemble import Assembly
+from motrix_rl_builtin.apg.capture import CapturedUpdate
 from motrix_rl_builtin.apg.config import ApgCfg
 from motrix_rl_builtin.apg.networks import Dynamics, MlpActor, MlpCritic
 
@@ -119,9 +121,7 @@ class ApgLearner:
         # per goal modality). Empty disables the goal input.
         self.goal_columns = tuple(columns.to(device) for columns in goal_columns)
         self.goal_slices = tuple(int(columns.shape[0]) for columns in self.goal_columns)
-        self.goal_norms = tuple(
-            EmpiricalNormalization(shape=width, device=device) for width in self.goal_slices
-        )
+        self.goal_norms = tuple(EmpiricalNormalization(shape=width, device=device) for width in self.goal_slices)
         # Column of the one-dim soft-termination term in the value group;
         # None falls back to hard ``terminated`` gates.
         self.soft_term_column = soft_term_column
@@ -137,6 +137,30 @@ class ApgLearner:
         for module in (self.dynamics, self.actor, self.critic):
             module.amp_dtype = amp_dtype
         self.obs_norm = EmpiricalNormalization(shape=obs_dim, device=device)
+        if device.type == "cuda":
+            # Upstream compiles the hot modules on CUDA (eager on CPU tests).
+            # Compiling the bound forwards leaves state_dict and optimizer
+            # parameter identity untouched — checkpoints and Muon are blind
+            # to it. The assembly's flat<->fields transforms (level-batched
+            # FK + quaternion chains) compile as one graph each.
+            for module in (self.dynamics, self.actor, self.critic):
+                module.forward = torch.compile(module.forward)
+            self._fields_to_flat = torch.compile(self.assembly.fields_to_flat)
+            self._flat_to_fields = torch.compile(self.assembly.flat_to_fields)
+        else:
+            self._fields_to_flat = self.assembly.fields_to_flat
+            self._flat_to_fields = self.assembly.flat_to_fields
+        # Whole-update CUDA-graph capture (upstream CapturedUpdate): the
+        # dispatch-heavy unroll records once and replays as one graph. The
+        # engines fall back to eager calls on CPU. Replay order is the
+        # iteration's own order (WM batches, then the policy update), which
+        # is also the record order.
+        self._wm_engine = CapturedUpdate(
+            self._wm_update_core, state=lambda: self._graph_state(optimizer_keys=("dynamics",))
+        )
+        self._policy_engine = CapturedUpdate(
+            self._policy_update_core, state=lambda: self._graph_state(optimizer_keys=("actor", "critic"))
+        )
         # Imagination runs at the actor batch width, not the env's lane count:
         # one resized shadow host, its exogenous channels re-seeded from every
         # start batch.
@@ -187,13 +211,22 @@ class ApgLearner:
         """
         world = self.cfg.world_model
         batch = self.replay.sample_windows(world.batch_size, world.window)
+        return dict(self._wm_engine(batch))
+
+    def _wm_update_core(self, batch: Mapping[str, object]) -> dict[str, torch.Tensor]:
+        """One supervised window batch: 8-step unroll, MSE, dynamics step.
+
+        Capture-safe: fixed shapes, no host syncs; the metric tensor is read
+        by the caller after the round's replay.
+        """
+        world = self.cfg.world_model
         # (B, K, flat) supervision; every step's target is its own stored
         # reset-free successor (the done step's is the pre-reset terminal the
         # assembler wrote). Fields the assembly derives (FK rows, duplicate
         # joint views) are exact, so the residual scheme supervises them too
         # while floating base supervises the physical block they derive from.
-        states = self.assembly.fields_to_flat(batch["states"]).to(self.device)
-        targets = self.assembly.fields_to_flat(batch["next_states"]).to(self.device)
+        states = self._fields_to_flat(batch["states"]).to(self.device)
+        targets = self._fields_to_flat(batch["next_states"]).to(self.device)
         actions = batch["actions"].to(self.device)
         valid = batch["valid"].to(self.device).float()
         loss = states.new_zeros(())
@@ -209,15 +242,15 @@ class ApgLearner:
         nn.utils.clip_grad_norm_(self.dynamics.parameters(), world.max_grad_norm)
         for optimizer in self._optimizers["dynamics"]:
             optimizer.step()
-        return {"apg.wm_loss": self.dynamics.loss_metric(loss.detach(), world.window)}
+        return {"train/wm_loss": self.dynamics.loss_metric(loss.detach(), world.window)}
 
     def update_dynamics_statistics(self, states: dict, actions: torch.Tensor, next_states: dict) -> None:
         """Update structured-model scales from one real full-batch step."""
         with torch.no_grad():
             self.dynamics.update_statistics(
-                self.assembly.fields_to_flat(states).to(self.device),
+                self._fields_to_flat(states).to(self.device),
                 actions.to(self.device),
-                self.assembly.fields_to_flat(next_states).to(self.device),
+                self._fields_to_flat(next_states).to(self.device),
             )
 
     # -- imagination -------------------------------------------------------------
@@ -278,10 +311,10 @@ class ApgLearner:
         # unroll's (already freed) graph before seeding this batch's channels.
         program.rebind_shadow_state(detach=True)
         program.seed_exogenous({name: start_states[name] for name in self._channels if name in start_states})
-        flat = self.assembly.fields_to_flat(start_states)
+        flat = self._fields_to_flat(start_states)
         rewards: list[torch.Tensor] = []
         gates: list[torch.Tensor] = []
-        first = program.observe(self.assembly.flat_to_fields(flat))
+        first = program.observe(self._flat_to_fields(flat))
         value_obs = [first[cfg.value_group]]
         for _ in range(horizon):
             # The actor consumes the history ending at obs(s_t) plus the
@@ -291,7 +324,7 @@ class ApgLearner:
             # successor state, the applied action visible in both).
             action = self.action_limit * self.actor(self._actor_features(history, self.goal_of(value_obs[-1])))
             flat = self.dynamics(flat, action)
-            fields = self.assembly.flat_to_fields(flat)
+            fields = self._flat_to_fields(flat)
             # Fresh shadow state: under autograd every mutable leaf must
             # be written exactly once (BPTT version safety).
             program.rebind_shadow_state()
@@ -321,8 +354,19 @@ class ApgLearner:
 
     def policy_update(self) -> dict[str, float]:
         """One actor BPTT step plus GAE critic regression on the rollout."""
-        cfg = self.cfg
         start_states, history = self._sample_valid_starts()
+        outputs = self._policy_engine({"states": start_states, "history": history})
+        return {key: float(value) for key, value in outputs.items()}
+
+    def _policy_update_core(self, inputs: Mapping[str, object]) -> dict[str, torch.Tensor]:
+        """The whole policy update on staged static inputs: unroll, actor
+        backward with clips, critic regression, actor optimizer steps.
+
+        Capture-safe: fixed shapes, no host syncs, no non-finite-grad skip
+        (upstream steps unconditionally — such a check would force a sync).
+        Returns metric tensors read by the caller after the replay."""
+        cfg = self.cfg
+        start_states, history = inputs["states"], inputs["history"]
 
         # Freeze the dynamics and critic for the actor stage: gradients must
         # not touch their parameters while still flowing through their inputs.
@@ -344,26 +388,32 @@ class ApgLearner:
 
         # The critic regresses on the detached rollout while the actor's
         # gradients sit untouched; the parameters are disjoint, so stepping
-        # the actor afterwards is equivalent to stepping before. Upstream
-        # steps unconditionally — no non-finite-grad skip (it would force a
-        # host sync).
+        # the actor afterwards is equivalent to stepping before.
         critic_loss = self._update_critic(rewards.detach(), gates.detach(), value_obs.detach())
-        row = torch.stack(
-            (
-                actor_loss.detach().mean(),
-                -actor_loss.detach().mean(),
-                grad_norm.detach(),
-                critic_loss,
-            )
-        ).cpu()
         for optimizer in self._optimizers["actor"]:
             optimizer.step()
         return {
-            "apg.policy_loss": float(row[0]),
-            "apg.imag_reward": float(row[1]),
-            "apg.policy_grad_norm": float(row[2]),
-            "apg.value_loss": float(row[3]),
+            "train/policy_loss": actor_loss.detach().mean(),
+            "train/imag_reward": -actor_loss.detach().mean(),
+            "train/policy_grad_norm": grad_norm.detach(),
+            "train/value_loss": critic_loss,
         }
+
+    def _graph_state(self, *, optimizer_keys: tuple[str, ...]) -> list[torch.Tensor]:
+        """What one captured update mutates or reads by tensor identity:
+        every module's parameters and buffers (all three nets feed both
+        updates), plus the named optimizers' state and lr tensors. Per-engine
+        optimizer sets — the WM graph records before the policy optimizers'
+        state exists, so a shared view would misreport lazy init as a move.
+        """
+        state: list[torch.Tensor] = []
+        for module in (self.dynamics, self.actor, self.critic):
+            state += [*module.parameters(), *module.buffers()]
+        for key in optimizer_keys:
+            for optimizer in self._optimizers[key]:
+                state += [t for s in optimizer.state.values() for t in s.values() if torch.is_tensor(t)]
+                state += [group["lr"] for group in optimizer.param_groups if torch.is_tensor(group["lr"])]
+        return state
 
     def _update_critic(self, rewards: torch.Tensor, gates: torch.Tensor, value_obs: torch.Tensor) -> torch.Tensor:
         """GAE(lambda) regression over the imagined rollout, targets detached.

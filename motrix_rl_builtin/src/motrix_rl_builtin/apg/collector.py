@@ -79,6 +79,9 @@ class ApgCollector:
         # Rollout episode summaries for the console panel / curves.
         self.episode_window = EpisodeWindow(max_episodes=100)
         self._episode_return = np.zeros(env.num_envs, dtype=np.float64)
+        # Lengths counted here, not read from state.episode_steps: auto-reset
+        # zeroes that counter inside env.step, before this runs.
+        self._episode_length = np.zeros(env.num_envs, dtype=np.float64)
         self._history: torch.Tensor | None = None
         self._state_pin: torch.Tensor | None = None
         self._state_dev: torch.Tensor | None = None
@@ -213,18 +216,27 @@ class ApgCollector:
         """Fold per-lane episode returns into the window on done rows."""
         state = self.env.state
         self._episode_return += state.reward.double().cpu().numpy()
+        self._episode_length += 1.0
         done = (state.terminated | state.truncated).cpu().numpy()
         if done.any():
-            lengths = (state.episode_steps[torch.as_tensor(done)] + 1).double().numpy()
-            self.episode_window.add(self._episode_return[done].tolist(), lengths.tolist())
+            self.episode_window.add(self._episode_return[done].tolist(), self._episode_length[done].tolist())
             self._episode_return[done] = 0.0
+            self._episode_length[done] = 0.0
 
     # -- loops ----------------------------------------------------------------------
 
     def collect(self, num_steps: int) -> dict[str, float]:
-        """Collect ``num_steps`` policy transitions into the replay."""
+        """Collect ``num_steps`` policy transitions into the replay.
+
+        Returns canonical-taxonomy scalars (see ``wiki/design/live-metrics.md``):
+        rollout means plus the per-term reward and env-metric channels, each as
+        the mean of per-step instantaneous values over this call; the trainer's
+        scalar window then averages across the calls of a logging window.
+        """
         rewards: list[float] = []
         terminations = 0
+        term_sums: dict[str, float] = {}
+        metric_sums: dict[str, float] = {}
         # Upstream adds sigma-0.1 Gaussian noise to the raw action, before the
         # env's per-joint scaling (joint-space magnitude = std * scale_j); the
         # env's own control-range clamping is the only bound.
@@ -247,10 +259,18 @@ class ApgCollector:
             state = self.env.state
             rewards.append(float(state.reward.mean()))
             terminations += int(state.terminated.sum())
+            for name, value in state.reward_terms.items():
+                term_sums[name] = term_sums.get(name, 0.0) + float(value.mean())
+            for name, value in state.metrics.items():
+                # Metric sinks may be boolean flags (e.g. clip_ended); fold
+                # them as their float rate.
+                metric_sums[name] = metric_sums.get(name, 0.0) + float(value.float().mean())
         lane_steps = num_steps * self.env.num_envs
         return {
-            "apg.rollout_reward": float(np.mean(rewards)) if rewards else 0.0,
-            "apg.rollout_terminated_rate": float(terminations) / max(lane_steps, 1),
+            "rollout/env_reward": float(np.mean(rewards)) if rewards else 0.0,
+            "rollout/termination_rate": float(terminations) / max(lane_steps, 1),
+            **{f"reward/{name}": total / num_steps for name, total in term_sums.items()},
+            **{f"metrics/{name}": total / num_steps for name, total in metric_sums.items()},
         }
 
     def evaluate(self, num_steps: int) -> dict[str, float]:
@@ -266,15 +286,18 @@ class ApgCollector:
             done = state.terminated | state.truncated
             terminations += int(state.terminated.sum())
             truncations += int(state.truncated.sum())
-            if bool(done.any()):
-                episode_ends.extend((state.episode_steps[done] + 1).tolist())
+            self._episode_length += 1.0
+            done = done.cpu().numpy()
+            if done.any():
+                episode_ends.extend(self._episode_length[done].tolist())
+                self._episode_length[done] = 0.0
         mean_length = float(np.mean(episode_ends)) if episode_ends else float(num_steps)
         lane_steps = num_steps * self.env.num_envs
         return {
-            "apg.eval_mean_episode_length": mean_length,
-            "apg.eval_completed_episodes": float(len(episode_ends)),
-            "apg.eval_termination_rate": float(terminations) / max(lane_steps, 1),
-            "apg.eval_truncation_rate": float(truncations) / max(lane_steps, 1),
+            "eval/mean_episode_length": mean_length,
+            "eval/completed_episodes": float(len(episode_ends)),
+            "eval/termination_rate": float(terminations) / max(lane_steps, 1),
+            "eval/truncation_rate": float(truncations) / max(lane_steps, 1),
         }
 
     def episode_summary(self) -> EpisodeWindowStats:

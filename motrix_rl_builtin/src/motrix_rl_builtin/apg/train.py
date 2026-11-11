@@ -41,6 +41,7 @@ from motrix_rl.console import (
 )
 from motrix_rl.contracts import TrainerBase, TrainerContext
 from motrix_rl.device import resolve_default_device
+from motrix_rl.live_metrics import ROLLOUT_MEANS, system_scalars
 from motrix_rl.normalize import EmpiricalNormalization
 from motrix_rl.replay import SequenceReplay
 from motrix_rl.training_logger import TrainingLogger
@@ -197,9 +198,7 @@ class Trainer(TrainerBase):
         # consumed by a single encoder (upstream stacks proprioception only;
         # its per-task encoders arrive with a second task, not before).
         all_columns = columns_of(cfg.goal_terms) if cfg.goal_terms else ()
-        goal_columns = (
-            (torch.tensor(all_columns, dtype=torch.long),) if cfg.goal_terms else ()
-        )
+        goal_columns = (torch.tensor(all_columns, dtype=torch.long),) if cfg.goal_terms else ()
         goal_dim = sum(int(columns.shape[0]) for columns in goal_columns)
         # Column of the configured soft-termination term, when the task
         # declares one (upstream's soft WM termination drives the gates).
@@ -402,11 +401,13 @@ class Trainer(TrainerBase):
         panel = TrainingPanelSession.open(title=f"{self._env_name}/motrix.apg")
         last_checkpoint_path: str | None = None
         collect_budget = 0.0
+        last_log_time = start_time
+        last_log_env_steps = start_env_steps
         try:
             for step in range(start_iteration + 1, num_iterations + 1):
                 metrics: dict[str, float] = {"iteration": float(step)}
                 # Upstream keeps a fixed learning rate throughout training.
-                metrics["apg.lr"] = cfg.actor.learning_rate
+                metrics["train/learning_rate"] = cfg.actor.learning_rate
 
                 # One policy update per round, as upstream (its Ratio
                 # mechanism only paces how often rounds happen, never how
@@ -443,6 +444,7 @@ class Trainer(TrainerBase):
                     record_checkpoint(path, step, env_steps)
                     last_checkpoint_path = str(path)
                 if step % logging_interval == 0:
+                    now = time.time()
                     self._emit_window(
                         collector,
                         learner,
@@ -454,10 +456,12 @@ class Trainer(TrainerBase):
                         step=step,
                         num_iterations=num_iterations,
                         env_steps=env_steps,
-                        start_time=start_time,
-                        lr=metrics["apg.lr"],
+                        elapsed=now - start_time,
+                        steps_per_second=(env_steps - last_log_env_steps) / max(now - last_log_time, 1e-9),
+                        lr=metrics["train/learning_rate"],
                         checkpoint_path=last_checkpoint_path,
                     )
+                    last_log_time, last_log_env_steps = now, env_steps
                 if cfg.trainer.eval_interval and step % cfg.trainer.eval_interval == 0:
                     began = time.perf_counter()
                     evals = collector.evaluate(cfg.trainer.eval_steps)
@@ -481,34 +485,48 @@ class Trainer(TrainerBase):
         step: int,
         num_iterations: int,
         env_steps: int,
-        start_time: float,
+        elapsed: float,
+        steps_per_second: float,
         lr: float,
         checkpoint_path: str | None,
     ) -> None:
+        """One logging window: canonical-taxonomy scalars (live-metrics.md §3)
+        to TensorBoard/live, the same sample to the terminal panel."""
         drained = scalars_window.drain(include_range=True)
         episode = collector.episode_summary()
-        elapsed = time.time() - start_time
-        steps_per_second = env_steps / max(elapsed, 1e-9)
+        mean_return = episode.mean_return if episode.mean_return is not None else float("nan")
+        mean_length = episode.mean_length if episode.mean_length is not None else float("nan")
+        collect_ms = timing.mean_ms("collect")
+        learn_ms = timing.mean_ms("learn")
+        learn_pct = (
+            100.0
+            * timing.total_seconds("learn")
+            / max(timing.total_seconds("collect") + timing.total_seconds("learn"), 1e-9)
+        )
         system = system_sampler.sample()
         stats = TrainingPanelStats(
             iteration=step,
             total_iterations=num_iterations,
             steps_per_second=steps_per_second,
             elapsed_seconds=elapsed,
-            mean_return=episode.mean_return if episode.mean_return is not None else float("nan"),
-            mean_episode_length=episode.mean_length if episode.mean_length is not None else float("nan"),
+            mean_return=mean_return,
+            mean_episode_length=mean_length,
             episodes=episode.episodes,
             buffer_size=len(learner.replay),
             buffer_capacity=collector.env.num_envs * self._rlcfg.replay.capacity,
-            collect_ms=timing.mean_ms("collect"),
-            learn_ms=timing.mean_ms("learn"),
-            learn_percent=100.0
-            * timing.total_seconds("learn")
-            / max(timing.total_seconds("collect") + timing.total_seconds("learn"), 1e-9),
+            collect_ms=collect_ms,
+            learn_ms=learn_ms,
+            learn_percent=learn_pct,
             warming=False,
-            training_metrics=drained,
-            reward_terms={},
-            env_metrics={},
+            training_metrics={
+                key: value for key, value in drained.items() if not key.startswith(("reward/", "metrics/"))
+            },
+            reward_terms={
+                key.removeprefix("reward/"): value for key, value in drained.items() if key.startswith("reward/")
+            },
+            env_metrics={
+                key.removeprefix("metrics/"): value for key, value in drained.items() if key.startswith("metrics/")
+            },
             cpu_load=system.cpu_load,
             gpu_utilization_percent=system.gpu_utilization_percent,
             memory_usage=system.memory_usage,
@@ -520,11 +538,18 @@ class Trainer(TrainerBase):
         training_log.scalars(
             {
                 **drained,
-                "apg.lr": lr,
+                "rollout/mean_return": mean_return,
+                "rollout/mean_ep_len": mean_length,
+                "train/learning_rate": lr,
                 "perf/env_steps_per_s": steps_per_second,
+                "perf/collect_ms_per_iter": collect_ms,
+                "perf/learn_ms_per_iter": learn_ms,
+                "perf/learn_pct": learn_pct,
             },
             step=step,
             env_steps=env_steps,
+            live_extra=lambda: system_scalars(stats),
+            placeholders=() if episode.episodes else ROLLOUT_MEANS,
         )
         timing.reset()
 

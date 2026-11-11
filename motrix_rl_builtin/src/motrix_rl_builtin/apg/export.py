@@ -63,9 +63,7 @@ class ApgOnnxExporter(OnnxPolicyExporter):
         normalizer.eval()
         goal_normalizers = ()
         if goal_dim:
-            goal_normalizers = tuple(
-                EmpiricalNormalization(shape=width, device="cpu") for width in goal_slices
-            )
+            goal_normalizers = tuple(EmpiricalNormalization(shape=width, device="cpu") for width in goal_slices)
             for index, goal_normalizer in enumerate(goal_normalizers):
                 goal_normalizer.load_state_dict(
                     _module_state(checkpoint, f"goal_norm_{index}", request.checkpoint), strict=True

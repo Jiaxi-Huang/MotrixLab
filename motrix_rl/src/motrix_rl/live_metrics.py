@@ -1,7 +1,13 @@
 # Copyright Motphys Technology Co., Ltd. 2025, 2026
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host scalars FastSAC adds to its live metrics (see ``wiki/design/live-metrics.md``)."""
+"""Canonical-key helpers shared by the providers that log live metrics.
+
+Protocol-level pieces of ``motrix.metrics/v1`` every provider needs (see
+``wiki/design/live-metrics.md`` §3): the rollout means that stay NaN
+placeholders until the first episode ends, and the fixed live-only ``sys/*``
+key list sampled from a panel frame.
+"""
 
 from __future__ import annotations
 
@@ -9,15 +15,17 @@ from motrix_rl.console import TrainingPanelStats
 
 _GIB = 1024**3
 
-# Rollout means that are a NaN placeholder until the first episode ends.
+#: Rollout means that are a NaN placeholder until the first episode ends;
+#: pass them as ``placeholders`` so live metrics keep their ``nonfinite``
+#: budget for a real divergence.
 ROLLOUT_MEANS = ("rollout/mean_return", "rollout/mean_ep_len")
 
 
 def system_scalars(stats: TrainingPanelStats) -> dict[str, float]:
-    """The fixed ``sys/*`` keys from the samples a panel frame already holds.
+    """The fixed live-only ``sys/*`` keys from the samples a panel frame holds.
 
-    Memory is reported in GiB, like the panel. Per-core CPU load is left out on
-    purpose: it would spend the service's per-run key budget on large hosts.
+    Memory is reported in GiB, like the panel. Per-core CPU load is left out
+    on purpose: it would spend the service's per-run key budget on large hosts.
     """
     scalars: dict[str, float] = {}
     if stats.cpu_load is not None:
