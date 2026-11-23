@@ -305,3 +305,12 @@ def test_shared_ring_counts_are_cumulative_and_synchronous_across_wraps():
         reads += count
         assert_counts()
     assert reads == writes > 2 * capacity
+
+
+def test_normalizer_reexport_is_the_shared_class() -> None:
+    """The normalizer moved to ``motrix_rl.normalize``; the buffer path re-exports it."""
+    from motrix_rl_builtin.fastsac.buffer import EmpiricalNormalization as FromBuffer
+
+    from motrix_rl.normalize import EmpiricalNormalization as Shared
+
+    assert FromBuffer is Shared
