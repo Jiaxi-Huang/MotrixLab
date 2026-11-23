@@ -181,9 +181,12 @@ def rotation_distance(lhs, rhs):
     dx = -w1 * x2 + x1 * w2 - y1 * z2 + z1 * y2
     dy = -w1 * y2 + x1 * z2 + y1 * w2 - z1 * x2
     dz = -w1 * z2 - x1 * y2 + y1 * x2 + z1 * w2
-    imaginary_norm = xp.sqrt(dx * dx + dy * dy + dz * dz)
-    imaginary_norm = xp.where(imaginary_norm < 0.0, 0.0, xp.where(imaginary_norm > 1.0, 1.0, imaginary_norm))
-    return 2.0 * xp.asin(imaginary_norm)
+    # vector_norm has a defined zero gradient at coincidence; atan2 avoids
+    # asin's infinite derivative at a half-turn. Both forms agree for unit
+    # quaternions, including q and -q representing the same orientation.
+    imaginary_norm = xp.linalg.vector_norm(xp.stack((dx, dy, dz), axis=-1), axis=-1)
+    real = xp.abs(x1 * x2 + y1 * y2 + z1 * z2 + w1 * w2)
+    return 2.0 * xp.atan2(imaginary_norm, real)
 
 
 def similarity(q_current, q_target):
