@@ -1,0 +1,22 @@
+# @package _global_
+# Full Uni-SuperMimic network/replay/batch recipe; apply after the local task.
+num_envs: 4096
+checkpoint:
+  interval: 5000
+logging:
+  interval: 125
+algo:
+  asynchronous: true
+  agent:
+    actor_hidden_dims: [2048, 1024, 512, 256]
+    dynamics_hidden_dims: [2048, 2048, 2048]
+    batch_size: 4096
+    buffer_size: 1000
+    world_model:
+      batch_size: 2048
+  trainer:
+    async_options:
+      # A 0.4 update ratio consumes 2–3 collector batches per learner round.
+      ring_capacity: 4
+    # Uni counts learner rounds; Motrix counts collector steps: 10 + 12000 / 0.4.
+    num_learning_iterations: 30010

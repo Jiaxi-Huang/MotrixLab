@@ -23,8 +23,16 @@ class TerminationTerm(BaseTerm):
     """Termination dispatch invocation with manager-allocated metric names."""
 
     metric_names: tuple[str, ...]
+    probability_dispatch: Callable | None
 
-    def __init__(self, dispatch: Callable[..., bool], *args: Any, metric_names: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        dispatch: Callable[..., bool],
+        *args: Any,
+        metric_names: tuple[str, ...] = (),
+        probability_dispatch: Callable | None = None,
+    ) -> None:
+        object.__setattr__(self, "probability_dispatch", probability_dispatch)
         object.__setattr__(self, "metric_names", tuple(metric_names))
         BaseTerm.__init__(self, dispatch, *args)
 
@@ -100,6 +108,7 @@ class TerminationManager:
                 created.dispatch,
                 *canonical_args,
                 metric_names=created.metric_names,
+                probability_dispatch=created.probability_dispatch,
             )
 
     @property

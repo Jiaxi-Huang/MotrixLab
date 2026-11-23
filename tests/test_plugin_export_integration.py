@@ -63,7 +63,9 @@ def _run_with_checkpoint(tmp_path: Path, config: TrainConfig, checkpoint: dict) 
 def test_framework_export_support_matrix() -> None:
     assert frameworks.get_framework("rslrl").supported_policy_exports() == (("torch", "ppo"),)
     assert frameworks.get_framework("skrl").supported_policy_exports() == (("torch", "ppo"),)
-    assert frameworks.get_framework("motrix").supported_policy_exports() == (("torch", "fastsac"),)
+    assert {("torch", "fastsac"), ("torch", "apg")} <= set(
+        frameworks.get_framework("motrix").supported_policy_exports()
+    )
 
 
 def test_export_rejects_non_onnx_output_before_replacing_file(tmp_path: Path) -> None:

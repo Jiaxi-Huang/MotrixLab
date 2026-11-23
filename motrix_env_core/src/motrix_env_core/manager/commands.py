@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, fields
+from dataclasses import field as dataclass_field
 
 import torch
 
 import motrix_env_core.manager.context as context
 from motrix_env_core.config import configclass
+from motrix_env_core.manager.exogenous import ExogenousRule
 
 
 # Keep inherited fields out of base-class slots: Torch 2.7 Dynamo only resolves
@@ -35,6 +37,15 @@ class CommandTerm(abc.ABC):
     """
 
     command: torch.Tensor
+
+    def training_state_dict(self) -> dict[str, torch.Tensor]:
+        """Persistent curriculum state, excluding open episodes and assets."""
+        return {}
+
+    def load_training_state_dict(self, state: dict[str, torch.Tensor]) -> None:
+        """Restore curriculum before opening fresh episodes on resume."""
+        if state:
+            raise ValueError(f"{type(self).__name__} has no persistent training state")
 
     @abc.abstractmethod
     def update(self, ctx: context.ManagerContext) -> None:
@@ -72,6 +83,18 @@ class CommandTerm(abc.ABC):
 
 @configclass(kw_only=True)
 class CommandCfg(abc.ABC):
+    """Configuration that creates one environment-local command term.
+
+    ``exogenous`` annotates which per-environment state leaves are exogenous
+    channels (not world-model-predicted) and how imagination advances them —
+    one :class:`ExogenousRule` (kind discriminator) per dotted leaf path.
+    The annotation derives the imagination semantics and never changes real
+    path behavior (see the dual-path modeling design); unannotated leaves
+    stay ordinary state.
+    """
+
+    exogenous: dict[str, ExogenousRule] = dataclass_field(default_factory=dict)
+
     @abc.abstractmethod
     def __call__(self, ctx: context.BuildContext) -> CommandTerm:
         """Construct one independently owned command term without an environment."""

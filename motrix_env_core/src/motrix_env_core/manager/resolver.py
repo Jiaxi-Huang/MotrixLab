@@ -35,6 +35,7 @@ from motrix_env_core.manager.kernel_data import (
 from motrix_env_core.manager.observations import ObservationGroupEntry, ObsTerm
 from motrix_env_core.manager.rewards import RewardTerm
 from motrix_env_core.manager.terminations import TerminationTerm
+from motrix_env_core.manager.terms import BaseTerm
 from motrix_env_core.manager.truncations import TruncationTerm
 from motrix_env_core.sim import PhysicsReadProgram, SimDataQuery
 
@@ -196,6 +197,7 @@ class TerminationTermCall(TermCall):
     """One termination term call with its resolver-assigned buffer column."""
 
     index: int
+    probability_function: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -339,8 +341,15 @@ class ManagerTermResolver:
         )
 
     def resolve_termination(self, name: str, index: int, term: TerminationTerm) -> TerminationTermCall:
+        if term.probability_dispatch is not None:
+            self._resolve_dispatch_args(
+                "termination probability", name, BaseTerm(term.probability_dispatch, *term.args)
+            )
         return TerminationTermCall(
-            function=term.dispatch, args=self._resolve_dispatch_args("termination", name, term), index=index
+            function=term.dispatch,
+            args=self._resolve_dispatch_args("termination", name, term),
+            index=index,
+            probability_function=term.probability_dispatch,
         )
 
     def resolve_truncation(self, name: str, index: int, term: TruncationTerm) -> TruncationTermCall:

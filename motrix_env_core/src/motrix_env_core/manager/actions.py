@@ -61,6 +61,10 @@ class ActionState:
 class ActionTerm(abc.ABC):
     """Extensible host-side action pipeline with kernel-bound state."""
 
+    # Shared tensor leaves must not be mistaken for batch state when their
+    # leading dimension happens to equal the collector's environment count.
+    modeling_shared_fields: tuple[str, ...] = ("action_ptr",)
+
     def __init__(self, action_space: gym.spaces.Box, state: ActionState) -> None:
         if not isinstance(action_space, gym.spaces.Box):
             raise TypeError("ActionTerm action_space must be a gym.spaces.Box.")
@@ -72,9 +76,9 @@ class ActionTerm(abc.ABC):
     def process(self, actions: torch.Tensor) -> torch.Tensor | None:
         """Record raw tensor actions and process one batched action slice."""
         state = self.state
-        ptr = (int(state.action_ptr[0]) + 1) % state.action_queue.shape[1]
-        state.action_ptr[0] = ptr
-        state.action_queue[:, ptr] = actions
+        state.action_ptr.copy_((state.action_ptr + 1) % state.action_queue.shape[1])
+        index = state.action_ptr.view(1, 1, 1).expand(actions.shape[0], 1, actions.shape[1])
+        state.action_queue.scatter_(1, index, actions[:, None, :])
         return self._process(actions)
 
     @abc.abstractmethod
