@@ -70,6 +70,12 @@ class WalkResetParams:
         base_mass_off_range: ``(min, max)`` additive base mass offset in kg.
         com_noise: Per-axis uniform offset width ``(x, y, z)`` in m for the
             base center of mass.
+        kp_randomized ... com_randomized: Build-time gates for the range
+            pairs above. The kernel branches on these Python bools (trace-time
+            constants) instead of reading the tensors — ``float()`` on a
+            tensor inside the compiled reset kernel is a graph break, and a
+            break materializes the compact-axis staging tensors as static
+            inputs in the resume frame.
     """
 
     default_joint_angles: torch.Tensor
@@ -90,6 +96,13 @@ class WalkResetParams:
     mass_scale_range: torch.Tensor
     base_mass_off_range: torch.Tensor
     com_noise: torch.Tensor
+    # Build-time randomization gates (see class docstring).
+    kp_randomized: bool
+    damping_randomized: bool
+    friction_randomized: bool
+    mass_randomized: bool
+    base_mass_randomized: bool
+    com_randomized: bool
 
 
 def _sample_spawn_xy(
@@ -116,13 +129,13 @@ def _sample_randomized_dynamics(
 ) -> None:
     """Sample randomized dynamics into the reset write buffers on compact rows."""
     count = env_ids.numel()
-    if float(params.kp_range[1]) > float(params.kp_range[0]):
+    if params.kp_randomized:
         u = ctx.rand.uniform(
             (count, params.kp_default.numel()), dtype=params.kp_default.dtype, device=params.kp_default.device
         )
         scale = _uniform_range(u, params.kp_range[0], params.kp_range[1])
         sim_writes["kp"][:] = params.kp_default * scale
-    if float(params.damping_range[1]) > float(params.damping_range[0]):
+    if params.damping_randomized:
         u = ctx.rand.uniform(
             (count, params.damping_default.numel()),
             dtype=params.damping_default.dtype,
@@ -130,15 +143,15 @@ def _sample_randomized_dynamics(
         )
         scale = _uniform_range(u, params.damping_range[0], params.damping_range[1])
         sim_writes["damping"][:] = params.damping_default * scale
-    if float(params.friction_range[1]) > float(params.friction_range[0]):
+    if params.friction_randomized:
         ratio = _uniform_range(
             ctx.rand.uniform((count, 1), dtype=params.friction_default.dtype, device=params.friction_default.device),
             params.friction_range[0],
             params.friction_range[1],
         )
         sim_writes["friction"][:, 0, :] = params.friction_default * ratio
-    mass_randomized = float(params.mass_scale_range[1]) > float(params.mass_scale_range[0])
-    base_mass_randomized = float(params.base_mass_off_range[1]) > float(params.base_mass_off_range[0])
+    mass_randomized = params.mass_randomized
+    base_mass_randomized = params.base_mass_randomized
     if mass_randomized or base_mass_randomized:
         u = ctx.rand.uniform(
             (count, params.link_mass_default.numel()),
@@ -155,7 +168,7 @@ def _sample_randomized_dynamics(
         )
         sim_writes["mass"][:] = values
     noise = params.com_noise
-    if float(noise[0]) > 0.0 or float(noise[1]) > 0.0 or float(noise[2]) > 0.0:
+    if params.com_randomized:
         u = ctx.rand.uniform((count, 3), dtype=noise.dtype, device=noise.device)
         offsets = _uniform_range(u, -noise, noise)
         sim_writes["com"][:, 0, :] = params.base_com_default + offsets
@@ -271,6 +284,23 @@ class WalkStateResetCfg(ResetTermCfg):
             )
             others = ctx.model.others
             link_masses = others["randomize_link_masses"]
+            kp_range = torch.tensor(randomization.kp_scale_range, dtype=torch.float32)
+            damping_range = torch.tensor(randomization.damping_scale_range, dtype=torch.float32)
+            friction_range = torch.from_numpy(
+                np.asarray(
+                    (1.0, 1.0)
+                    if randomization.sliding_friction_range is None
+                    else randomization.sliding_friction_range,
+                    dtype=np.float32,
+                )
+            )
+            mass_scale_range = torch.tensor(randomization.link_mass_scale_range, dtype=torch.float32)
+            base_mass_off_range = torch.from_numpy(np.asarray(randomization.base_mass_offset_range, dtype=np.float32))
+            com_noise = torch.tensor(randomization.base_com_offset_noise, dtype=torch.float32)
+
+            def range_active(pair: torch.Tensor) -> bool:
+                return bool((pair[1] > pair[0]).item())
+
             params.update(
                 randomization_enabled=True,
                 kp_default=others["actuator_kp"],
@@ -280,21 +310,20 @@ class WalkStateResetCfg(ResetTermCfg):
                 base_mass_default=float(link_masses[base_index]),
                 base_com_default=others["randomize_base_com"],
                 friction_default=others["randomize_friction_default"],
-                kp_range=torch.tensor(randomization.kp_scale_range, dtype=torch.float32),
-                damping_range=torch.tensor(randomization.damping_scale_range, dtype=torch.float32),
-                friction_range=torch.from_numpy(
-                    np.asarray(
-                        (1.0, 1.0)
-                        if randomization.sliding_friction_range is None
-                        else randomization.sliding_friction_range,
-                        dtype=np.float32,
-                    )
-                ),
-                mass_scale_range=torch.tensor(randomization.link_mass_scale_range, dtype=torch.float32),
-                base_mass_off_range=torch.from_numpy(
-                    np.asarray(randomization.base_mass_offset_range, dtype=np.float32)
-                ),
-                com_noise=torch.tensor(randomization.base_com_offset_noise, dtype=torch.float32),
+                kp_range=kp_range,
+                damping_range=damping_range,
+                friction_range=friction_range,
+                mass_scale_range=mass_scale_range,
+                base_mass_off_range=base_mass_off_range,
+                com_noise=com_noise,
+                # Gates derived from the same tensors the kernel samples with,
+                # so a float32-degenerate range disables the item identically.
+                kp_randomized=range_active(kp_range),
+                damping_randomized=range_active(damping_range),
+                friction_randomized=range_active(friction_range),
+                mass_randomized=range_active(mass_scale_range),
+                base_mass_randomized=range_active(base_mass_off_range),
+                com_randomized=bool((com_noise > 0.0).any().item()),
             )
         else:
             params.update(
@@ -312,6 +341,12 @@ class WalkStateResetCfg(ResetTermCfg):
                 mass_scale_range=torch.ones(2, dtype=torch.float32),
                 base_mass_off_range=torch.zeros(2, dtype=torch.float32),
                 com_noise=torch.zeros(3, dtype=torch.float32),
+                kp_randomized=False,
+                damping_randomized=False,
+                friction_randomized=False,
+                mass_randomized=False,
+                base_mass_randomized=False,
+                com_randomized=False,
             )
 
         kernel = reset_walk_state_randomized if randomization.enabled else reset_walk_state
