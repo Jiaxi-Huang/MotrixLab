@@ -40,6 +40,10 @@
 
 - [ArrayEnv 终态观测结果契约](./array-env-final-observation.md)
   NumPy 前端的稀疏终态观测结果、捕获时机、快照所有权与 Manager/FastSAC 边界。
+- [APG（WM/BPTT）Trainer 设计与路线图](./wm-bptt-trainer.md)
+  在 provider 插件与 schema 驱动传输层之上分阶段支持 world model + 想象 BPTT trainer：环境侧课程基建（motion 起点采样器统一为 sampling_mode 驱动、多 clip 感知的 uniform/adaptive/return sampler 族）、派生式任务侧契约（manager 执行器内化双路径编译，modeling view 从声明 read 集与 cfg 外生注记派生，任务侧零 python、APG 变体为家族单文件）、FinalState 终态捕获与传输定案、任务无关的 `motrix.apg` provider 与 RL 侧序列数据平面；附五阶段（各含独立可合入 commit）路线图，packed 多 clip 传输优化列为后续项。
+- [APG Trainer 设计开发总结](./apg-trainer-summary.md)
+  相对 main 基线（`1ddbb5d` → `4a42758`）的跨层快照：RL 侧算法/优化时间线与 5090 吞吐演进（同卡配对最高 +74%，稳态 27–31k env-steps/s）、LAFAN1 最佳 40/40（单 seed 单点）；env 侧双路径建模与任务接入约束；RL↔env 三通道数据传输、H2D 已优化项与剩余清单。附总体架构、双路径建模、数据面与 learner 编译边界四张 SVG；设计细节归 wm-bptt-trainer.md 等原文，验收证据归实施计划。
 
 ## 使用说明
 
