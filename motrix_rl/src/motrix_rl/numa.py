@@ -471,3 +471,133 @@ def _gpu_node_from_topology(device_index: int) -> int | None:
         if overlap > best_overlap:
             best_node, best_overlap = node, overlap
     return best_node
+
+
+def available_cpu_ids() -> set[int]:
+    """CPU ids this process may run on (Linux affinity mask, Windows process mask)."""
+    if hasattr(os, "sched_getaffinity"):
+        return set(os.sched_getaffinity(0))
+    if sys.platform == "win32":
+        import ctypes
+
+        process_mask = ctypes.c_ulonglong()
+        system_mask = ctypes.c_ulonglong()
+        kernel32 = ctypes.windll.kernel32
+        got = kernel32.GetProcessAffinityMask(
+            kernel32.GetCurrentProcess(), ctypes.byref(process_mask), ctypes.byref(system_mask)
+        )
+        if got:
+            return {i for i in range(64) if process_mask.value & (1 << i)}
+    return set(range(os.cpu_count() or 1))
+
+
+def _set_worker_cpu_affinity(cpus: set[int]) -> None:
+    """Pin this process to ``cpus``; best-effort and never fatal.
+
+    Raises OSError (or skips with a warning on platforms without an affinity
+    API) so the caller can decide; permission-constrained environments
+    (cgroups/cpusets) degrade to a warning instead of killing the worker.
+    """
+    if hasattr(os, "sched_setaffinity"):
+        os.sched_setaffinity(0, cpus)
+    elif sys.platform == "win32":
+        import ctypes
+
+        mask = ctypes.c_ulonglong(sum(1 << c for c in cpus))
+        current = ctypes.windll.kernel32.GetCurrentProcess()
+        if not ctypes.windll.kernel32.SetProcessAffinityMask(current, mask):
+            raise OSError(f"SetProcessAffinityMask failed for cpus {sorted(cpus)}")
+    else:
+        logging.getLogger(__name__).warning(
+            "CPU affinity is unsupported on this platform; skipping pinning to %s", sorted(cpus)
+        )
+
+
+def resolve_worker_cpus(spec: str | None, field: str) -> set[int]:
+    """Resolve one worker's CPU affinity from a spec like ``"0:5,7"``.
+
+    Each comma-separated item is a single core id or an inclusive ``A:B``
+    range; cores outside the process's available set are dropped. An empty
+    spec or an empty effective set disables pinning.
+    """
+    if not spec:
+        return set()
+    available = available_cpu_ids()
+    cpus: set[int] = set()
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            if ":" in item:
+                start_s, _, end_s = item.partition(":")
+                start, end = int(start_s), int(end_s)
+            else:
+                start = end = int(item)
+        except ValueError as exc:
+            raise ValueError(
+                f"{field}='{spec}': invalid core spec item '{item}' "
+                "(expected core ids or inclusive A:B ranges, e.g. '0:5,7')"
+            ) from exc
+        if start > end:
+            raise ValueError(f"{field}='{spec}': range '{item}' has start > end")
+        # Clamp to the available core span instead of enumerating the raw
+        # range: a typo like 0:1000000000 must not iterate billions of ids.
+        lo, hi = min(available), max(available)
+        cpus.update(range(max(start, lo), min(end, hi) + 1))
+    return cpus & available
+
+
+def pin_worker_cpus(cpus: set[int]) -> None:
+    """Pin this worker process and cap its torch threads to its CPU slice.
+
+    The thread cap applies even when the affinity call fails (cgroup/cpuset
+    constraints): limiting torch to the configured core count still reduces
+    CPU contention when running unpinned.
+    """
+    if not cpus:
+        return
+    try:
+        _set_worker_cpu_affinity(cpus)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("CPU pinning to %s failed (%s); continuing unpinned", sorted(cpus), exc)
+    import torch
+
+    torch.set_num_threads(max(len(cpus), 1))
+
+
+@contextlib.contextmanager
+def spawn_worker_cpus(initial_cpus: set[int] | None):
+    """Spawn under the parent's original allocation, then restore its learner slice.
+
+    Pass the allocation captured before pinning the parent. This does not
+    change the parent's thread budget and never selects CPUs outside that
+    original allocation. Child workers apply their own slice on entry.
+    """
+    if initial_cpus is None:
+        yield
+        return
+    current = available_cpu_ids()
+    if current == initial_cpus:
+        yield
+        return
+    try:
+        _set_worker_cpu_affinity(initial_cpus)
+        yield
+    finally:
+        _set_worker_cpu_affinity(current)
+
+
+def log_worker_resources(role: str) -> None:
+    """Record the effective process budget; importing NUMA helpers stays Torch-free."""
+    import torch
+
+    logger.info(
+        "%s runtime: cpus=%s torch_threads=%s interop_threads=%s OMP_NUM_THREADS=%s MKL_NUM_THREADS=%s",
+        role,
+        sorted(available_cpu_ids()),
+        torch.get_num_threads(),
+        torch.get_num_interop_threads(),
+        os.environ.get("OMP_NUM_THREADS"),
+        os.environ.get("MKL_NUM_THREADS"),
+    )
