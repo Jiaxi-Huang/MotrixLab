@@ -10,6 +10,7 @@ without a simulator backend.
 """
 
 from dataclasses import dataclass, fields, replace
+from dataclasses import field as dataclass_field
 
 import gymnasium as gym
 import numpy as np
@@ -34,12 +35,15 @@ from motrix_env_core.manager import (  # noqa: E402
     ManagerObservationsCfg,
     ManagerRewardsCfg,
     ManagerTerminationsCfg,
+    ManagerTruncationsCfg,
     ObservationTermCfg,
     ObsTerm,
     RewardTerm,
     RewardTermCfg,
     TerminationTerm,
     TerminationTermCfg,
+    TruncationTerm,
+    TruncationTermCfg,
     metric,
 )
 from motrix_env_core.manager.context import BuildContext
@@ -189,6 +193,25 @@ class _InjectedTerminationCfg(TerminationTermCfg):
         )
 
 
+def _injected_truncation(ctx: ManagerContext, threshold) -> bool:
+    value = ctx.actions["test"].source[:, 0]
+    ctx.metrics["source_at_truncation"][:, 0] = value
+    return value >= threshold
+
+
+@configclass(kw_only=True)
+class _InjectedTruncationCfg(TruncationTermCfg):
+    threshold: float
+
+    def __call__(self, env: ManagerEnv) -> TruncationTerm:
+        del env
+        return TruncationTerm(
+            _injected_truncation,
+            float(self.threshold),
+            metric_names=("source_at_truncation",),
+        )
+
+
 @configclass(kw_only=True)
 class _TestActionCfg(ActionCfg):
     actuator_names: tuple[str, ...] = ()
@@ -226,20 +249,50 @@ class _CounterCommandCfg(CommandCfg):
     def __call__(self, ctx: BuildContext) -> CommandTerm:
         shape = (ctx.num_envs, 1)
         return _CounterCommand(
-            double=torch.zeros(shape, dtype=torch.float32),
+            lanes=_CounterLanes(
+                torch.zeros(shape, dtype=torch.float32),
+                torch.arange(4, dtype=torch.float32),
+            ),
             command=torch.zeros(shape, dtype=torch.float32),
+            double=torch.zeros(shape, dtype=torch.float32),
+            reward_sum=torch.zeros(shape, dtype=torch.float32),
         )
 
 
 @dataclass(frozen=True, slots=True)
+class _CounterGauges:
+    """Nested kernel-data sub-object carrying its own metric gauge."""
+
+    step_sum: torch.Tensor = metric(name="counter_step_sum", scalar=True)
+
+
+@dataclass(frozen=True, slots=True)
+class _CounterLanes:
+    """Nested command state mixing per-env rows with a shared constant table.
+
+    Mirrors WBT's sampler-in-command shape: ``marks`` is per-lane state the
+    terminal-state capture must gather, ``table`` is episode-independent
+    shared data (clip-scale constants) with no row semantics.
+    """
+
+    marks: torch.Tensor
+    table: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
 class _CounterCommand(CommandTerm):
+    lanes: _CounterLanes
     double: torch.Tensor = metric()
+    reward_sum: torch.Tensor = metric(name="reward_sum")
+    gauges: _CounterGauges = dataclass_field(default_factory=_CounterGauges)
 
     def update(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.double[:, 0] = 2.0 * ctx.actions["test"].source[:, 0]
 
     def advance(self: "_CounterCommand", ctx: ManagerContext) -> None:
         self.command[:, 0] += ctx.dt
+        self.reward_sum[:, 0] += ctx.reward
+        self.gauges.step_sum.copy_(self.gauges.step_sum + 1.0)
 
     def reset(self: "_CounterCommand", ctx: ManagerContext, env_ids: torch.Tensor, episode_reset: torch.Tensor) -> None:
         self.command[env_ids, 0] = -1.0
@@ -265,6 +318,11 @@ class _ManagerRewardsCfg(ManagerRewardsCfg):
 @configclass
 class _ManagerTerminationsCfg(ManagerTerminationsCfg):
     limit: _InjectedTerminationCfg = _InjectedTerminationCfg(threshold=0.5)
+
+
+@configclass
+class _ManagerTruncationsGroupCfg(ManagerTruncationsCfg):
+    time_style: _InjectedTruncationCfg = _InjectedTruncationCfg(threshold=0.5)
 
 
 def _manager_groups(*, scale: float = 3.0, threshold: float = 0.5, reward_weight: float = 2.0) -> ManagerBasedEnvCfg:
@@ -295,6 +353,7 @@ class _ManagerEnvCfg(ManagerBasedEnvCfg):
     observations: _ManagerObservationsCfg = _manager_groups().observations
     rewards: _ManagerRewardsCfg = _manager_groups().rewards
     terminations: _ManagerTerminationsCfg = _manager_groups().terminations
+    truncations: dict[str, TruncationTermCfg] = dataclass_field(default_factory=dict)
 
 
 class _ManagerEnv(ManagerEnv[EnvCfg]):
@@ -749,6 +808,39 @@ def test_manager_context_is_injected_once_and_reused_across_all_term_kinds() -> 
     assert env._compiled_manager_program is not None
 
 
+def test_nested_kernel_data_metrics_are_materialized_and_collected() -> None:
+    env = _ManagerEnv(num_envs=2)
+    command = _counter_command(env)
+    state = env.step(torch.zeros((2, 1), dtype=torch.float32))
+
+    # The nested gauge was materialized at construction and registered under
+    # its declared name; the advance hook wrote through it.
+    assert "counter_step_sum" in env.metrics
+    assert env.metrics["counter_step_sum"].data_ptr() == command.gauges.step_sum.data_ptr()
+    assert command.gauges.step_sum.item() == 1.0
+    assert state.metrics["counter_step_sum"].item() == 1.0
+    assert state.process_metrics()["counter_step_sum"] == 1.0
+
+
+def test_context_reward_mirrors_state_reward_in_advance_hook() -> None:
+    env = _ManagerEnv(num_envs=2)
+    command = _counter_command(env)
+    first = env.step(torch.full((2, 1), 0.1, dtype=torch.float32))
+    assert env._compiled_manager_program is not None
+    context = env._compiled_manager_program.context
+    first_reward = first.reward.clone()
+    # The mirror shares storage with the state reward from birth, and the
+    # advance hook already saw the transition the evaluate kernel just wrote
+    # (not the previous step's total).
+    assert context.reward is first.reward
+    np.testing.assert_allclose(command.reward_sum[:, 0], first_reward)
+    np.testing.assert_allclose(context.reward, first_reward)
+
+    second = env.step(torch.full((2, 1), 0.2, dtype=torch.float32))
+    assert context.reward is second.reward
+    np.testing.assert_allclose(command.reward_sum[:, 0], first_reward + second.reward)
+
+
 def test_reset_keeps_command_metric_alias_for_direct_context() -> None:
     env = _ManagerEnv(num_envs=2)
     state = env.init_state()
@@ -839,7 +931,11 @@ def test_reset_passes_compact_episode_reset_in_selected_lane_order(
     @configclass
     class EpisodeCommandCfg(CommandCfg):
         def __call__(self, ctx: BuildContext) -> CommandTerm:
-            return EpisodeCommand(command=torch.zeros(ctx.num_envs, 1), double=torch.zeros(ctx.num_envs, 1))
+            return EpisodeCommand(
+                lanes=_CounterLanes(torch.zeros(ctx.num_envs, 1), torch.arange(4, dtype=torch.float32)),
+                command=torch.zeros(ctx.num_envs, 1),
+                double=torch.zeros(ctx.num_envs, 1),
+            )
 
     cfg = _ManagerEnvCfg(commands={"counter": EpisodeCommandCfg()})
     env = ManagerEnv(cfg, num_envs=4)
@@ -882,6 +978,65 @@ def test_truncated_envs_reset_before_observation() -> None:
     np.testing.assert_array_equal(state.episode_steps, 0)
     np.testing.assert_array_equal(state.obs.policy[:, 0], 1.75)
     np.testing.assert_allclose(state.reward, 0.005)
+
+
+def test_truncation_terms_or_into_truncated_and_publish_masks() -> None:
+    cfg = _ManagerEnvCfg(truncations={"time_style": _InjectedTruncationCfg(threshold=0.5)})
+    env = ManagerEnv(cfg, num_envs=3)
+
+    state = env.step(torch.tensor([[0.25], [0.75], [0.5]], dtype=torch.float32))
+
+    # The truncation-term union ORs into the shared truncated buffer (one
+    # tensor with ctx.truncated from birth), independent of terminations.
+    np.testing.assert_array_equal(state.truncated, [False, True, True])
+    np.testing.assert_array_equal(state.terminated, [False, True, True])
+    context = env._compiled_manager_program.context
+    assert context.truncated is state.truncated
+    # The per-term mask column surfaces under the declaration name and the
+    # diagnostic metric tensor allocated at build time is written in place.
+    np.testing.assert_array_equal(state.metrics["time_style"], [False, True, True])
+    np.testing.assert_allclose(state.metrics["source_at_truncation"], [0.25, 0.75, 0.5])
+
+
+def test_truncation_terms_or_with_time_limit_and_capture_final_obs() -> None:
+    cfg = _ManagerEnvCfg(truncations={"time_style": _InjectedTruncationCfg(threshold=0.5)})
+    cfg.max_episode_seconds = 0.03
+    env = ManagerEnv(cfg, num_envs=2)
+    env.init_state()
+
+    # Step 1 of 3: only the term-truncated lane ends; its final observation
+    # is captured exactly like a time-limit truncation's.
+    first = env.step(torch.tensor([[0.25], [0.75]], dtype=torch.float32))
+    np.testing.assert_array_equal(first.truncated, [False, True])
+    assert first.final_obs is not None
+    np.testing.assert_array_equal(first.final_obs.env_ids, [1])
+
+    # Steps 2-3: the time limit folds in on top of the term union without
+    # overwriting it. Lane 0 reaches its 3-step limit; lane 1's episode
+    # restarted at its step-1 truncation, so it is only on step 2 and stays
+    # alive — the mask column attributes every end to the right source.
+    env.step(torch.tensor([[0.25], [0.25]], dtype=torch.float32))
+    third = env.step(torch.tensor([[0.25], [0.25]], dtype=torch.float32))
+    np.testing.assert_array_equal(third.truncated, [True, False])
+    np.testing.assert_array_equal(third.metrics["time_style"], [False, False])
+    assert third.final_obs is not None
+    np.testing.assert_array_equal(third.final_obs.env_ids, [0])
+
+
+def test_truncation_terms_accept_typed_group_and_reject_shared_names() -> None:
+    cfg = _ManagerEnvCfg(truncations=_ManagerTruncationsGroupCfg())
+    env = ManagerEnv(cfg, num_envs=2)
+    state = env.step(torch.tensor([[0.25], [0.75]], dtype=torch.float32))
+    np.testing.assert_array_equal(state.truncated, [False, True])
+
+    # Termination and truncation mask columns share the flat metrics
+    # namespace; a shared declaration name fails fast at program resolution.
+    clash = _ManagerEnvCfg(
+        truncations={"limit": _InjectedTruncationCfg(threshold=0.5)},
+    )
+    env = ManagerEnv(clash, num_envs=2)
+    with pytest.raises(ValueError, match="must be distinct"):
+        env.init_state()
 
 
 @pytest.mark.parametrize("with_value", [False, True])
