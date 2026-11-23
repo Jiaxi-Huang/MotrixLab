@@ -3,7 +3,6 @@
 
 """Command terms for manager-based whole-body tracking."""
 
-import math
 from dataclasses import dataclass
 
 import torch
@@ -12,42 +11,23 @@ from omegaconf import MISSING
 from motrix_env_core.config import configclass
 from motrix_env_core.config.scene import RobotCfg
 from motrix_env_core.manager import (
+    CommandCfg,
+    CommandTerm,
     ManagerContext,
     metric,
 )
-from motrix_env_core.manager.commands import CommandCfg, CommandTerm
 from motrix_env_core.manager.context import BuildContext
 from motrix_env_core.math.quaternion import align_targets
 from motrix_envs.motion import MotionLibrary, WbtMotionClip
+from motrix_envs.motion.sampler import (
+    AdaptiveTimestepsSampler,
+    MotionStartSampler,
+    ReturnTimestepsSampler,
+    UniformTimestepsSampler,
+    max_discounted_return,
+)
 
-
-def _sample_motion_step(
-    draws: torch.Tensor,
-    sampling_cdf: torch.Tensor,
-    num_frames: int,
-    start_zero_prob: torch.Tensor,
-) -> torch.Tensor:
-    """Batched start-frame sampling from pre-drawn uniform samples.
-
-    ``draws`` is ``(N, 2)`` without adaptive sampling or ``(N, 3)`` with it —
-    one unit draw, optionally one within-bin draw, and one start-at-zero draw
-    per lane, matching the fixed draw order.
-    """
-    unit = (draws[:, :1] + 1.0) * 0.5
-    adaptive = sampling_cdf.numel() != 0
-    if adaptive:
-        # ``sum(cdf < unit)`` is search-left: equality selects the equal bin,
-        # matching the per-lane linear scan that stops at ``unit <= cdf[bin]``.
-        bin_id = (sampling_cdf[None, :] < unit).sum(dim=1, dtype=torch.int64)
-        bin_unit = (draws[:, 1:2] + 1.0) * 0.5
-        phase = (bin_id.to(torch.float32) + bin_unit[:, 0]) / sampling_cdf.numel()
-        step_value = phase * num_frames
-    else:
-        step_value = unit[:, 0] * (num_frames - 1)
-    step_value = torch.clamp(step_value, min=0.0, max=float(num_frames - 2))
-    steps = step_value.to(torch.int64)
-    zero_unit = (draws[:, -1:] + 1.0) * 0.5
-    return torch.where(zero_unit[:, 0] < start_zero_prob, torch.zeros_like(steps), steps)
+_SAMPLING_MODES = ("uniform", "adaptive", "return")
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,8 +37,10 @@ class WbtMotionCommand(CommandTerm):
     Clip arrays are shared and indexed by the per-environment ``steps`` vector.
     :meth:`update` aligns the selected frame to the simulated robot's current
     reference body, the kernel hooks :meth:`advance` / :meth:`reset`
-    advance and resample the per-lane frame index, and host-side lifecycle
-    methods maintain adaptive-sampling statistics and the sampling distribution.
+    advance and resample the per-lane frame index, and the nested
+    :attr:`sampler` owns the start-frame curriculum (statistics, sampling
+    distribution, and its gauges) for whichever ``sampling_mode`` the config
+    selected.
 
     Attributes:
         clip: Shared numeric reference-motion corpus in model and tracked-body
@@ -69,8 +51,9 @@ class WbtMotionCommand(CommandTerm):
             (inherited ``CommandTerm.command``).
         target_body_position_relative: Tracked-body targets aligned to the current robot pose.
         target_body_orientation_relative: Aligned tracked-body target quaternions.
-        adaptive_bin_failed_count: Exponential moving failure count for each sampling bin.
-        adaptive_current_bin_failed_count: Failure counts accumulated in the current update.
+        sampler: Start-frame curriculum owning all sampling statistics and
+            its ``metric()`` gauges (see
+            :class:`~motrix_envs.motion.sampler.MotionStartSampler`).
         start_at_timestep_zero_prob: Probability that a reset starts at frame zero.
         hold_at_clip_end: Whether lanes remain on a final frame instead of
             resetting — the lane's own clip end without ``sequential_clips``,
@@ -80,10 +63,6 @@ class WbtMotionCommand(CommandTerm):
             current frame on every reset instead of resampling, and at the
             corpus end either loop back to the head or, with
             ``hold_at_clip_end``, hold on the final frame.
-        uniform_ratio: Uniform prior mass added to adaptive sampling probabilities.
-        alpha: Update rate for adaptive failure-count statistics.
-        kernel_size: Number of bins used to smooth adaptive probabilities.
-        kernel_lambda: Exponential decay factor of the smoothing kernel.
         steps: Current reference-frame index for every environment.
         clip_ended: Whether each environment advanced beyond the final frame.
     """
@@ -96,19 +75,13 @@ class WbtMotionCommand(CommandTerm):
     target_body_position_relative: torch.Tensor
     target_body_orientation_relative: torch.Tensor
 
-    # Host-side adaptive frame-sampling state and parameters. Host hooks
-    # operate on the tensors directly; kernels write the per-env members
-    # through the tensors themselves.
-    adaptive_bin_failed_count: torch.Tensor
-    adaptive_current_bin_failed_count: torch.Tensor
-    sampling_cdf: torch.Tensor
+    # Start-frame curriculum: owns the sampling statistics, distribution, and
+    # gauges for the configured sampling_mode.
+    sampler: MotionStartSampler
+
     start_at_timestep_zero_prob: float
     hold_at_clip_end: bool
     sequential_clips: bool
-    uniform_ratio: float
-    alpha: float
-    kernel_size: int
-    kernel_lambda: float
 
     # Per-environment frame state exposed through the manager metrics system.
     # Kept as ``(num_envs, 1)`` whole-batch tensors: the Torch executor hooks
@@ -116,12 +89,6 @@ class WbtMotionCommand(CommandTerm):
     # indices in place through these tensors.
     steps: torch.Tensor = metric(name="motion_step", dtype=torch.float32)
     clip_ended: torch.Tensor = metric()
-
-    # Batch-level adaptive-sampling gauges written by the reset kernel.
-    adaptive_entropy: torch.Tensor = metric(name="adaptive_sampling_entropy", scalar=True)
-    adaptive_top1_prob: torch.Tensor = metric(name="adaptive_sampling_top1_prob", scalar=True)
-    adaptive_top1_bin: torch.Tensor = metric(name="adaptive_sampling_top1_bin", scalar=True)
-    adaptive_failure_mass: torch.Tensor = metric(name="adaptive_failure_mass", scalar=True)
 
     # -- Kernel hooks ----------------------------------------------------------
     # These hooks receive a batched context (all tensors whole-batch) and run
@@ -148,13 +115,8 @@ class WbtMotionCommand(CommandTerm):
 
     def advance(self: "WbtMotionCommand", ctx: ManagerContext) -> None:
         """Advance every lane one frame."""
-        # Fold the transition's failure mass into the adaptive sampler here
-        # (first, so every branch below runs it): whole-batch shared state,
-        # previously a separate host on_transition phase.
-        failed = self.adaptive_bin_failed_count
-        if failed.numel():
-            failed.mul_(1.0 - self.alpha).add_(self.adaptive_current_bin_failed_count, alpha=self.alpha)
-            self.adaptive_current_bin_failed_count.zero_()
+        # Per-transition curriculum fold first, so every branch below runs it.
+        self.sampler.fold_step(ctx)
         steps = self.steps
         clip_end = self.clip.frame_clip_end[steps[:, 0]]
         num_frames = self.clip.joint_pos.shape[0]
@@ -175,93 +137,34 @@ class WbtMotionCommand(CommandTerm):
             # Freeze each lane on its own clip's final frame; no reset request.
             steps.copy_(torch.minimum(advanced, clip_end[:, None]))
             return
-        # Non-sequential wrap resamples ended lanes while preserving all other frames.
-        sampling_cdf = self.sampling_cdf
-        count = 3 if sampling_cdf.numel() != 0 else 2
-        draws = 2 * ctx.rand.uniform((steps.shape[0], count), device=steps.device) - 1
-        sampled = _sample_motion_step(
-            draws,
-            sampling_cdf,
-            num_frames,
-            self.start_at_timestep_zero_prob,
-        )
+        # Draw from the production default stream; only ended lanes change frames.
+        draws = 2 * ctx.rand.uniform((steps.shape[0], self.sampler.draw_count), device=steps.device) - 1
+        sampled = self.sampler.sample(draws, self.start_at_timestep_zero_prob)
         steps.copy_(torch.where(ended[:, None], sampled[:, None], advanced))
         ctx.sim_reset_requested |= ended[:, None]
 
-    def reset(
-        self: "WbtMotionCommand", ctx: ManagerContext, env_ids: torch.Tensor, episode_reset: torch.Tensor
-    ) -> None:
-        """Rebuild the adaptive sampler, then resample start frames for reset lanes.
+    def reset(self, ctx: ManagerContext, env_ids: torch.Tensor, episode_reset: torch.Tensor) -> None:
+        """Fold curriculum statistics, then resample start frames for reset lanes.
 
         Compact semantics: ``env_ids`` are this pass's reset rows (K).
-        Episode-boundary statistics gather just those rows — the terminated
-        lanes among them (``episode_reset``) feed a ``scatter_add`` failure
-        histogram, gauges publish through 0-d scalar metrics, and the sampling
-        CDF is rebuilt before the reset rows draw from it and scatter their
-        new frame indices back.
+        The sampler first folds the episode rows' statistics and rebuilds its
+        distribution, then the reset rows draw from it and scatter their new
+        frame indices back; finally the sampler opens new episodes on the
+        episode rows.
         """
         idx = env_ids
-        cdf = self.sampling_cdf
-        if cdf.numel():
-            failed = self.adaptive_bin_failed_count
-            num_bins = failed.numel()
-            num_frames = self.clip.joint_pos.shape[0]
-            episode_failed = episode_reset & ctx.terminated[idx]
-            failed_bins = (self.steps[idx, 0].to(torch.int64) * num_bins) // max(num_frames, 1)
-            failed_bins = torch.clamp(failed_bins, 0, num_bins - 1)
-            histogram = torch.zeros(num_bins, dtype=torch.float32)
-            histogram.scatter_add_(0, failed_bins, episode_failed.to(torch.float32))
-            self.adaptive_current_bin_failed_count.add_(histogram)
-            probabilities = failed + self.uniform_ratio / num_bins
-            kernel_size = max(self.kernel_size, 1)
-            if kernel_size > 1:
-                kernel = torch.tensor([self.kernel_lambda**i for i in range(kernel_size)], dtype=torch.float32)
-                kernel /= kernel.sum()
-                padded = torch.nn.functional.pad(probabilities[None, None, :], (0, kernel_size - 1), mode="rep")
-                probability = (padded.unfold(2, kernel_size, 1) @ kernel)[0, 0]
-            else:
-                probability = probabilities
-            total = probability.sum()
-            uniform = torch.full((num_bins,), 1.0 / num_bins, dtype=torch.float32)
-            positive = total > 0.0
-            probabilities = torch.where(
-                positive, probability / torch.where(positive, total, torch.ones_like(total)), uniform
-            )
-            entropy = -(probabilities * torch.log(probabilities + 1e-12)).sum()
-            top_bin = torch.argmax(probabilities)
-            self.adaptive_entropy.copy_(entropy / math.log(max(num_bins, 2)))
-            # Gather (not ``probabilities[top_bin]``): tensor indexing would
-            # sync the index to a Python int and break the graph.
-            self.adaptive_top1_prob.copy_(torch.gather(probabilities, 0, top_bin.reshape(1)).reshape(()))
-            self.adaptive_top1_bin.copy_(top_bin.to(torch.float32) / float(num_bins))
-            self.adaptive_failure_mass.copy_(failed.sum())
-            max_step = num_frames - 1
-            max_bin = min(max(math.ceil(max_step * num_bins / max(num_frames, 1)), 1), num_bins)
-            probabilities = probabilities.clone()
-            probabilities[max_bin:] = 0.0
-            total = probabilities.sum()
-            fallback = torch.zeros(num_bins, dtype=torch.float32)
-            fallback[:max_bin] = 1.0 / max_bin
-            positive = total > 0.0
-            probabilities = torch.where(
-                positive, probabilities / torch.where(positive, total, torch.ones_like(total)), fallback
-            )
-            cdf.copy_(torch.cumsum(probabilities, dim=0).to(torch.float32))
-            cdf[-1] = 1.0
+        self.sampler.fold_episode_stats(idx, episode_reset, ctx.terminated, self.steps[idx, 0])
+        self.sampler.rebuild()
         if bool(self.sequential_clips):
             # Sequential playback rematerializes onto the current frame.
+            self.sampler.mark_episode_starts(idx, episode_reset, self.steps[idx, 0])
             return
-        count = 3 if cdf.numel() != 0 else 2
-        draws = 2 * ctx.rand.uniform((idx.numel(), count), device=idx.device) - 1
-        steps = _sample_motion_step(
-            draws,
-            cdf,
-            self.clip.joint_pos.shape[0],
-            self.start_at_timestep_zero_prob,
-        )
+        draws = 2 * ctx.rand.uniform((idx.numel(), self.sampler.draw_count), device=self.steps.device) - 1
+        steps = self.sampler.sample(draws, self.start_at_timestep_zero_prob)
         # ``clip_ended`` is intentionally left untouched; advance recomputes it
         # on the following transition.
         self.steps[idx, 0] = steps
+        self.sampler.mark_episode_starts(idx, episode_reset, self.steps[idx, 0])
 
 
 @configclass(kw_only=True)
@@ -271,7 +174,7 @@ class WbtMotionCommandCfg(CommandCfg):
     joint_names: tuple[str, ...] = MISSING
     tracked_body_names: tuple[str, ...] = MISSING
     reference_body_name: str = MISSING
-    adaptive_sampling_enabled: bool = True
+    sampling_mode: str = "adaptive"
     start_at_timestep_zero_prob: float = 0.0
     hold_at_clip_end: bool = False
     sequential_clips: bool = False
@@ -279,14 +182,54 @@ class WbtMotionCommandCfg(CommandCfg):
     alpha: float = 0.001
     kernel_size: int = 1
     kernel_lambda: float = 0.8
+    # Return-mode mixing and fold parameters (ignored by other modes).
+    uniform_mix: float = 0.5
+    return_mix: float = 0.4
+    history_mix: float = 0.1
+    sampling_gamma: float = 0.99
+    return_ema: float = 0.2
 
-    def __call__(self, ctx: BuildContext) -> CommandTerm:
-        robot = ctx.cfg.scene.objs.robot
+    def _build_sampler(self, env: BuildContext, source: WbtMotionClip, env_fps: int) -> MotionStartSampler:
+        if self.sampling_mode == "uniform":
+            return UniformTimestepsSampler(num_frames=source.joint_pos.shape[0])
+        if self.sampling_mode == "adaptive":
+            return AdaptiveTimestepsSampler.from_clip(
+                source,
+                env_fps,
+                uniform_ratio=self.uniform_ratio,
+                alpha=self.alpha,
+                kernel_size=self.kernel_size,
+                kernel_lambda=self.kernel_lambda,
+            )
+        if self.sampling_mode == "return":
+            # Softmax normalizer derived from the configured reward weights
+            # (no copied value): the task's largest achievable discounted
+            # return over the sampling horizon.
+            g_max = max_discounted_return(
+                env.cfg.ctrl_dt,
+                sum(cfg.weight for cfg in env.cfg.reward_cfgs().values() if cfg.weight > 0.0),
+                float(self.sampling_gamma),
+            )
+            return ReturnTimestepsSampler.from_clip(
+                source,
+                env_fps,
+                env.num_envs,
+                uniform_mix=self.uniform_mix,
+                return_mix=self.return_mix,
+                history_mix=self.history_mix,
+                sampling_gamma=self.sampling_gamma,
+                return_ema=self.return_ema,
+                g_max=g_max,
+            )
+        raise ValueError(f"commands.motion sampling_mode must be one of {_SAMPLING_MODES}, got {self.sampling_mode!r}.")
+
+    def __call__(self, env: BuildContext) -> CommandTerm:
+        robot = env.cfg.scene.objs.robot
         if not isinstance(robot, RobotCfg):
             raise TypeError(f"WBT scene robot must be RobotCfg, got {type(robot).__name__}")
         if not self.joint_names or len(set(self.joint_names)) != len(self.joint_names):
             raise ValueError("WBT motion joint_names must be non-empty and unique.")
-        body_joint_names = ctx.model.bodies["robot"].joint_names
+        body_joint_names = env.model.bodies["robot"].joint_names
         if body_joint_names != tuple(self.joint_names):
             raise ValueError("WBT robot body joint order must match commands.motion.joint_names order.")
         if robot.resolved_base_link_name not in self.tracked_body_names:
@@ -297,7 +240,7 @@ class WbtMotionCommandCfg(CommandCfg):
             raise ValueError(
                 f"tracked_body_names must include the reference body {self.reference_body_name!r}"
             ) from None
-        env_fps = max(int(round(1.0 / ctx.cfg.ctrl_dt)), 1)
+        env_fps = max(int(round(1.0 / env.cfg.ctrl_dt)), 1)
         source = MotionLibrary(
             self.motion_files,
             joint_names=list(self.joint_names),
@@ -307,34 +250,21 @@ class WbtMotionCommandCfg(CommandCfg):
             fps=env_fps,
             extension_channels=self.extension_channels,
         ).assemble()
-        if self.adaptive_sampling_enabled:
-            num_bins = source.joint_pos.shape[0] // env_fps + 1
-        else:
-            num_bins = 0
+        num_envs = env.num_envs
         tracked_shape = (len(self.tracked_body_names), 3)
-        state = WbtMotionCommand(
+        return WbtMotionCommand(
             clip=source,
             reference_index=int(reference_index),
-            steps=torch.zeros((ctx.num_envs, 1), dtype=torch.int64),
-            clip_ended=torch.zeros((ctx.num_envs, 1), dtype=torch.bool),
-            command=torch.empty((ctx.num_envs, 2 * len(ctx.model.actuators)), dtype=torch.float32),
-            target_body_position_relative=torch.empty((ctx.num_envs, *tracked_shape), dtype=torch.float32),
-            target_body_orientation_relative=torch.empty((ctx.num_envs, tracked_shape[0], 4), dtype=torch.float32),
-            adaptive_bin_failed_count=torch.zeros((num_bins,), dtype=torch.float32),
-            adaptive_current_bin_failed_count=torch.zeros((num_bins,), dtype=torch.float32),
-            sampling_cdf=torch.ones((num_bins,), dtype=torch.float32)
-            if num_bins
-            else torch.empty((0,), dtype=torch.float32),
+            steps=torch.zeros((num_envs, 1), dtype=torch.int64),
+            clip_ended=torch.zeros((num_envs, 1), dtype=torch.bool),
+            command=torch.empty((num_envs, 2 * len(self.joint_names)), dtype=torch.float32),
+            target_body_position_relative=torch.empty((num_envs, *tracked_shape), dtype=torch.float32),
+            target_body_orientation_relative=torch.empty((num_envs, tracked_shape[0], 4), dtype=torch.float32),
+            sampler=self._build_sampler(env, source, env_fps),
             start_at_timestep_zero_prob=float(self.start_at_timestep_zero_prob),
             hold_at_clip_end=self.hold_at_clip_end,
             sequential_clips=self.sequential_clips,
-            uniform_ratio=float(self.uniform_ratio),
-            alpha=float(self.alpha),
-            kernel_size=int(self.kernel_size),
-            kernel_lambda=float(self.kernel_lambda),
         )
-
-        return state
 
 
 __all__ = [

@@ -120,7 +120,7 @@ class G1BackflipWbtEnvCfg(G1WbtEnvCfg):
             # flight window land on the reference ballistic trajectory; judge
             # skill by frame-0-start episodes (play), since training-time
             # means stay diluted by mid-clip starts.
-            adaptive_sampling_enabled=False,
+            sampling_mode="uniform",
             start_at_timestep_zero_prob=0.2,
             # Hold the final frame instead of wrap-rematerializing: an episode
             # that reaches the clip end keeps tracking the landing hold until
