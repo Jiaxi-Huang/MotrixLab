@@ -225,3 +225,21 @@ def _double(tree: KinematicTree) -> KinematicTree:
     child.off_p = tree.off_p.double()
     child.off_R = tree.off_R.double()
     return child
+
+
+def test_compiled_fk_matches_eager_values_and_gradients():
+    """The fused fixed-size product path must preserve full FK and its derivatives."""
+    torch.manual_seed(31)
+    axes = torch.nn.functional.normalize(torch.randn(5, 3), dim=-1)
+    offsets = torch.randn(5, 3)
+    rotations = axis_angle_to_mat(axes, torch.randn(5))
+    tree = KinematicTree([-1, 0, 0, 1, 3], [-1, 0, 1, 2, 3], axes, offsets, rotations)
+    tree = _double(tree)
+    shapes = [(4, 3), (4, 3, 3), (4, 3), (4, 3), (4, 4), (4, 4)]
+    inputs = [torch.randn(shape, dtype=torch.float64, requires_grad=True) for shape in shapes]
+    eager = tree.forward(*inputs)
+    expected_grad = torch.autograd.grad(sum(x.square().sum() for x in eager), inputs)
+    compiled = torch.compile(tree.forward, backend="aot_eager", fullgraph=True)(*inputs)
+    actual_grad = torch.autograd.grad(sum(x.square().sum() for x in compiled), inputs)
+    for actual, expected in zip((*compiled, *actual_grad), (*eager, *expected_grad), strict=True):
+        torch.testing.assert_close(actual, expected)
