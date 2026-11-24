@@ -41,6 +41,11 @@ from motrix_env_core.manager.terminations import (
     TerminationManager,
     TerminationTermCfg,
 )
+from motrix_env_core.manager.truncations import (
+    ManagerTruncationsCfg,
+    TruncationManager,
+    TruncationTermCfg,
+)
 from motrix_env_core.observations import ObservationSpec
 from motrix_env_core.sim import (
     ModelQuery,
@@ -143,6 +148,7 @@ class ManagerBasedEnvCfg(EnvCfg):
     )
     rewards: dict[str, RewardTermCfg] = field(default_factory=dict)
     terminations: dict[str, TerminationTermCfg] = field(default_factory=dict)
+    truncations: dict[str, TruncationTermCfg] = field(default_factory=dict)
 
     def command_cfgs(self) -> dict[str, CommandCfg]:
         return _manager_group_to_dict(self.commands, ManagerCommandsCfg, CommandCfg, label="command")
@@ -187,6 +193,14 @@ class ManagerBasedEnvCfg(EnvCfg):
             ManagerTerminationsCfg,
             TerminationTermCfg,
             label="termination",
+        )
+
+    def truncation_cfgs(self) -> dict[str, TruncationTermCfg]:
+        return _manager_group_to_dict(
+            self.truncations,
+            ManagerTruncationsCfg,
+            TruncationTermCfg,
+            label="truncation",
         )
 
 
@@ -301,6 +315,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         self._action_space, self._action_slices = self._build_action_space()
         self._reward_terms = create_reward_terms(cfg.reward_cfgs(), self.build_context())
         self.termination_manager = TerminationManager(cfg.termination_cfgs(), self)
+        self.truncation_manager = TruncationManager(cfg.truncation_cfgs(), self)
         self.observation_manager = ObservationManager(
             create_observation_groups(cfg, self.build_context()), self.num_envs
         )
@@ -313,6 +328,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         for terms in (
             (term for term in self._reward_terms.values()),
             (term for term in self.termination_manager.terms.values()),
+            (term for term in self.truncation_manager.terms.values()),
             (entry.term for group in self.observation_manager.groups.values() for entry in group.terms),
         ):
             for term in terms:
@@ -384,12 +400,16 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         The resolver's context is already live (the task program builds
         before the base lifecycle runs), so ``ctx.terminated``, the evaluate
         kernel's output, and ``state.terminated`` are one tensor from birth —
-        the manager state is the only named holder on the env side.
+        the manager state is the only named holder on the env side. The
+        reward and truncation mirrors follow the same pattern: the incoming
+        buffers are discarded for the context's, which the evaluate kernel
+        rewrites in place every transition.
         """
         context = self._compiled_manager_program.context
         context.terminated.fill_(True)  # keep the seed-all-lanes init contract
+        context.truncated.fill_(False)
         return super()._new_state(
-            self.observation_manager.observation, context.reward, context.terminated, truncated, episode_steps
+            self.observation_manager.observation, context.reward, context.terminated, context.truncated, episode_steps
         )
 
     def init_state(self) -> ArrayEnvState:
@@ -627,8 +647,8 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
     def _make_metrics_view(self) -> dict[str, Any]:
         """Assemble the persistent live metrics view for the current state.
 
-        Values are views into the kernel reward/termination buffers and the
-        term-owned CPU tensor arrays, so kernels write them in place every
+        Values are views into the kernel reward/termination/truncation buffers
+        and the term-owned CPU tensor arrays, so kernels write them in place every
         step and nothing needs rebuilding per transition. Host-side writers
         may add batch-level scalar entries (e.g. sampler statistics at reset
         time). Consumers retain values across steps through
@@ -637,9 +657,13 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         assert self._compiled_manager_program is not None
         assert self._kernel_buffers is not None
         termination_masks = self._kernel_buffers[2]
+        truncation_masks = self._kernel_buffers[3]
         metrics = {
             term.name: termination_masks[:, term.index] for term in self._compiled_manager_program.layout.terminations
         }
+        metrics.update(
+            {term.name: truncation_masks[:, term.index] for term in self._compiled_manager_program.layout.truncations}
+        )
         # Single-column term metrics export as ``(N,)`` per-env vectors.
         metrics.update(
             {
@@ -655,6 +679,17 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         with self.perf.scope("evaluate"):
             self._execute_evaluate_kernel()
         return state
+
+    def _update_truncate(self) -> None:
+        """Fold the episode time limit into the truncation-term union.
+
+        The evaluate kernel already ORed the truncation terms into the shared
+        ``truncated`` buffer (cleared at step start by the base lifecycle), so
+        the time-limit mask ORs in on top instead of overwriting it.
+        """
+        max_episode_steps = self._max_episode_steps()
+        if max_episode_steps:
+            self._state.truncated |= self._state.episode_steps >= max_episode_steps
 
     def compute_observation(self, state: ArrayEnvState) -> ArrayEnvState:
         """Publish a new whole-batch frame and append observation history."""
@@ -701,11 +736,13 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         reward_terms = torch.empty((self.num_envs, len(layout.rewards)), dtype=torch.float32)
         weighted_reward_terms = torch.empty_like(reward_terms)
         termination_masks = torch.empty((self.num_envs, len(layout.terminations)), dtype=torch.bool)
+        truncation_masks = torch.empty((self.num_envs, len(layout.truncations)), dtype=torch.bool)
         state.reward_terms = {term.name: weighted_reward_terms[:, term.index] for term in layout.rewards}
         buffers = (
             reward_terms,
             weighted_reward_terms,
             termination_masks,
+            truncation_masks,
         )
         self._kernel_buffers = buffers
         return buffers
