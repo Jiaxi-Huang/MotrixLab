@@ -352,14 +352,16 @@ def run_collector_process(
                 except Empty:
                     pass
                 collector_data_queue.put(collector.snapshot_stats())
+        if isinstance(ring, GpuIpcTransitionRing):
+            while not control.stop and ring.write_completed_count < ring.write_issued_count:
+                time.sleep(opts.idle_sleep_s)
     except BaseException:
+        control.set_stop()
         if not isinstance(sys.exc_info()[1], (KeyboardInterrupt, SystemExit)):
             # Ctrl+C is an operator action, not a defect: the stop flag is
             # already set by the SIGINT handler; don't spam async_errors.
             error_queue.put((role, traceback.format_exc()))
         raise
-    finally:
-        control.set_stop()  # signal the learner if the collector exits for any reason
 
 
 # ------------------------------------------------------------------ learner process
@@ -581,17 +583,30 @@ def run_learner_process(
         # Each collector runs until its own counter reaches num_iterations; the
         # aggregate (sum) therefore reaches num_iterations * num_collectors.
         total_collector_steps = num_iterations * num_collectors
-        while not control.stop and control.collector_steps < total_collector_steps:
+        remaining_batches = num_iterations - resume_step
+        while remaining_batches > 0 and not control.stop:
             # Progress basis: full num_envs-batch equivalents — the aggregate
             # counter counts per-collector batches of per_collector_envs
             # transitions each, so dividing by num_collectors recovers the
             # sync-trainer "iteration collects num_envs transitions" unit
             # (identical to the raw counter when num_collectors == 1). All
             # ranks read the same shared value.
-            step = control.collector_steps // num_collectors
+            collected = control.collector_steps
+            if dist is not None:
+                progress = torch.tensor(collected, device=device)
+                dist.broadcast(progress, src=0)
+                collected = int(progress)
+            finished = collected >= total_collector_steps
+            step = collected // num_collectors
             control.global_step = step
             t_drain = time.perf_counter()
             ingested = learner.drain()
+            if finished:
+                while not control.stop and any(r.read_issued_count < remaining_batches for r in rings):
+                    count = learner.drain()
+                    ingested += count
+                    if not count:
+                        time.sleep(opts.idle_sleep_s)
             if ingested:
                 if not start_anchored:
                     start_time = time.time()
@@ -720,6 +735,8 @@ def run_learner_process(
                     except Full:
                         logger.warning("learner data queue full; checkpoint notice for %s dropped", path)
                 next_save += save_interval
+            if finished:
+                break
 
         if num_learners > 1:
             # All ranks have consumed the identical global step count, so the
