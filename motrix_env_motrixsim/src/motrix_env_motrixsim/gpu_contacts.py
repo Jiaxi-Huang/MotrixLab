@@ -9,23 +9,33 @@ import warp as wp
 
 
 @wp.kernel
-def count_geom_contacts(
+def read_geom_contacts(
     contacts: wp.array2d(dtype=Any),
     counts: wp.array(dtype=wp.int32),
     collider_pairs: wp.array2d(dtype=wp.int32),
+    normal_report: bool,
     result: wp.array2d(dtype=wp.float32),
 ):
     world = wp.tid()
     found = wp.int32(0)
+    normal = wp.vec3()
     for i in range(wp.min(counts[world], contacts.shape[1])):
         pair = contacts[world, i].pair_index
         for j in range(collider_pairs.shape[0]):
             a = collider_pairs[j, 0]
             b = collider_pairs[j, 1]
             if (pair[0] == a and pair[1] == b) or (pair[0] == b and pair[1] == a):
+                if normal_report and found == 0:
+                    normal = contacts[world, i].normal
+                    if pair[0] != a:
+                        normal = -normal
                 found += 1
                 break
-    result[world, 0] = float(found)
+    if normal_report:
+        for axis in range(3):
+            result[world, axis] = normal[axis]
+    else:
+        result[world, 0] = float(found)
 
 
 @wp.kernel
@@ -108,3 +118,43 @@ def link_contact_wrenches(
     for j in range(3):
         output[world, column, j] = force[j] * inv_dt
         output[world, column, 3 + j] = moment[j] * inv_dt
+
+
+@wp.kernel
+def touch_force(
+    contacts: wp.array2d(dtype=Any),
+    counts: wp.array(dtype=wp.int32),
+    rows: wp.array3d(dtype=wp.int32),
+    impulses: wp.array2d(dtype=wp.float32),
+    frames: wp.array(dtype=Any),
+    frame_count: int,
+    frame_id: int,
+    colliders: wp.array(dtype=wp.int32),
+    size: wp.vec3,
+    box: bool,
+    inv_dt: float,
+    output: wp.array2d(dtype=wp.float32),
+):
+    world = wp.tid()
+    frame = frames[world * frame_count + frame_id]
+    total = wp.float32(0.0)
+    for i in range(wp.min(counts[world], contacts.shape[1])):
+        c = contacts[world, i]
+        row = rows[world, i, 0]
+        if row < 0 or row >= impulses.shape[1]:
+            continue
+        for j in range(colliders.shape[0]):
+            collider = colliders[j]
+            if collider != c.pair_index[0] and collider != c.pair_index[1]:
+                continue
+            point = c.point
+            if collider == c.pair_index[1]:
+                point = point + c.normal * c.penetration_depth
+            local = wp.transpose(frame.rotation) * (point - frame.translation)
+            inside = wp.length_sq(local) <= size[0] * size[0]
+            if box:
+                inside = wp.abs(local[0]) <= size[0] and wp.abs(local[1]) <= size[1] and wp.abs(local[2]) <= size[2]
+            if inside:
+                total += wp.abs(impulses[world, row])
+                break
+    output[world, 0] = total * inv_dt

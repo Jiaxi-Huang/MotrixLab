@@ -145,11 +145,15 @@ class CudaReads(PhysicsReadProgram):
                 backend.link_contact_reader([link.index for link in links if link.name not in excluded])
             )
         if isinstance(query, read.GeomPairCollidingQuery):
-            low = backend.host_model.low
+
+            def colliders(name):
+                geom = backend.host_model.get_geom(name)
+                if geom is None:
+                    raise KeyError(f"Simulator query {key!r} references unknown geom {name!r}.")
+                return backend.host_model.low.get_collider_indices(geom.index) or ()
+
             readers = [
-                backend.contact_count_reader(
-                    [(a, b) for a in low.get_collider_indices(first) for b in low.get_collider_indices(second)]
-                )
+                backend.geom_contact_reader([(a, b) for a in colliders(first) for b in colliders(second)])
                 for first, second in query.pairs
             ]
             sources = [self._source(fetch) for fetch in readers]

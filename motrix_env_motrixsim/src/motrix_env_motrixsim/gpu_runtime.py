@@ -56,6 +56,7 @@ class MotrixCudaBackend(SimBackend):
         self.initial_position = self.position[0].clone()
         self._domains = dict(self.data.low.domains.items())
         self._contact_sensors = {sensor.name: sensor for sensor in host_model.low.low_contact_sensors}
+        self._touch_sensors = {sensor.name: sensor for sensor in host_model.low.low_touch_sensors}
         self._terrain = {}
         # Both parity banks are live. Invalidate the selected worlds in both
         # banks without advancing their shared clock or the other worlds.
@@ -165,10 +166,19 @@ class MotrixCudaBackend(SimBackend):
                 self.set_mocap_pose(mocap, poses, rows)
 
     def sensor_reader(self, name):
+        if name in self._touch_sensors:
+            return self.touch_reader(self._touch_sensors[name])
         sensor = self._contact_sensors.get(name)
         if sensor is None:
             return lambda: wp.to_torch(self.model.get_sensor_value(name, self.data))
         report = sensor.report
+        if (
+            report.normal
+            and not any((report.found, report.force, report.torque, report.pos, report.tangent, report.dist))
+            and sensor.max_num == 1
+            and sensor.reduce == "none"
+        ):
+            return self.geom_contact_reader(sensor.collider_pairs, normal=True)
         if (
             not report.found
             or any((report.force, report.torque, report.pos, report.normal, report.tangent, report.dist))
@@ -177,10 +187,10 @@ class MotrixCudaBackend(SimBackend):
             raise NotImplementedError(
                 f"MotrixSim CUDA cannot provide contact sensor {name!r} with its requested report"
             )
-        return self.contact_count_reader(sensor.collider_pairs)
+        return self.geom_contact_reader(sensor.collider_pairs)
 
     def link_contact_reader(self, indices):
-        from motrix_env_motrixsim.gpu_contacts import dense_contact_rows, link_contact_wrenches
+        from motrix_env_motrixsim.gpu_contacts import link_contact_wrenches
 
         if not indices:
             empty = self.position.new_empty((self.data.num_worlds, 0, 6))
@@ -196,22 +206,10 @@ class MotrixCudaBackend(SimBackend):
         output = wp.zeros((self.data.num_worlds, len(indices), 6), dtype=wp.float32, device=self._warp_device)
         result = wp.to_torch(output)
 
-        sparse = solver.sparse_jacobian
-        rows = (
-            wp.empty((*collision.contacts.shape, 6), dtype=wp.int32, device=self._warp_device)
-            if sparse is None
-            else sparse.contact_rows.rows
-        )
+        fetch_rows = self._contact_rows_reader()
 
         def fetch():
-            if sparse is None:
-                warm = solver.persistent_lambdas
-                wp.launch(
-                    dense_contact_rows,
-                    collision.contacts.shape,
-                    inputs=[collision.contacts, collision.contact_count, warm.slots, warm.rows, warm.row_counter, rows],
-                    device=self._warp_device,
-                )
+            rows = fetch_rows()
             wp.launch(
                 link_contact_wrenches,
                 (self.data.num_worlds, len(indices)),
@@ -233,20 +231,87 @@ class MotrixCudaBackend(SimBackend):
 
         return fetch
 
-    def contact_count_reader(self, collider_pairs):
-        from motrix_env_motrixsim.gpu_contacts import count_geom_contacts
+    def _contact_rows_reader(self):
+        from motrix_env_motrixsim.gpu_contacts import dense_contact_rows
 
         collision = self._domains["rigid_collision"]
-        pairs = wp.array(collider_pairs, dtype=wp.int32, device=self._warp_device).reshape((-1, 2))
+        solver = self._domains["solver"]
+        sparse = solver.sparse_jacobian
+        rows = (
+            wp.empty((*collision.contacts.shape, 6), dtype=wp.int32, device=self._warp_device)
+            if sparse is None
+            else sparse.contact_rows.rows
+        )
+
+        def fetch_rows():
+            if sparse is None:
+                warm = solver.persistent_lambdas
+                wp.launch(
+                    dense_contact_rows,
+                    collision.contacts.shape,
+                    inputs=[collision.contacts, collision.contact_count, warm.slots, warm.rows, warm.row_counter, rows],
+                    device=self._warp_device,
+                )
+            return rows
+
+        return fetch_rows
+
+    def touch_reader(self, sensor):
+        from motrix_env_motrixsim.gpu_contacts import touch_force
+
+        shape = sensor.shape.shape_type
+        if shape not in ("sphere", "box") or sensor.loc.location_type != "Frame":
+            raise NotImplementedError(f"Unsupported touch sensor geometry for {sensor.name!r}: {shape}")
+        collision = self._domains["rigid_collision"]
+        impulses = self._domains["solver"].constraint_lambdas.unilateral
+        sensors = self._domains["sensors"]
+        colliders = wp.array(sensor.colliders, dtype=wp.int32, device=self._warp_device)
         output = wp.zeros((self.data.num_worlds, 1), dtype=wp.float32, device=self._warp_device)
+        result = wp.to_torch(output)
+        fetch_rows = self._contact_rows_reader()
+        size = wp.vec3(*sensor.size)
+
+        def fetch():
+            wp.launch(
+                touch_force,
+                self.data.num_worlds,
+                inputs=[
+                    collision.contacts,
+                    collision.contact_count,
+                    fetch_rows(),
+                    impulses,
+                    sensors.base_to_frames,
+                    sensors.frame_len,
+                    sensor.loc.location_id,
+                    colliders,
+                    size,
+                    shape == "box",
+                    1.0 / self.model.timestep,
+                    output,
+                ],
+                device=self._warp_device,
+            )
+            return result
+
+        return fetch
+
+    def geom_contact_reader(self, collider_pairs, *, normal=False):
+        from motrix_env_motrixsim.gpu_contacts import read_geom_contacts
+
+        collision = self._domains["rigid_collision"]
+        if not collider_pairs:
+            empty = self.position.new_zeros((self.data.num_worlds, 3 if normal else 1))
+            return lambda: empty
+        pairs = wp.array(collider_pairs, dtype=wp.int32, device=self._warp_device).reshape((-1, 2))
+        output = wp.zeros((self.data.num_worlds, 3 if normal else 1), dtype=wp.float32, device=self._warp_device)
 
         result = wp.to_torch(output)
 
         def fetch():
             wp.launch(
-                count_geom_contacts,
+                read_geom_contacts,
                 self.data.num_worlds,
-                inputs=[collision.contacts, collision.contact_count, pairs, output],
+                inputs=[collision.contacts, collision.contact_count, pairs, normal, output],
                 device=self._warp_device,
             )
             return result
