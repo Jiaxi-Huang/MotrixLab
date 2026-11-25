@@ -85,11 +85,8 @@ def _quat_from_y_angle(angle: torch.Tensor) -> torch.Tensor:
 
 
 def _quat_to_z_axis(quat: torch.Tensor) -> torch.Tensor:
-    axis = torch.tensor([0.0, 0.0, 1.0], dtype=quat.dtype)
-    w = quat[..., 3:4]
-    im = quat[..., :3]
-    t = 2.0 * torch.cross(im, axis.expand_as(im), dim=-1)
-    return axis + w * t + torch.cross(im, t, dim=-1)
+    x, y, z, w = quat.unbind(dim=-1)
+    return torch.stack((2 * (x * z + w * y), 2 * (y * z - w * x), 1 - 2 * (x.square() + y.square())), dim=-1)
 
 
 def _tolerance(
