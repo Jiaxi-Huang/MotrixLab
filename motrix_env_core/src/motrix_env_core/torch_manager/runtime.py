@@ -367,9 +367,7 @@ class TorchManagerRuntime:
                 call.invoke(ctx, env_ids, sim_writes)
 
         if self.compile_enabled:
-            kernel = torch.compile(
-                kernel, dynamic=True, options={} if self.ctx.env_id.is_cuda else self._static_options
-            )
+            kernel = torch.compile(kernel, dynamic=True, options={} if ctx.env_id.is_cuda else _compile_options())
 
         last_count: int | None = None
         writes_by_term: tuple[dict[str, torch.Tensor], ...] = ()
