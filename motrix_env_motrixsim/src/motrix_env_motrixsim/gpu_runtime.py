@@ -46,7 +46,9 @@ class MotrixCudaBackend(SimBackend):
         self.host_model = host_model
         self._model_compiler = MotrixSimModelCompiler(host_model)
         with self.physics_stream():
-            self.model = gpu.SceneModel.from_cmodel(host_model)
+            self.model = gpu.SceneModel.from_cmodel(
+                host_model, max_contacts=sim.max_contacts, max_contact_constraints=sim.max_contact_constraints
+            )
             self.data = gpu.SceneData(self.model, batch=num_envs)
             self.position = wp.to_torch(self.data.dof_pos)
             self.velocity = wp.to_torch(self.data.dof_vel)
