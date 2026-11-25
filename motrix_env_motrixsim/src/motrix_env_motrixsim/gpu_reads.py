@@ -35,13 +35,15 @@ class CudaReads(PhysicsReadProgram):
             for output, project in fields:
                 output.copy_(project(values))
 
+        # Different environments specialize this closure for different query
+        # layouts. Allow Dynamo to fall back when its per-code cache fills.
         if self._sources:
-            self._publish = torch.compile(publish, fullgraph=True, dynamic=False, mode="reduce-overhead")
+            self._publish = torch.compile(publish, dynamic=False, mode="reduce-overhead")
         elif self._fields:
             # All inputs here are persistent SceneData views or fixed model indices.
             # Capture only snapshot publication; initialization never advances physics.
             with backend.physics_stream():
-                compiled = torch.compile(publish, fullgraph=True, dynamic=False, options={"triton.cudagraphs": False})
+                compiled = torch.compile(publish, dynamic=False, options={"triton.cudagraphs": False})
                 compiled(())
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=backend._torch_stream):
