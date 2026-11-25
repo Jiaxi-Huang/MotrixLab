@@ -130,6 +130,18 @@ class CudaReads(PhysicsReadProgram):
                 getters = [method(model.get_link(n)) for n in query.links]
                 sources = [self._source(lambda get=get: wp.to_torch(get(data))) for get in getters]
                 return lambda values: torch.stack([project(values) for project in sources], dim=1)
+        if isinstance(query, read.BodyLinkNetContactForceQuery):
+            body = backend.host_model.get_body(query.body)
+            if body is None:
+                raise KeyError(f"Simulator query {key!r} references unknown body {query.body!r}.")
+            links = body.links
+            excluded = set(query.exclude_links)
+            unknown = excluded.difference(link.name for link in links)
+            if unknown:
+                raise KeyError(f"Simulator query {key!r} excludes unknown body links: {sorted(unknown)}.")
+            return self._source(
+                backend.link_contact_reader([link.index for link in links if link.name not in excluded])
+            )
         if isinstance(query, read.GeomPairCollidingQuery):
             low = backend.host_model.low
             readers = [

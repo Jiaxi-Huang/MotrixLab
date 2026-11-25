@@ -177,6 +177,60 @@ class MotrixCudaBackend(SimBackend):
             )
         return self.contact_count_reader(sensor.collider_pairs)
 
+    def link_contact_reader(self, indices):
+        from motrix_env_motrixsim.gpu_contacts import dense_contact_rows, link_contact_wrenches
+
+        if not indices:
+            empty = self.position.new_empty((self.data.num_worlds, 0, 6))
+            return lambda: empty
+
+        collision = self._domains["rigid_collision"]
+        solver = self._domains["solver"]
+        maps = self.host_model.low.link_low_maps
+        # A high-level link can span virtual joints. Its colliders belong to the final rigid link.
+        low = [maps[i].index + maps[i].num - 1 for i in indices]
+        high_ids = wp.array(indices, dtype=wp.int32, device=self._warp_device)
+        low_ids = wp.array(low, dtype=wp.int32, device=self._warp_device)
+        output = wp.zeros((self.data.num_worlds, len(indices), 6), dtype=wp.float32, device=self._warp_device)
+        result = wp.to_torch(output)
+
+        sparse = solver.sparse_jacobian
+        rows = (
+            wp.empty((*collision.contacts.shape, 6), dtype=wp.int32, device=self._warp_device)
+            if sparse is None
+            else sparse.contact_rows.rows
+        )
+
+        def fetch():
+            if sparse is None:
+                warm = solver.persistent_lambdas
+                wp.launch(
+                    dense_contact_rows,
+                    collision.contacts.shape,
+                    inputs=[collision.contacts, collision.contact_count, warm.slots, warm.rows, warm.row_counter, rows],
+                    device=self._warp_device,
+                )
+            wp.launch(
+                link_contact_wrenches,
+                (self.data.num_worlds, len(indices)),
+                inputs=[
+                    collision.contacts,
+                    collision.contact_count,
+                    rows,
+                    solver.constraint_lambdas.unilateral,
+                    self.model.get_link_poses(self.data),
+                    self._domains["overrides"].apparent_link_com,
+                    high_ids,
+                    low_ids,
+                    1.0 / self.model.timestep,
+                    output,
+                ],
+                device=self._warp_device,
+            )
+            return result
+
+        return fetch
+
     def contact_count_reader(self, collider_pairs):
         from motrix_env_motrixsim.gpu_contacts import count_geom_contacts
 

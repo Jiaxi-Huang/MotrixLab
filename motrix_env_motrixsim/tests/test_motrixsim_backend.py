@@ -20,6 +20,7 @@ from motrix_env_core.sim import (
     BodyJointPositionWrite,
     BodyJointVelocityQuery,
     BodyLinearVelocityWrite,
+    BodyLinkNetContactForceQuery,
     BodyPositionWrite,
     BodyRotationWrite,
     DofPositionLimitsQuery,
@@ -550,3 +551,30 @@ def test_cuda_read_snapshot_on_alternating_caller_streams():
             expected.fill_(index)
             torch.testing.assert_close(snapshot, expected)
         caller.wait_stream(stream)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA CUDA")
+def test_cuda_link_contact_wrench_about_center_of_mass(tmp_path):
+    pytest.importorskip("motrixsim.gpu")
+    scene = tmp_path / "offset_contact.xml"
+    scene.write_text(
+        """<mujoco><worldbody>
+        <geom type="plane" size="2 2 .1"/>
+        <body name="load" pos="0 0 .4">
+          <joint name="height" type="slide" axis="0 0 1"/>
+          <inertial pos="0 0 0" mass="1" diaginertia=".01 .01 .01"/>
+          <geom pos=".1 0 0" type="sphere" size=".15"/>
+        </body></worldbody></mujoco>"""
+    )
+    device = torch.device("cuda:0")
+    backend = MotrixSimBackend.for_device(device)(
+        SceneCfg(file=scene), SimCfg(dt=0.005, gravity=(0, 0, -9.81), device=str(device)), 2
+    )
+    reads = backend.compile_reads({"wrench": BodyLinkNetContactForceQuery(body="load")})
+    backend.step(180)
+    reads.execute()
+
+    # The normal balances the 1 kg load, 0.1 m from its center of mass.
+    expected = torch.tensor([0, 0, 9.81, 0, -0.981, 0], device=device)
+    torch.testing.assert_close(reads["wrench"][:, 0], expected.expand(2, -1), atol=0.01, rtol=0.001)
