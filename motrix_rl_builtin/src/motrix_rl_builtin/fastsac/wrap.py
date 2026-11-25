@@ -51,6 +51,7 @@ class FastSacEnvWrap:
 
         self._env = env
         self.device = device
+        self.defer_metrics = False
         self.num_envs = env.num_envs
         # Clamp actions alongside the simulator.
         self._low_t = torch.as_tensor(action_space.low, dtype=torch.float32, device=self._sim_device)
@@ -90,9 +91,12 @@ class FastSacEnvWrap:
 
     def final_frames(self, result: FastSacStepResult) -> FinalObs | None:
         final = result.final_obs
-        if result.truncated.any() and final is None:
-            raise RuntimeError("FastSAC truncation bootstrap requires pre-reset final observations")
         if final is None:
+            message = "FastSAC truncation bootstrap requires pre-reset final observations"
+            if result.truncated.is_cuda:
+                torch._assert_async(~result.truncated.any(), message)
+            elif result.truncated.any():
+                raise RuntimeError(message)
             return None
         return FinalObs(final.env_ids, self.stage_frames(final.obs.policy, final.obs.value_or_policy))
 
@@ -114,7 +118,7 @@ class FastSacEnvWrap:
             # None when no row truncated or the implementation does not
             # capture finals.
             final_obs=final,
-            info=env_infos(state),
+            info={"Reward": state.reward_terms, "metrics": state.metrics} if self.defer_metrics else env_infos(state),
         )
 
     @property

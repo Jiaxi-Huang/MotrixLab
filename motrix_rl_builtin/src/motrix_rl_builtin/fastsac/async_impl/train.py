@@ -246,7 +246,18 @@ class Trainer(TrainerBase):
         final_obs_enabled = max_episode_steps is not None
         transition_schema = fastsac_transition_schema(frame_dim, value_frame_dim, act_dim)
         final_stores: list[FinalObsStorage] | None = (
-            [FinalObsStorage(async_options.ring_capacity, shard, frame_dim, value_frame_dim) for shard in env_shards]
+            [
+                FinalObsStorage(
+                    async_options.ring_capacity,
+                    shard,
+                    frame_dim,
+                    value_frame_dim,
+                    device=collector_devices[i]
+                    if ring_ipc[i] and torch.device(sim_devices[i]) == collector_devices[i]
+                    else torch.device("cpu"),
+                )
+                for i, shard in enumerate(env_shards)
+            ]
             if final_obs_enabled
             else None
         )

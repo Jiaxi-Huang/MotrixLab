@@ -296,6 +296,9 @@ def run_collector_process(
                 num_envs,
                 payload_store=final_store,
             )
+        if isinstance(ring, GpuIpcTransitionRing) and env.env.device == ring.slots.device == collector_device:
+            env.device = ring.slots.device
+            env.defer_metrics = True
         collector = Collector(
             env,
             cfg,
