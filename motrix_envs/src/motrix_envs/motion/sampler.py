@@ -249,14 +249,14 @@ class AdaptiveTimestepsSampler(MotionStartSampler):
         probabilities = self.failed_count + self.uniform_ratio / num_bins
         kernel_size = max(self.kernel_size, 1)
         if kernel_size > 1:
-            kernel = torch.tensor([self.kernel_lambda**i for i in range(kernel_size)], dtype=torch.float32)
+            kernel = probabilities.new_tensor([self.kernel_lambda**i for i in range(kernel_size)])
             kernel /= kernel.sum()
-            padded = torch.nn.functional.pad(probabilities[None, None, :], (0, kernel_size - 1), mode="rep")
+            padded = torch.nn.functional.pad(probabilities[None, None, :], (0, kernel_size - 1), mode="replicate")
             probability = (padded.unfold(2, kernel_size, 1) @ kernel)[0, 0]
         else:
             probability = probabilities
         total = probability.sum()
-        uniform = torch.full((num_bins,), 1.0 / num_bins, dtype=torch.float32)
+        uniform = torch.full_like(probability, 1.0 / num_bins)
         positive = total > 0.0
         probabilities = torch.where(
             positive, probability / torch.where(positive, total, torch.ones_like(total)), uniform
