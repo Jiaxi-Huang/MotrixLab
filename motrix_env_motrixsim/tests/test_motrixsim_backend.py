@@ -517,3 +517,36 @@ def test_read_views_alias_arena_and_stay_conventionally_read_only():
     # The backing numpy views stay non-writeable; torch cannot carry that
     # flag, so the read-only contract is documented on ``view``.
     assert not program._views["all_pos"].flags.writeable
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA CUDA")
+def test_cuda_read_snapshot_on_alternating_caller_streams():
+    pytest.importorskip("motrixsim.gpu")
+    from motrix_env_core import registry
+
+    cfg = registry.make_env_config("cartpole")
+    cfg.sim.device = "cuda:0"
+    device = torch.device(cfg.sim.device)
+    backend = MotrixSimBackend.for_device(device)(cfg.scene, cfg.sim, 3)
+    reads = backend.compile_reads({"ctrl": ActuatorCtrlQuery(), "alias": ActuatorCtrlQuery()})
+    writes = backend.compile_writes({"ctrl": CtrlTargetsWrite()})
+    snapshot = reads["ctrl"]
+    assert snapshot is reads["alias"]
+    streams = [torch.cuda.Stream(device=device), torch.cuda.Stream(device=device)]
+    caller = torch.cuda.current_stream(device)
+    expected = snapshot.clone()
+    for index, stream in enumerate(streams, 1):
+        stream.wait_stream(caller)
+        with torch.cuda.stream(stream):
+            writes.buffer("ctrl").fill_(index)
+            writes.execute()
+            torch.testing.assert_close(snapshot, expected)
+            rows = torch.tensor([1], device=device)
+            reads.execute(rows)
+            expected[rows] = index
+            torch.testing.assert_close(snapshot, expected)
+            reads.execute()
+            expected.fill_(index)
+            torch.testing.assert_close(snapshot, expected)
+        caller.wait_stream(stream)

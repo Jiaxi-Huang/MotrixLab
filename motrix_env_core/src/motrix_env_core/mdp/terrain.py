@@ -50,7 +50,7 @@ def heightfield_lookup(grid: HeightFieldGrid, x: torch.Tensor, y: torch.Tensor) 
     arrive as zero-copy tensor views of the shared grid arrays.
     """
     if not grid.enabled:
-        return torch.full((x.shape[0],), float(grid.constant), dtype=torch.float64)
+        return torch.full_like(x, float(grid.constant), dtype=torch.float64)
     heights = grid.heights
     origin = grid.origin
     spacing = grid.spacing

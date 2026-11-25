@@ -72,7 +72,7 @@ class Trainer(TrainerBase):
         env_name = context.env_name
         self._rlcfg = context.rl_cfg
         self._env_name = env_name
-        self._env_spec = env_registry.resolve(env_name, sim=context.sim)
+        self._env_spec = env_registry.resolve(env_name, sim=context.sim, sim_device=context.sim_device)
         self._render = context.render
         self._resume_from = context.resume_from
         self._context = context
@@ -227,7 +227,22 @@ class Trainer(TrainerBase):
         # Provenance for performance snapshots: record the devices this run
         # actually uses (topology is the single source of truth), not the
         # host inventory.
-        annotate_run(self._context.run_dir, system=capture_system_info(topology=topology))
+        requested = self._env_spec.env_cfg.sim.device
+        sim_devices = []
+        for channel in transition_channels:
+            device = torch.device(requested)
+            if device.type == "cuda" and device.index is None:
+                owner = learner_devices[channel.consumer_id]
+                if owner.type != "cuda":
+                    raise ValueError("Unindexed CUDA simulation requires a CUDA learner for each collector")
+                device = torch.device("cuda", torch.cuda.current_device() if owner.index is None else owner.index)
+            sim_devices.append(str(device))
+        annotate_run(
+            self._context.run_dir,
+            system=capture_system_info(topology=topology),
+            sim_device=sim_devices[0],
+            collector_sim_devices=sim_devices,
+        )
         final_obs_enabled = max_episode_steps is not None
         transition_schema = fastsac_transition_schema(frame_dim, value_frame_dim, act_dim)
         final_stores: list[FinalObsStorage] | None = (
@@ -312,7 +327,8 @@ class Trainer(TrainerBase):
             f"[motrix.fastsac async] collector/learner training '{self._env_name}' learner={learner_device} "
             f"learner_replicas={num_learners} "
             + (f"learner_devices={[str(d) for d in learner_devices]} " if num_learners > 1 else "")
-            + f"collector_env=cpu collector_inference={collector_banner} num_collectors={num_collectors} "
+            + f"collector_env={list(dict.fromkeys(sim_devices))} collector_inference={collector_banner} "
+            f"num_collectors={num_collectors} "
             f"numa_nodes={numa_nodes} learner_numa_nodes={learner_numa_nodes} "
             f"num_envs={num_envs} iters={num_iterations} "
             f"from={resume_step} utd_mode={async_options.utd_mode}"
@@ -396,6 +412,7 @@ class Trainer(TrainerBase):
                 target=run_collector_process,
                 kwargs={
                     "env_spec": self._env_spec,
+                    "sim_device": sim_devices[i],
                     "cfg": cfg,
                     "num_envs": env_shards[i],
                     "dims": dims,

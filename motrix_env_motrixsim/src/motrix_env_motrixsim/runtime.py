@@ -345,6 +345,20 @@ class MotrixSimBackend(SimBackend):
 
     name = "motrixsim"
 
+    @classmethod
+    def for_device(cls, device):
+        if device.type != "cuda":
+            return super().for_device(device)
+        from importlib.util import find_spec
+
+        if find_spec("motrixsim.gpu") is None:
+            raise ImportError("MotrixSim CUDA requires motrix-env-motrixsim[gpu]")
+        if not torch.cuda.is_available() or (device.index is not None and device.index >= torch.cuda.device_count()):
+            raise ValueError(f"Requested MotrixSim CUDA device {device} is unavailable")
+        from motrix_env_motrixsim.gpu_runtime import MotrixCudaBackend
+
+        return MotrixCudaBackend
+
     def __init__(self, scene: SceneCfg, sim: SimCfg, num_envs: int, *, render: RenderConfig | None = None) -> None:
         super().__init__(scene, sim, num_envs, render=render)
         self._model: mtx.SceneModel = MotrixSimSceneCompiler().compile(scene, sim, render=render)

@@ -72,6 +72,7 @@ def create_training_handle(request: TrainRequest) -> frameworks.TrainerHandle:
         train_backend=provider.train_backend,
         algo=method.algo,
         sim=config.sim,
+        sim_device=config.sim_device,
         seed=config.seed,
         checkpoint_format=provider.checkpoint_format,
         runs_root=request.runs_root,

@@ -40,6 +40,7 @@ def _make_env(history_length: int = 1, value_dim: int | None = None) -> Mock:
         observations["value"] = torch.zeros((_NUM_ENVS, value_dim * history_length), dtype=torch.float32)
     observation_spec = ObservationSpec(groups)
     env = Mock(spec=DirectEnv)
+    env.device = torch.device("cpu")
     state = ArrayEnvState(
         obs=EnvObs(observations),
         reward=torch.ones(_NUM_ENVS, dtype=torch.float32),
@@ -104,7 +105,7 @@ def test_provider_applies_render_init_kwargs_before_wrapping(monkeypatch, mode):
         _env_name="cartpole",
         _sim="test-sim",
         _render=recording,
-        _context=SimpleNamespace(seed=7, num_envs=4, play_num_envs=2),
+        _context=SimpleNamespace(run=None, sim_device=None, seed=7, num_envs=4, play_num_envs=2),
         _set_seed=Mock(),
     )
     make = Mock()

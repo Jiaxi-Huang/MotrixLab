@@ -533,7 +533,7 @@ class ManagerProgramResolver:
         metrics = dict(self._env.metrics)
         commands = dict(self._env.command_terms)
         value = ManagerContext(
-            env_id=torch.arange(self._env.num_envs, dtype=torch.int64),
+            env_id=torch.arange(self._env.num_envs, dtype=torch.int64, device=self._env.device),
             actions=actions,
             commands=commands,
             metrics=metrics,
@@ -541,8 +541,8 @@ class ManagerProgramResolver:
             dt=float(self._env.cfg.ctrl_dt),
             rand=self._env._random,
             sim_reset_requested=self._env._sim_reset_requested,
-            terminated=torch.zeros(self._env.num_envs, dtype=torch.bool),
-            reward=torch.zeros(self._env.num_envs, dtype=torch.float32),
+            terminated=torch.zeros(self._env.num_envs, dtype=torch.bool, device=self._env.device),
+            reward=torch.zeros(self._env.num_envs, dtype=torch.float32, device=self._env.device),
         )
         self._validate_context_leaves(value)
         return value

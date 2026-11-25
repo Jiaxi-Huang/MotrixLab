@@ -80,8 +80,10 @@ def build_env(
     render: RenderConfig | None = None,
     mode: str = "train",
     seed: int | None = None,
+    sim_device: str | None = None,
 ) -> FastSacEnvWrap:
     env = env_spec.make(
+        **({"sim_device": sim_device} if sim_device is not None else {}),
         num_envs=num_envs,
         mode=mode,
         seed=seed,
@@ -244,6 +246,7 @@ def run_collector_process(
     run_dir: str,
     handshake: StartupHandshake,
     collector_device: torch.device,
+    sim_device: str | None = None,
     collector_id: int = 0,
     numa_node: int | None = None,
     cpus: list[int] | None = None,
@@ -265,7 +268,7 @@ def run_collector_process(
         obs_dim, critic_obs_dim, act_dim = dims
         device = torch.device("cpu")
         env_started = time.perf_counter()
-        env = build_env(env_spec, num_envs, device, seed=seed)
+        env = build_env(env_spec, num_envs, device, seed=seed, sim_device=sim_device)
         logger.info(
             "collector startup: env build (scene + manager kernels) finished in %.3fs",
             time.perf_counter() - env_started,

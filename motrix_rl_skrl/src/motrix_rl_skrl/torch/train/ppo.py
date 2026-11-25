@@ -128,6 +128,7 @@ class Trainer(SkrlPpoTrainerBase):
             num_envs=num_envs,
             mode=mode,
             sim=self._sim,
+            **({"sim_device": self._context.sim_device} if self._context.sim_device is not None else {}),
             seed=self._context.seed,
             headless=self._render.headless if self._render else False,
             record=self._render.record if self._render else None,

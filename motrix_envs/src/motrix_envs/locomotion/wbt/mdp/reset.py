@@ -53,7 +53,7 @@ class BodyPosResetCfg(ResetTermCfg):
         amplitude = np.asarray(self.noise, dtype=np.float32) * np.float32(self.noise_scale)
         return ResetTerm(
             _reset_body_pos,
-            torch.from_numpy(amplitude),
+            torch.as_tensor(amplitude),
             writes={"position": BodyPositionWrite((body,))},
         )
 
@@ -107,7 +107,7 @@ class BodyRotResetCfg(ResetTermCfg):
         amplitude = np.asarray(self.noise, dtype=np.float32) * np.float32(self.noise_scale)
         return ResetTerm(
             _reset_body_rot,
-            torch.from_numpy(amplitude),
+            torch.as_tensor(amplitude),
             writes={"rotation": BodyRotationWrite((body,))},
         )
 
@@ -138,7 +138,7 @@ class BodyLinVelResetCfg(ResetTermCfg):
         amplitude = np.asarray(self.noise, dtype=np.float32) * np.float32(self.noise_scale)
         return ResetTerm(
             _reset_body_lin_vel,
-            torch.from_numpy(amplitude),
+            torch.as_tensor(amplitude),
             writes={"linear_velocity": BodyLinearVelocityWrite((body,))},
         )
 
@@ -169,7 +169,7 @@ class BodyRotVelResetCfg(ResetTermCfg):
         amplitude = np.asarray(self.noise, dtype=np.float32) * np.float32(self.noise_scale)
         return ResetTerm(
             _reset_body_rot_vel,
-            torch.from_numpy(amplitude),
+            torch.as_tensor(amplitude),
             writes={"angular_velocity": BodyAngularVelocityWrite((body,))},
         )
 

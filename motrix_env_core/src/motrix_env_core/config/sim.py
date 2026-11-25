@@ -15,6 +15,8 @@ class SimCfg:
     solver_tolerance: float | None = None
     gravity: tuple[float, float, float] | None = None
 
+    device: str = "cpu"
+
     def validate(self) -> None:
         if isinstance(self.dt, bool) or not isfinite(self.dt) or self.dt <= 0.0:
             raise ValueError(f"sim.dt must be positive and finite, got {self.dt}")

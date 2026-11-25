@@ -6,7 +6,6 @@
 import math
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 
 from motrix_env_core.config import configclass
@@ -257,13 +256,7 @@ class WalkCommandCfg(CommandCfg):
             vel_limit_high=torch.tensor(self.vel_limit[1], dtype=torch.float32),
             stand_prob=float(self.stand_prob),
             resample_steps=float(max(int(round(self.resampling_time / self.ctrl_dt)), 1)),
-            phase_step=torch.from_numpy(
-                np.full(
-                    (num_envs, 1),
-                    2.0 * math.pi * self.ctrl_dt / self.gait_period,
-                    dtype=np.float32,
-                )
-            ),
+            phase_step=torch.full((num_envs, 1), 2.0 * math.pi * self.ctrl_dt / self.gait_period, dtype=torch.float32),
             gait_period_base=float(self.gait_period),
             gait_period_width=float(self.gait_period_randomization_width),
             curriculum_enabled=self.curriculum_enabled,

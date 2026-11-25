@@ -3,6 +3,7 @@
 
 import abc
 import dataclasses
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -136,9 +137,13 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
     def __init__(self, cfg: EnvCfgType, num_envs: int = 1):
         self._cfg = cfg
         self._num_envs = num_envs
+        self.device = torch.device(cfg.sim.device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self._step_context = nullcontext
         self.perf = Perf()
-        self.engine_error_codes = torch.zeros(num_envs, dtype=torch.int32)
-        self.engine_error_mask = torch.zeros(num_envs, dtype=torch.bool)
+        self.engine_error_codes = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+        self.engine_error_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         if cfg.scene is None:
             raise ValueError("EnvCfg.scene must be configured")
         self._render_spacing = cfg.render_spacing
@@ -175,10 +180,10 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         num_envs = self._num_envs
         self._state = self._new_state(
             obs,
-            torch.zeros((num_envs,), dtype=torch.float32),
-            torch.ones((num_envs,), dtype=torch.bool),
-            torch.zeros((num_envs,), dtype=torch.bool),
-            torch.zeros((num_envs,), dtype=torch.long),
+            torch.zeros((num_envs,), device=self.device, dtype=torch.float32),
+            torch.ones((num_envs,), device=self.device, dtype=torch.bool),
+            torch.zeros((num_envs,), device=self.device, dtype=torch.bool),
+            torch.zeros((num_envs,), device=self.device, dtype=torch.long),
         )
         self._reset_done_envs()
         with self.perf.scope("observation"):
@@ -206,7 +211,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
 
     def _zeros_box(self, space: gym.spaces.Box) -> torch.Tensor:
         dtype = torch.from_numpy(np.empty((), dtype=space.dtype)).dtype
-        return torch.zeros((self._num_envs, *space.shape), dtype=dtype)
+        return torch.zeros((self._num_envs, *space.shape), dtype=dtype, device=self.device)
 
     def _zeros_obs(self, spec: ObservationSpec) -> EnvObs:
         return EnvObs({name: self._zeros_box(group.space) for name, group in spec.groups.items()})
@@ -326,6 +331,10 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         ``reset(env_ids)`` for done rows (may refresh selected rows) ->
         ``compute_observation`` (whole-batch endpoint publication).
         """
+        with self._step_context():
+            return self._step(actions)
+
+    def _step(self, actions: torch.Tensor) -> ArrayEnvState:
         if self._state is None:
             with self.perf.scope("init_state"):
                 self.init_state()
@@ -343,16 +352,19 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         self._state.terminated.logical_or_(self.engine_error_mask)
         self._state.episode_steps += 1
         self._update_truncate()
+        self._process_episode_boundaries()
+        with self.perf.scope("observation"):
+            self._state = self.compute_observation(self._state)
+            self._state.obs = _as_obs(self._state.obs)
+        return self._state
+
+    def _process_episode_boundaries(self) -> None:
         trunc_ids = torch.nonzero(self._state.truncated, as_tuple=False).flatten()
         if trunc_ids.numel():
             with self.perf.scope("final_obs"):
                 self._state = self._state.replace(final_obs=self._capture_final_obs(trunc_ids))
         with self.perf.scope("reset"):
             self._reset_done_envs()
-        with self.perf.scope("observation"):
-            self._state = self.compute_observation(self._state)
-            self._state.obs = _as_obs(self._state.obs)
-        return self._state
 
 
 __all__ = ["ArrayEnv", "ArrayEnvState", "EnvCfgType", "FinalObs", "EnvObs"]

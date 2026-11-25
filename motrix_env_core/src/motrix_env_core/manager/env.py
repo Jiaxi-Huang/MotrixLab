@@ -230,7 +230,6 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         """
         if not isinstance(cfg, ManagerBasedEnvCfg):
             raise TypeError(f"{type(cfg).__name__} must inherit ManagerBasedEnvCfg.")
-        super().__init__(cfg, num_envs)
         self._build_seed = 1 if seed is None else seed
         from motrix_env_core.manager.random import RandomSource
 
@@ -239,11 +238,20 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         from motrix_env_core.sim.registry import create_sim_backend, default_sim_backend_name
 
         factory = create_sim_backend(backend or cfg.backend or default_sim_backend_name())
+        if cfg.sim.device != "cpu":
+            factory = factory.for_device(torch.device(cfg.sim.device))
+        super().__init__(cfg, num_envs)
         # Construction compiles the scene inside the backend: no compiled
         # artifact crosses the boundary.
         render = RenderConfig(headless=headless, record=record)
         self.sim: SimBackend = factory(cfg.scene, cfg.sim, num_envs, render=render)
+        self._step_context = self.sim.step_context
         self.model = self.sim.compile_model(cfg.model_query_cfgs())
+        # Term factories allocate their durable tensors during this scoped build.
+        with self.device:
+            self._build_terms(cfg)
+
+    def _build_terms(self, cfg: ManagerBasedEnvCfg) -> None:
         # Full-width ctrl buffer in canonical actuator order, owned by the
         # compiled ctrl write program; routing happens here, the backend only
         # receives the merged targets.
@@ -333,6 +341,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
                 self.num_envs,
                 context=f"Manager command {name!r}",
                 context_path=("commands", name),
+                device=self.device,
             ):
                 metric_name, value = binding
                 if metric_name in self.metrics:
@@ -548,6 +557,13 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         with self.perf.scope("reset_read_inputs"):
             self._compiled_manager_program.read_plan.read(self, env_ids)
 
+    def _process_episode_boundaries(self) -> None:
+        # A normal CUDA step needs only one host decision. Materialize
+        # compact reset/truncation indices only on steps that use them.
+        if self.device.type == "cuda" and not (self._state.done | self._sim_reset_requested[:, 0]).any():
+            return
+        super()._process_episode_boundaries()
+
     def _reset_done_envs(self) -> None:
         """Reset done lanes and requested sim-reset lanes in one pass.
 
@@ -698,9 +714,9 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
     def _make_kernel_buffers(self, state: ArrayEnvState) -> tuple[torch.Tensor, ...]:
         assert self._compiled_manager_program is not None
         layout = self._compiled_manager_program.layout
-        reward_terms = torch.empty((self.num_envs, len(layout.rewards)), dtype=torch.float32)
+        reward_terms = torch.empty((self.num_envs, len(layout.rewards)), dtype=torch.float32, device=self.device)
         weighted_reward_terms = torch.empty_like(reward_terms)
-        termination_masks = torch.empty((self.num_envs, len(layout.terminations)), dtype=torch.bool)
+        termination_masks = torch.empty((self.num_envs, len(layout.terminations)), dtype=torch.bool, device=self.device)
         state.reward_terms = {term.name: weighted_reward_terms[:, term.index] for term in layout.rewards}
         buffers = (
             reward_terms,

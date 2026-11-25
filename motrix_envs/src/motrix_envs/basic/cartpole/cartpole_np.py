@@ -91,8 +91,8 @@ class CartPoleEnv(DirectEnv):
         cfg: CartPoleEnvCfg = self._cfg
         rows = env_ids.numel()
         scale = cfg.reset_noise_scale
-        dof_pos = (torch.rand(rows, 2, dtype=torch.float32) * 2.0 - 1.0) * scale
-        dof_vel = (torch.rand(rows, 2, dtype=torch.float32) * 2.0 - 1.0) * scale
+        dof_pos = (torch.rand(rows, 2, dtype=torch.float32, device=self.device) * 2.0 - 1.0) * scale
+        dof_vel = (torch.rand(rows, 2, dtype=torch.float32, device=self.device) * 2.0 - 1.0) * scale
 
         self._reset_position[env_ids] = dof_pos
         self._reset_velocity[env_ids] = dof_vel

@@ -32,6 +32,7 @@ import torch
 
 from motrix_env_core.array.env import EnvObs
 from motrix_env_core.manager.kernel import EvaluationOutputs
+from motrix_env_core.manager.kernel_data.data import iter_leaves
 from motrix_env_core.manager.resolver import (
     CommandAdvanceHook,
     CommandResetHook,
@@ -140,7 +141,17 @@ class TorchManagerRuntime:
         self.layout = program.layout
         self.compile_enabled = compile
         self.ctx = program.context
-        _apply_default_thread_cap(env.num_envs)
+        if self.ctx.env_id.is_cuda:
+            self._static_options = {"triton.cudagraphs": True}
+            if compile:
+                # Terms mutate the persistent command, action and metric buffers in
+                # place. Dynamo guards their addresses when recording a CUDA graph.
+                for _, _, tensor in iter_leaves(self.ctx):
+                    if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+                        torch._dynamo.mark_static_address(tensor)
+        else:
+            _apply_default_thread_cap(env.num_envs)
+            self._static_options = _compile_options()
 
         # Typed call sequences encode the execution contract structurally:
         # evaluate follows the fixed phase order command update hooks ->
@@ -156,7 +167,9 @@ class TorchManagerRuntime:
         self.observations: dict[str, tuple[ObservationTermCall, ...]] = program.observations
         reward_cfgs = env.cfg.reward_cfgs()
         self.reward_weights = torch.tensor(
-            [float(reward_cfgs[term.name].weight) for term in self.layout.rewards], dtype=torch.float32
+            [float(reward_cfgs[term.name].weight) for term in self.layout.rewards],
+            dtype=torch.float32,
+            device=self.ctx.env_id.device,
         )
         # Reset-term compact-write layout mirrors SimResetRuntime.buffers:
         # one entry per declared write, ordered by term then output name.
@@ -225,6 +238,10 @@ class TorchManagerRuntime:
         reward_plan = self.rewards
         termination_plan = self.terminations
 
+        if self.compile_enabled and ctx.env_id.is_cuda:
+            for buffer in buffers:
+                torch._dynamo.mark_static_address(buffer)
+
         def kernel(reward_view: torch.Tensor, terminated_view: torch.Tensor) -> None:
             for hook in update_hooks:
                 receiver = ctx.commands[hook.receiver_key]
@@ -248,7 +265,7 @@ class TorchManagerRuntime:
             terminated_view.copy_(terminated if terminated is not None else torch.zeros_like(terminated_view))
 
         if self.compile_enabled:
-            return torch.compile(kernel, dynamic=False, options=_compile_options())
+            return torch.compile(kernel, dynamic=False, options=self._static_options)
         return kernel
 
     def _build_compiled_observe(self) -> Callable[[EnvObs], None]:
@@ -261,11 +278,21 @@ class TorchManagerRuntime:
         num_envs = ctx.env_id.shape[0]
         term_bufs = {
             group_name: tuple(
-                torch.empty(num_envs, term.output_slice.stop - term.output_slice.start, dtype=torch.float32)
+                torch.empty(
+                    num_envs,
+                    term.output_slice.stop - term.output_slice.start,
+                    dtype=torch.float32,
+                    device=ctx.env_id.device,
+                )
                 for term in group.terms
             )
             for group_name, group in self.layout.observations.items()
         }
+        if self.compile_enabled and ctx.env_id.is_cuda:
+            for group_buffers in term_bufs.values():
+                for buffer in group_buffers:
+                    torch._dynamo.mark_static_address(buffer)
+
         per_term_plan = tuple(
             (
                 group_name,
@@ -287,14 +314,17 @@ class TorchManagerRuntime:
                 target.copy_(torch.cat([buf for _call, buf in entries], dim=1))
 
             if self.compile_enabled:
-                return torch.compile(group_kernel, dynamic=False, options=_compile_options())
+                return torch.compile(group_kernel, dynamic=False, options=self._static_options)
             return group_kernel
 
         group_kernels = {group_name: make_group_kernel(entries) for group_name, entries in per_term_plan}
 
         def kernel(outputs: EnvObs) -> None:
             for name, group_kernel in group_kernels.items():
-                group_kernel(outputs[name])
+                target = outputs[name]
+                if self.compile_enabled and target.is_cuda:
+                    torch._dynamo.mark_static_address(target)
+                group_kernel(target)
 
         return kernel
 
@@ -337,7 +367,9 @@ class TorchManagerRuntime:
                 call.invoke(ctx, env_ids, sim_writes)
 
         if self.compile_enabled:
-            kernel = torch.compile(kernel, dynamic=True, options=_compile_options())
+            kernel = torch.compile(
+                kernel, dynamic=True, options={} if self.ctx.env_id.is_cuda else self._static_options
+            )
 
         last_count: int | None = None
         writes_by_term: tuple[dict[str, torch.Tensor], ...] = ()

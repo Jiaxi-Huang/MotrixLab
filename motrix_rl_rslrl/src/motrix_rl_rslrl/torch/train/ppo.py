@@ -67,6 +67,7 @@ class Trainer(TrainerBase):
         env = env_registry.make(
             self._env_name,
             sim=self._sim,
+            **({"sim_device": self._context.sim_device} if self._context.sim_device is not None else {}),
             num_envs=self._context.num_envs,
             mode="train",
             seed=self._context.seed,
@@ -77,6 +78,10 @@ class Trainer(TrainerBase):
         logger.info(f"Using device: {device}")
 
         # Wrap environment for RSLRL
+        if self._context.run is not None:
+            from motrix_rl.runs import annotate_run
+
+            annotate_run(self._context.run_dir, sim_device=str(env.device))
         vec_env = wrap_env(env, device, render=self._render)
 
         # Create RSLRL config - use to_dict() method
@@ -137,6 +142,7 @@ class Trainer(TrainerBase):
         env = env_registry.make(
             self._env_name,
             sim=self._sim,
+            **({"sim_device": self._context.sim_device} if self._context.sim_device is not None else {}),
             num_envs=self._context.play_num_envs,
             mode="play",
             seed=self._context.seed,
