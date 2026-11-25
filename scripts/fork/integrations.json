@@ -1,0 +1,12 @@
+{
+  "main-supermimic": {
+    "topics": [
+      "fix/quaternion-gradients",
+      "perf/compiled-kinematics",
+      "feat/manager-truncation"
+    ],
+    "downstream": [
+      "supermimic"
+    ]
+  }
+}

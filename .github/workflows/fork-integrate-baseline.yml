@@ -1,0 +1,155 @@
+name: Integrate one fork baseline
+on:
+  workflow_call:
+    inputs:
+      baseline:
+        required: true
+        type: string
+      resolved_candidate:
+        required: false
+        default: ""
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: fork-integration-${{ inputs.baseline }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'Jiaxi-Huang/MotrixLab'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.build.outputs.changed }}
+      sha: ${{ steps.build.outputs.sha }}
+      ref: ${{ steps.build.outputs.ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          fetch-depth: 0
+          lfs: true
+      - name: Configure author
+        run: |
+          git config user.name 'fork-integration[bot]'
+          git config user.email 'fork-integration@users.noreply.github.com'
+      - id: build
+        env:
+          RESOLVED: ${{ inputs.resolved_candidate }}
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ -n "$RESOLVED" ]; then
+            git check-ref-format "refs/heads/$RESOLVED"
+            args+=(--resolved-candidate "origin/$RESOLVED")
+          fi
+          python scripts/fork/sync.py prepare --baseline "$BASELINE" --run-id "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --output "$RUNNER_TEMP/candidate.json" "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/prepare.log"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          data = json.loads((Path(os.environ['RUNNER_TEMP']) / 'candidate.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"changed={str(data['changed']).lower()}\n")
+              out.write(f"sha={data.get('candidate', '')}\nref={data.get('ref', '')}\n")
+          PY
+      - name: Capture failed merge diagnostics
+        if: failure()
+        run: |
+          git status --porcelain > "$RUNNER_TEMP/merge-status.txt"
+          git diff > "$RUNNER_TEMP/merge.diff"
+          git bundle create "$RUNNER_TEMP/failed.bundle" --all
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: candidate-${{ inputs.baseline }}
+          path: |
+            ${{ runner.temp }}/candidate.json
+            ${{ runner.temp }}/*.bundle
+            ${{ runner.temp }}/prepare.log
+            ${{ runner.temp }}/merge-status.txt
+            ${{ runner.temp }}/merge.diff
+          retention-days: 14
+  test:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          lfs: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+      - name: Install locked environment
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          if [ "$PYTHON_VERSION" = 3.10 ]; then
+            sh install.sh --all --python "$PYTHON_VERSION"
+          else
+            uv sync --frozen --python "$PYTHON_VERSION" --extra cuda --extra rslrl --extra skrl-jax --group test
+          fi
+      - name: Fast and slow contracts
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          args=()
+          if [ "$PYTHON_VERSION" != 3.10 ]; then args+=(--ignore=motrix_deploy_unitree/tests); fi
+          .venv/bin/python -m pytest --junitxml=test-results/contracts.xml -m 'not integration' "${args[@]}"
+      - name: Fork orchestration contracts
+        run: .venv/bin/python -m pytest scripts/fork/tests -m integration
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: tests-${{ inputs.baseline }}-${{ matrix.python }}
+          path: test-results/
+  lint:
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          lfs: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884
+      - run: uvx prek==0.5.2 run --all-files
+  publish:
+    needs: [prepare, test, lint]
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-${{ inputs.baseline }}
+          path: ${{ runner.temp }}/candidate
+      - run: python scripts/fork/sync.py publish --manifest "$RUNNER_TEMP/candidate/candidate.json"
+  cleanup:
+    needs: [prepare, test, lint, publish]
+    if: always() && github.repository == 'Jiaxi-Huang/MotrixLab'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Delete temporary candidate ref
+        env:
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          ref="integration/$BASELINE/candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          if git ls-remote --exit-code --heads origin "$ref"; then
+            git push origin --delete "$ref"
+          fi

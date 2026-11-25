@@ -1,0 +1,56 @@
+name: Fork integration
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Configured main-* branch; empty means all baselines"
+        required: false
+        type: string
+      resolved_candidate:
+        description: "Fork branch with resolved merges; requires a single baseline"
+        required: false
+        type: string
+permissions:
+  contents: write
+jobs:
+  profiles:
+    if: github.repository == 'Jiaxi-Huang/MotrixLab'
+    runs-on: ubuntu-latest
+    outputs:
+      baselines: ${{ steps.select.outputs.baselines }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: main
+      - id: select
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          RESOLVED: ${{ inputs.resolved_candidate }}
+        run: |
+          python - <<'PYTHON'
+          import json, os
+          from pathlib import Path
+          profiles = json.loads(Path('scripts/fork/integrations.json').read_text())
+          selected = os.environ['BASELINE']
+          if selected and selected not in profiles:
+              raise SystemExit('Unknown integration baseline')
+          if os.environ['RESOLVED'] and not selected:
+              raise SystemExit('Resolved candidate requires one baseline')
+          names = [selected] if selected else list(profiles)
+          if any(not name.startswith('main-') for name in names):
+              raise SystemExit('Integration branches must use main-* names')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('baselines=' + json.dumps(names) + '\n')
+          PYTHON
+  integrate:
+    needs: profiles
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline: ${{ fromJSON(needs.profiles.outputs.baselines) }}
+    uses: ./.github/workflows/fork-integrate-baseline.yml
+    with:
+      baseline: ${{ matrix.baseline }}
+      resolved_candidate: ${{ inputs.resolved_candidate || '' }}
