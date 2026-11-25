@@ -35,7 +35,7 @@ class Trainer(TrainerBase):
         env_name = context.env_name
         self._rlcfg = context.rl_cfg
         self._env_name = env_name
-        self._env_spec = env_registry.resolve(env_name, sim=context.sim)
+        self._env_spec = env_registry.resolve(env_name, sim=context.sim, sim_device=context.sim_device)
         self._render = context.render
         self._resume_from = context.resume_from
         self._context = context
@@ -105,6 +105,10 @@ class Trainer(TrainerBase):
 
         try:
             env = self._make_env(self._context.num_envs, render=self._render)
+            if self._context.run is not None:
+                from motrix_rl.runs import annotate_run
+
+                annotate_run(self._context.run_dir, sim_device=str(env.env.device))
             agent = self._make_agent(env)
             num_iterations = self._rlcfg.trainer.num_learning_iterations
 

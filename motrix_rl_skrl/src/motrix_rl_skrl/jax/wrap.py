@@ -18,6 +18,8 @@ from motrix_rl.utils import env_infos
 
 def _as_jnp(value, dtype) -> jax.Array:
     """Convert torch env state to a JAX array: host view plus device transfer."""
+    if value.is_cuda:
+        return jax.dlpack.from_dlpack(value.contiguous()).astype(dtype)
     return jnp.asarray(np.asarray(value), dtype=dtype)
 
 
@@ -33,6 +35,7 @@ class SkrlJaxEnvWrap(SkrlWrapper):
     _renderer: SimRenderer | VideoRecorder | None = None
 
     def __init__(self, env: ArrayEnv, render: RenderConfig | None = None):
+        self._sim_device = env.device
         super().__init__(env)
         self._renderer = create_renderer(env, render)
 
@@ -51,7 +54,7 @@ class SkrlJaxEnvWrap(SkrlWrapper):
     ]:
         # ``from_dlpack`` is the direct JAX-to-torch path; ``.cpu()`` lands
         # GPU-resident batches on the host where the CPU frontend steps.
-        state = self._env.step(torch.from_dlpack(actions).cpu())
+        state = self._env.step(torch.from_dlpack(actions).to(self._sim_device))
         return (
             _as_jnp(state.obs.policy, jnp.float32),
             _as_jnp(state.reward.reshape(-1, 1), jnp.float32),

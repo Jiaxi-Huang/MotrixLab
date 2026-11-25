@@ -49,10 +49,14 @@ class DirectEnv(ArrayEnv[DirectEnvCfgType]):
         headless: bool = False,
         record: RecordConfig | None = None,
     ):
-        super().__init__(cfg, num_envs)
         from motrix_env_core.sim.registry import create_sim_backend, default_sim_backend_name
 
         factory = create_sim_backend(backend or default_sim_backend_name())
+        if cfg.sim.device != "cpu":
+            import torch
+
+            factory = factory.for_device(torch.device(cfg.sim.device))
+        super().__init__(cfg, num_envs)
         # Construction compiles the scene inside the backend: no compiled
         # artifact crosses the boundary.
         render = RenderConfig(headless=headless, record=record)

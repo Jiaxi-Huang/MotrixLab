@@ -36,6 +36,7 @@ class ViewConfig:
     env: str | None = None
     robot: str | None = None
     sim: str | None = None
+    sim_device: str | None = None
     num_envs: int = 1
 
 
@@ -62,7 +63,7 @@ def _run_np(env: ArrayEnv):
     while True:
         t0 = time.monotonic()
         actions = torch.from_numpy(_sample_random_action_np(env))
-        env.step(actions)
+        env.step(actions.to(env.device))
         renderer.render()
         real_dt = time.monotonic() - t0
         sleep_dt = env_dt - real_dt
@@ -186,7 +187,8 @@ def run(cfg: ViewConfig) -> None:
 
     env_name = cfg.env or DEFAULT_ENV_NAME
     try:
-        env = registry.make(env_name, num_envs=cfg.num_envs)
+        overrides = {key: val for key, val in (("sim", cfg.sim), ("sim_device", cfg.sim_device)) if val is not None}
+        env = registry.make(env_name, num_envs=cfg.num_envs, **overrides)
     except ModuleNotFoundError as exc:
         # Torch-frontend environments import torch when their factory resolves the env class.
         if exc.name == "torch":

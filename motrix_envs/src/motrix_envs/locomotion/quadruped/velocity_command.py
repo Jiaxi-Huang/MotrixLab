@@ -25,10 +25,12 @@ class RandomPlanarVelocityBinding(CommandBinding[PlanarVelocityCommand]):
         self._rng = rng
 
     def read_command(self, *, batch_size: int = 1) -> PlanarVelocityCommand:
-        u = torch.rand((batch_size, 3), generator=self._rng)
+        u = torch.rand((batch_size, 3), generator=self._rng, device=self._rng.device)
         values = self._lower + (self._upper - self._lower) * u
         if self._standing_probability > 0.0:
-            standing = torch.rand((batch_size,), generator=self._rng) < self._standing_probability
+            standing = (
+                torch.rand((batch_size,), generator=self._rng, device=self._rng.device) < self._standing_probability
+            )
             values[standing] = 0.0
         return PlanarVelocityCommand(values)
 

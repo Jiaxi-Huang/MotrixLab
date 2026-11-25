@@ -105,6 +105,12 @@ class SimBackend(abc.ABC):
 
     name: str
 
+    @classmethod
+    def for_device(cls, device: torch.device) -> type[SimBackend]:
+        if device.type != "cpu":
+            raise ValueError(f"{cls.name} does not support simulation on {device}")
+        return cls
+
     def __init__(self, scene: SceneCfg, sim: SimCfg, num_envs: int, *, render: RenderConfig | None = None) -> None:
         """Compile ``scene`` and allocate ``num_envs`` batched data rows.
 

@@ -136,9 +136,12 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
     def __init__(self, cfg: EnvCfgType, num_envs: int = 1):
         self._cfg = cfg
         self._num_envs = num_envs
+        self.device = torch.device(cfg.sim.device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
         self.perf = Perf()
-        self.engine_error_codes = torch.zeros(num_envs, dtype=torch.int32)
-        self.engine_error_mask = torch.zeros(num_envs, dtype=torch.bool)
+        self.engine_error_codes = torch.zeros(num_envs, dtype=torch.int32, device=self.device)
+        self.engine_error_mask = torch.zeros(num_envs, dtype=torch.bool, device=self.device)
         if cfg.scene is None:
             raise ValueError("EnvCfg.scene must be configured")
         self._render_spacing = cfg.render_spacing
@@ -175,10 +178,10 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
         num_envs = self._num_envs
         self._state = self._new_state(
             obs,
-            torch.zeros((num_envs,), dtype=torch.float32),
-            torch.ones((num_envs,), dtype=torch.bool),
-            torch.zeros((num_envs,), dtype=torch.bool),
-            torch.zeros((num_envs,), dtype=torch.long),
+            torch.zeros((num_envs,), device=self.device, dtype=torch.float32),
+            torch.ones((num_envs,), device=self.device, dtype=torch.bool),
+            torch.zeros((num_envs,), device=self.device, dtype=torch.bool),
+            torch.zeros((num_envs,), device=self.device, dtype=torch.long),
         )
         self._reset_done_envs()
         with self.perf.scope("observation"):
@@ -206,7 +209,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
 
     def _zeros_box(self, space: gym.spaces.Box) -> torch.Tensor:
         dtype = torch.from_numpy(np.empty((), dtype=space.dtype)).dtype
-        return torch.zeros((self._num_envs, *space.shape), dtype=dtype)
+        return torch.zeros((self._num_envs, *space.shape), dtype=dtype, device=self.device)
 
     def _zeros_obs(self, spec: ObservationSpec) -> EnvObs:
         return EnvObs({name: self._zeros_box(group.space) for name, group in spec.groups.items()})

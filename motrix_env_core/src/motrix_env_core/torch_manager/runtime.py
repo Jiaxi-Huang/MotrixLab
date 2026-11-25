@@ -156,7 +156,9 @@ class TorchManagerRuntime:
         self.observations: dict[str, tuple[ObservationTermCall, ...]] = program.observations
         reward_cfgs = env.cfg.reward_cfgs()
         self.reward_weights = torch.tensor(
-            [float(reward_cfgs[term.name].weight) for term in self.layout.rewards], dtype=torch.float32
+            [float(reward_cfgs[term.name].weight) for term in self.layout.rewards],
+            dtype=torch.float32,
+            device=self.ctx.env_id.device,
         )
         # Reset-term compact-write layout mirrors SimResetRuntime.buffers:
         # one entry per declared write, ordered by term then output name.
@@ -261,7 +263,12 @@ class TorchManagerRuntime:
         num_envs = ctx.env_id.shape[0]
         term_bufs = {
             group_name: tuple(
-                torch.empty(num_envs, term.output_slice.stop - term.output_slice.start, dtype=torch.float32)
+                torch.empty(
+                    num_envs,
+                    term.output_slice.stop - term.output_slice.start,
+                    dtype=torch.float32,
+                    device=ctx.env_id.device,
+                )
                 for term in group.terms
             )
             for group_name, group in self.layout.observations.items()

@@ -44,6 +44,7 @@ def test_numpy_adapter_reads_final_result_without_consuming_environment_state():
     )
     initial = state.replace(final_obs=None)
     env = SimpleNamespace(
+        device=torch.device("cpu"),
         num_envs=1,
         observation_spec=ObservationSpec({"policy": ObservationGroupSpec(gym.spaces.Box(-np.inf, np.inf, (1,)))}),
         action_space=gym.spaces.Box(-1.0, 1.0, (1,), dtype=np.float32),

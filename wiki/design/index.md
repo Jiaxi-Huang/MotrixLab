@@ -6,6 +6,7 @@
 
 ## 文档列表
 
+- [MotrixSim CUDA 仿真设计](./motrixsim-gpu.md)
 - [项目整体架构设计](./architecture.md)
   系统总体分层、核心原则（Model/Data/State 分离、环境与 RL 框架解耦、注册表驱动、配置层次继承）、仿真后端抽象、RL 框架集成方式和数据流总览。
 - [Manager 设计](./manager/index.md)

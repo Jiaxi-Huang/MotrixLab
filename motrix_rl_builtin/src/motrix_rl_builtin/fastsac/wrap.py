@@ -36,14 +36,15 @@ class FastSacEnvWrap:
     Wraps a Motrix environment (``ArrayEnv`` frontends) as the torch-tensor
     vectorized environment consumed by FastSAC. The frontend already exposes
     torch state and consumes torch actions; state passes through with only a
-    device move to the trainer device. Environments simulate on CPU, so the
+    device move to the trainer device. The
     actor maps its tanh output to the action range declared by the
-    environment and the wrapper clips on CPU before stepping. Done
+    environment and the wrapper clips on the simulation device before stepping. Done
     environments are auto-reset by the environment; the returned observation
     is therefore the post-reset observation for those environments.
     """
 
     def __init__(self, env: ABEnv, device: torch.device, render: RenderConfig | None = None) -> None:
+        self._sim_device = env.device
         action_space = env.action_space
         if not isinstance(action_space, gym.spaces.Box):
             raise TypeError("FastSAC supports only Box action spaces.")
@@ -51,9 +52,9 @@ class FastSacEnvWrap:
         self._env = env
         self.device = device
         self.num_envs = env.num_envs
-        # Bounds live on CPU alongside the env-bound actions clamped in step.
-        self._low_t = torch.as_tensor(action_space.low, dtype=torch.float32)
-        self._high_t = torch.as_tensor(action_space.high, dtype=torch.float32)
+        # Clamp actions alongside the simulator.
+        self._low_t = torch.as_tensor(action_space.low, dtype=torch.float32, device=self._sim_device)
+        self._high_t = torch.as_tensor(action_space.high, dtype=torch.float32, device=self._sim_device)
         self._renderer = create_renderer(env, render)
 
     @property
@@ -96,8 +97,14 @@ class FastSacEnvWrap:
         return FinalObs(final.env_ids, self.stage_frames(final.obs.policy, final.obs.value_or_policy))
 
     def step(self, actions: torch.Tensor) -> FastSacStepResult:
-        env_actions = torch.clamp(actions.detach().cpu(), self._low_t, self._high_t)
+        env_actions = torch.clamp(actions.detach().to(self._low_t.device), self._low_t, self._high_t)
         state = self._env.step(env_actions)
+        final = state.final_obs
+        if final is not None and final.env_ids.device != self.device:
+            final = FinalObs(
+                final.env_ids.to(self.device),
+                EnvObs({key: value.to(self.device) for key, value in final.obs.groups.items()}),
+            )
         return FastSacStepResult(
             obs=state.obs.policy.to(self.device),
             critic_obs=state.obs.value_or_policy.to(self.device),
@@ -106,7 +113,7 @@ class FastSacEnvWrap:
             truncated=state.truncated.to(device=self.device, dtype=torch.bool),
             # None when no row truncated or the implementation does not
             # capture finals.
-            final_obs=state.final_obs,
+            final_obs=final,
             info=env_infos(state),
         )
 

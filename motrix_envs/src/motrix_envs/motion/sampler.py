@@ -117,7 +117,7 @@ class UniformTimestepsSampler(MotionStartSampler):
 
 def _clip_geometry(clip: WbtMotionClip) -> tuple[np.ndarray, np.ndarray]:
     """Per-clip ``(start, end)`` global frame bounds from the per-frame boundaries."""
-    ends = np.unique(clip.frame_clip_end.numpy())
+    ends = np.unique(clip.frame_clip_end.cpu().numpy())
     starts = np.concatenate(([0], ends[:-1] + 1)).astype(np.int64)
     return starts, ends.astype(np.int64)
 
@@ -181,10 +181,10 @@ class AdaptiveTimestepsSampler(MotionStartSampler):
         offsets = np.concatenate(([0], np.cumsum(bins)[:-1]))
         num_bins = int(bins.sum())
         return AdaptiveTimestepsSampler(
-            clip_frame_start=torch.from_numpy(starts),
-            clip_frame_end=torch.from_numpy(ends),
-            clip_bins=torch.from_numpy(bins),
-            bin_clip_offset=torch.from_numpy(offsets),
+            clip_frame_start=torch.as_tensor(starts),
+            clip_frame_end=torch.as_tensor(ends),
+            clip_bins=torch.as_tensor(bins),
+            bin_clip_offset=torch.as_tensor(offsets),
             failed_count=torch.zeros((num_bins,), dtype=torch.float32),
             current_failed=torch.zeros((num_bins,), dtype=torch.float32),
             sampling_cdf=torch.cumsum(torch.full((num_bins,), 1.0 / num_bins), dim=0),
@@ -283,7 +283,7 @@ def per_clip_bins(clip: WbtMotionClip, bin_frames: int) -> tuple[np.ndarray, np.
     frame minimum), so a drawn start never begins on a terminal frame while a
     nonterminal one exists in that clip.
     """
-    ends_per_frame = clip.frame_clip_end.numpy()
+    ends_per_frame = clip.frame_clip_end.cpu().numpy()
     starts = np.concatenate(([0], np.flatnonzero(np.diff(ends_per_frame) != 0) + 1)).astype(np.int64)
     ends = ends_per_frame[starts]
     bin_start = []
@@ -370,8 +370,8 @@ class ReturnTimestepsSampler(MotionStartSampler):
         num_bins = int(bin_start.size)
         num_frames = clip.joint_pos.shape[0]
         return ReturnTimestepsSampler(
-            bin_start=torch.from_numpy(bin_start),
-            bin_span=torch.from_numpy(bin_span),
+            bin_start=torch.as_tensor(bin_start),
+            bin_span=torch.as_tensor(bin_span),
             sampling_cdf=torch.cumsum(torch.full((num_bins,), 1.0 / num_bins), dim=0),
             bin_return=torch.zeros((num_bins,), dtype=torch.float32),
             bin_history=torch.full((num_bins,), 1.0 / max(num_bins, 1), dtype=torch.float32),

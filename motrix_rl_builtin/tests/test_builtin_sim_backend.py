@@ -46,6 +46,7 @@ def _make_env():
         high=np.array([2.0, 3.0], dtype=np.float32),
     )
     env = Mock(spec=DirectEnv)
+    env.device = torch.device("cpu")
     state = ArrayEnvState(
         obs=EnvObs({"policy": torch.zeros((_NUM_ENVS, _OBS_DIM), dtype=torch.float32)}),
         reward=torch.ones(_NUM_ENVS, dtype=torch.float32),

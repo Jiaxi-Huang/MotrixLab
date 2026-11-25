@@ -63,7 +63,7 @@ class JointPositionActionTerm(ActionTerm):
         super().__init__(space, state)
         # Seeded generator driving reset-time delay resampling; lives on the
         # term (not the kernel-data state) because it is host-only.
-        self.generator = torch.Generator()
+        self.generator = torch.Generator(device=state.action_queue.device)
 
     def _process(self, actions: torch.Tensor) -> torch.Tensor:
         """Map raw policy actions to targets using manager-owned action history.
@@ -92,6 +92,7 @@ class JointPositionActionTerm(ActionTerm):
                 state.delay_hi + 1,
                 (env_ids.numel(),),
                 generator=self.generator,
+                device=state.delay_steps.device,
             )
 
 
@@ -166,7 +167,7 @@ class JointPositionActionCfg(ActionCfg):
                 raise ValueError(f"position actuator {spec.name!r} must define or inherit ctrl_range")
             ctrl_ranges.append(spec.ctrl_range)
         space = joint_position_action_space_from_ctrl_ranges(
-            torch.tensor(ctrl_ranges, dtype=torch.float32), state.default_angles.cpu(), state.action_scales.cpu()
+            torch.tensor(ctrl_ranges, dtype=torch.float32), state.default_angles, state.action_scales
         )
         term = JointPositionActionTerm(space, state)
         # Reset-time delay resampling is reproducible per environment seed.
@@ -198,7 +199,7 @@ class JointPositionActionCfg(ActionCfg):
 
     @staticmethod
     def _read_position_actuator_kps(model: SimModel) -> torch.Tensor:
-        return torch.as_tensor(model.others["actuator_kp"]).detach().cpu()
+        return torch.as_tensor(model.others["actuator_kp"]).detach()
 
     @staticmethod
     def _read_position_actuator_effort_limits(model: SimModel) -> torch.Tensor:
