@@ -131,31 +131,38 @@ class CudaWrites(WriteProgram):
         return self._buffers[name]
 
     def execute(self, env_ids=None):
+        rows = slice(None) if env_ids is None else env_ids
+        self._execute(env_ids, rows)
+
+    def execute_compact(self, env_ids, buffers):
+        self._execute(env_ids, slice(0, env_ids.numel()))
+
+    def _execute(self, env_ids, source_rows):
         backend = self._backend
         rows = slice(None) if env_ids is None else env_ids
         if self._reset:
             backend.reset_rows(rows)
         for key, (target, columns) in self._targets.items():
             row_index = rows if env_ids is None else rows[:, None]
-            target[row_index, columns] = self._buffers[key].flatten(1)[rows]
+            target[row_index, columns] = self._buffers[key].flatten(1)[source_rows]
         if self._refresh or self._parameters:
             with backend.physics_stream():
                 for key, (setters, spin_roll) in self._parameters.items():
                     values = self._buffers[key]
                     if spin_roll is not None:
-                        if (values[rows, :, 1:] != spin_roll).any():
+                        if (values[source_rows, :, 1:] != spin_roll).any():
                             raise NotImplementedError("MotrixSim CUDA 1.0.0 supports only sliding-friction overrides")
                         values = values[:, :, 0]
                     if env_ids is not None:
                         selected = torch.full_like(values, torch.nan)
-                        selected[rows] = values[rows]
+                        selected[rows] = values[source_rows]
                         values = selected
                     for column, setter in enumerate(setters):
                         setter(backend.data, wp.from_torch(values[:, column].contiguous()))
                 for key, (bodies, components) in self._mocap.items():
                     for i, mocap in enumerate(bodies):
                         poses = wp.to_torch(mocap.get_pose(backend.data))
-                        poses[rows, components] = self._buffers[key][rows, i]
+                        poses[rows, components] = self._buffers[key][source_rows, i]
                         backend.set_mocap_pose(mocap, poses, rows)
                 if self._refresh:
                     backend.model.forward_kinematic(backend.data)

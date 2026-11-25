@@ -121,7 +121,7 @@ sh install.sh --docs
 | `--rslrl` | 添加 RSL-RL provider |
 | `--skrl-jax` | 添加 SKRL JAX runtime，仅 Linux |
 | `--skrl-torch` | 兼容性参数；SKRL Torch 已是仓库必需依赖 |
-| `--sim-gpu` | 安装 NVIDIA MotrixSim CUDA 仿真 SDK 1.0.0。在支持的 NVIDIA 主机上运行 `sh install.sh --gpu cuda --sim-gpu`。 |
+| `--sim-gpu` | 安装 NVIDIA CUDA 仿真 SDK（`motrixsim-gpu`）。在支持的 NVIDIA 主机上运行 `sh install.sh --gpu cuda --sim-gpu`。 |
 | `--docs` | 添加文档工具链 |
 | `--all` | 完整开发环境，仅 Python 3.10 |
 | `--help` | 查看脚本的完整参数说明 |

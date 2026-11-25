@@ -614,6 +614,9 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             sim_reset_ids = _validate_reset_ids(sim_reset_ids, "sim_reset_ids")
         if self._state.final_obs is not None:
             self._state = self._state.replace(final_obs=None)
+        if sim_reset_ids is not None and env_ids.numel():
+            # Explicit callers can supply overlapping sets. Episode reset takes precedence.
+            sim_reset_ids = sim_reset_ids[~torch.isin(sim_reset_ids, env_ids)]
         self._reset_rows(env_ids, sim_reset_ids)
         self._state.episode_steps[env_ids] = 0
 
@@ -632,9 +635,6 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         # Context remains whole-batch and never carries reset-pass scratch.
         episode_reset = torch.ones_like(env_ids, dtype=torch.bool)
         if sim_reset_ids is not None and sim_reset_ids.numel():
-            if env_ids.numel():
-                # Episode reset wins when the public caller supplies overlapping sets.
-                sim_reset_ids = sim_reset_ids[~torch.isin(sim_reset_ids, env_ids)]
             episode_reset = torch.cat([episode_reset, torch.zeros_like(sim_reset_ids, dtype=torch.bool)])
             env_ids = torch.cat([env_ids, sim_reset_ids])
         if env_ids.numel():

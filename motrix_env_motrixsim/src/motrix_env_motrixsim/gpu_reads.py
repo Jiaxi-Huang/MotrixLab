@@ -29,17 +29,23 @@ class CudaReads(PhysicsReadProgram):
                     torch._dynamo.mark_static_address(output)
                 self._outputs[query] = output
         fields = tuple((self._outputs[q], project) for q, project in projections.items())
-        self._fields = fields
 
         def publish(values):
             for output, project in fields:
                 output.copy_(project(values))
 
+        def publish_rows(values, rows):
+            for output, project in fields:
+                output[rows] = project(values)[rows].to(torch.float32)
+
+        # Fuse indexed projection with the row scatter. Only the reset count varies.
+        self._publish_rows = torch.compile(publish_rows, options={"triton.cudagraphs": False})
+
         # Different environments specialize this closure for different query
         # layouts. Allow Dynamo to fall back when its per-code cache fills.
         if self._sources:
             self._publish = torch.compile(publish, dynamic=False, mode="reduce-overhead")
-        elif self._fields:
+        elif fields:
             # All inputs here are persistent SceneData views or fixed model indices.
             # Capture only snapshot publication; initialization never advances physics.
             with backend.physics_stream():
@@ -126,12 +132,13 @@ class CudaReads(PhysicsReadProgram):
             (read.LinkAngularVelocityQuery, read.BatchLinkAngularVelocityQuery, lambda link: link.get_angular_velocity),
         ):
             if isinstance(query, single):
-                fetch = method(model.get_link(query.link))
-                return self._source(lambda: wp.to_torch(fetch(data)))
+                velocity = wp.to_torch(method(model.get_link(query.link))(data))
+                return lambda values: velocity
             if isinstance(query, batch):
-                getters = [method(model.get_link(n)) for n in query.links]
-                sources = [self._source(lambda get=get: wp.to_torch(get(data))) for get in getters]
-                return lambda values: torch.stack([project(values) for project in sources], dim=1)
+                # Link getters expose strided views into SceneData's persistent world
+                # velocity buffers. Bind them once alongside the compiled projection.
+                velocities = tuple(wp.to_torch(method(model.get_link(name))(data)) for name in query.links)
+                return lambda values: torch.stack(velocities, dim=1)
         if isinstance(query, read.BodyLinkNetContactForceQuery):
             body = backend.host_model.get_body(query.body)
             if body is None:
@@ -180,5 +187,5 @@ class CudaReads(PhysicsReadProgram):
             if env_ids is None:
                 self._publish(values)
             else:
-                for output, project in self._fields:
-                    output[env_ids] = project(values)[env_ids].to(torch.float32)
+                torch._dynamo.maybe_mark_dynamic(env_ids, 0)
+                self._publish_rows(values, env_ids)

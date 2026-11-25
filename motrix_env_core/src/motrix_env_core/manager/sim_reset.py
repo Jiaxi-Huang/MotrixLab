@@ -98,14 +98,11 @@ class SimResetRuntime:
         env_ids: torch.Tensor,
         episode_reset: torch.Tensor,
     ) -> None:
-        """Materialize compact term outputs, scatter them, and execute reset."""
+        """Apply compact term outputs to the selected simulator rows."""
         with active_perf_scope("reset_kernel"):
             task_program.reset_kernel(env_ids, episode_reset, self.buffers)
-        for buffer in self.buffers:
-            compact = buffer[: env_ids.numel()].clone()
-            buffer[env_ids] = compact
         with active_perf_scope("backend_apply"):
-            self.program.execute(env_ids)
+            self.program.execute_compact(env_ids, self.buffers)
 
 
 __all__ = ["ResetTerm", "SimResetRuntime"]

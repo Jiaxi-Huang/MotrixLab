@@ -239,8 +239,7 @@ class ArrayEnv(ABEnv, Generic[EnvCfgType]):
 
     def _clear_engine_error_rewards(self) -> None:
         """Publish a finite failure reward, only from the done/reset slow path."""
-        if bool(self.engine_error_mask.any()):
-            self._state.reward.masked_fill_(self.engine_error_mask, 0.0)
+        self._state.reward.masked_fill_(self.engine_error_mask, 0.0)
 
     @abc.abstractmethod
     def reset(self, env_ids: torch.Tensor) -> None:

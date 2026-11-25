@@ -352,3 +352,9 @@ class WriteProgram(abc.ABC):
         ``env_ids`` selects rows; ``None`` means every row. Reset-before-write
         and derived-state refresh behavior are fixed when the program is compiled.
         """
+
+    def execute_compact(self, env_ids: torch.Tensor, buffers: tuple[torch.Tensor, ...]) -> None:
+        """Apply the first K buffer rows to the corresponding K world IDs."""
+        for buffer in buffers:
+            buffer[env_ids] = buffer[: env_ids.numel()].clone()
+        self.execute(env_ids)
