@@ -221,3 +221,9 @@ Observation terms use the host-side ``ObservationTerm(size, dispatch, *args)`` f
 The evaluate kernel publishes the weighted transition reward to `ctx.reward` before command
 `advance` hooks. It aliases `state.reward`. Nested kernel-data metrics are initialized to zero
 and collected recursively so motion curricula can own their statistics.
+
+## Truncation terms
+
+Manager truncation terms publish their masks and union to `ctx.truncated`, which aliases
+`state.truncated`. The environment ORs the episode time limit into this union.
+Termination and truncation term names must be distinct; truncated rows retain pre-reset final observations.

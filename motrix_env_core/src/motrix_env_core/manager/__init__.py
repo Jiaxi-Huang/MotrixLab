@@ -29,6 +29,12 @@ from motrix_env_core.manager.terminations import (
     TerminationTermCfg,
 )
 from motrix_env_core.manager.terms import BaseTerm
+from motrix_env_core.manager.truncations import (
+    ManagerTruncationsCfg,
+    TruncationManager,
+    TruncationTerm,
+    TruncationTermCfg,
+)
 from motrix_env_core.sim import SimQueriesCfg
 
 __all__ = [
@@ -47,6 +53,7 @@ __all__ = [
     "ManagerObservationsCfg",
     "ManagerRewardsCfg",
     "ManagerTerminationsCfg",
+    "ManagerTruncationsCfg",
     "SimQueriesCfg",
     "ObsTerm",
     "ObservationTermCfg",
@@ -59,5 +66,8 @@ __all__ = [
     "TerminationManager",
     "TerminationTermCfg",
     "TerminationTerm",
+    "TruncationManager",
+    "TruncationTermCfg",
+    "TruncationTerm",
     "metric",
 ]

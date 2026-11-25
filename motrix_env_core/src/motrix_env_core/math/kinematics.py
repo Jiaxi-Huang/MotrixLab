@@ -24,6 +24,28 @@ from motrix_env_core.math.rotation import axis_angle_to_mat
 __all__ = ["KinematicTree"]
 
 
+def _matvec3(matrix: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    # Fixed-size products can fuse with the rest of compiled FK. Dispatching
+    # every 3x3 product through BLAS leaves thousands of tiny GPU launches in BPTT.
+    if torch.compiler.is_compiling():
+        return (
+            matrix[..., :, 0] * vector[..., 0, None]
+            + matrix[..., :, 1] * vector[..., 1, None]
+            + matrix[..., :, 2] * vector[..., 2, None]
+        )
+    return (matrix @ vector.unsqueeze(-1)).squeeze(-1)
+
+
+def _matmul3(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    if torch.compiler.is_compiling():
+        return (
+            left[..., :, 0:1] * right[..., 0:1, :]
+            + left[..., :, 1:2] * right[..., 1:2, :]
+            + left[..., :, 2:3] * right[..., 2:3, :]
+        )
+    return left @ right
+
+
 class KinematicTree:
     """Moving-body tree topology for differentiable FK.
 
@@ -99,10 +121,11 @@ class KinematicTree:
                 positions[i], rotations[i] = p, R
                 continue
             parent_rotation = rotations[par]
-            positions[i] = positions[par] + (parent_rotation @ self.off_p[i].unsqueeze(-1)).squeeze(-1)
+            positions[i] = positions[par] + _matvec3(parent_rotation, self.off_p[i])
             if i in self._position_rotation_needed:
-                rotations[i] = (parent_rotation @ self.off_R[i]) @ axis_angle_to_mat(
-                    self.axes[i], q[..., self.joint_idx[i]]
+                rotations[i] = _matmul3(
+                    _matmul3(parent_rotation, self.off_R[i]),
+                    axis_angle_to_mat(self.axes[i], q[..., self.joint_idx[i]]),
                 )
         idx = range(self.num_bodies) if bodies is None else bodies
         return torch.stack([positions[i] for i in idx], -2)
@@ -143,10 +166,10 @@ class KinematicTree:
                 continue
             j = self.joint_idx[i]
             Rp = Rs[par]
-            pi = P[par] + (Rp @ self.off_p[i].unsqueeze(-1)).squeeze(-1)
-            R_off = Rp @ self.off_R[i]
-            Ri = R_off @ axis_angle_to_mat(self.axes[i], q[..., j])
-            axis_w = (R_off @ self.axes[i].unsqueeze(-1)).squeeze(-1)
+            pi = P[par] + _matvec3(Rp, self.off_p[i])
+            R_off = _matmul3(Rp, self.off_R[i])
+            Ri = _matmul3(R_off, axis_angle_to_mat(self.axes[i], q[..., j]))
+            axis_w = _matvec3(R_off, self.axes[i])
             wi = W[par] + axis_w * qd[..., j : j + 1]
             vi = V[par] + torch.cross(W[par], pi - P[par], dim=-1)
             P[i], Rs[i], V[i], W[i] = pi, Ri, vi, wi

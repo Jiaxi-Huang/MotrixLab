@@ -59,6 +59,12 @@ class ManagerContext:
     # so a hook observes the current step's reward — per-step curriculum
     # accumulators (return-based start sampling) fold it in place.
     reward: torch.Tensor
+    # Read-only mirror of the latest transition's truncation-term union
+    # (time-limit truncation is folded in by the env after the kernel),
+    # sharing storage with ``state.truncated`` (one tensor from state
+    # assembly). Distinguishes time-style episode ends from failures for
+    # bootstrap-correct returns.
+    truncated: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)

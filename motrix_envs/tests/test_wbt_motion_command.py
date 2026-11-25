@@ -103,6 +103,7 @@ def _ctx(
         dt=0.02,
         sim_reset_requested=torch.zeros((num_envs, 1), dtype=torch.bool),
         terminated=torch.zeros(num_envs, dtype=torch.bool) if terminated is None else terminated,
+        truncated=torch.zeros(num_envs, dtype=torch.bool),
         reward=torch.zeros(num_envs, dtype=torch.float32) if reward is None else reward,
     )
 

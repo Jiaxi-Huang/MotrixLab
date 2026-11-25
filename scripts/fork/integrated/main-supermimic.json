@@ -1,0 +1,8 @@
+{
+  "upstream": "e98888a5df951fd3c67da6cbcdfb7fc2008801e8",
+  "topics": {
+    "fix/quaternion-gradients": "7a20c57a87a184637e9884d308a85297e55198c4",
+    "perf/compiled-kinematics": "88a36f46e209e2dbdfea1070c65c012e4fb4c474",
+    "feat/manager-truncation": "d48dec76ae7c769e6635eab52904ce01d3e51567"
+  }
+}
