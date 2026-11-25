@@ -58,6 +58,7 @@ class JointPositionActionTerm(ActionTerm):
     """Host runtime for joint-position targets and reset-time action delays."""
 
     state: JointPositionActionState
+    modeling_shared_fields = ("action_ptr", "default_angles", "joint_lower", "joint_upper", "action_scales")
 
     def __init__(self, space: gym.spaces.Box, state: JointPositionActionState) -> None:
         super().__init__(space, state)
@@ -74,12 +75,11 @@ class JointPositionActionTerm(ActionTerm):
         ``motrix_env_core.torch_manager.actions.process_joint_position_actions``.
         """
         state = self.state
-        ptr = int(state.action_ptr[0])
         target_raw = actions
         if state.delay_hi > 0:
             queue = state.action_queue
             width = queue.shape[1]
-            delay_indices = (ptr - state.delay_steps) % width
+            delay_indices = (state.action_ptr - state.delay_steps) % width
             target_raw = torch.take_along_dim(queue, delay_indices[:, None, None], dim=1)[:, 0, :]
         return target_raw * state.action_scales + state.default_angles
 

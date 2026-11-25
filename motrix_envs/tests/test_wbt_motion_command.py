@@ -424,6 +424,35 @@ def test_return_history_uniform_returns_preserve_symmetry():
     torch.testing.assert_close(sampler.sampling_cdf, torch.arange(1, 5) / 4)
 
 
+def test_return_history_checkpoint_preserves_future_sampling():
+    from motrix_envs.locomotion.wbt.mdp.supermimic import MotionCommand
+
+    sampler = _return_sampler(100, num_envs=2)
+    sampler.bin_return.copy_(torch.tensor([1.0, 5.0, 0.2, 5.0]))
+    for _ in range(20):
+        sampler.rebuild()
+    command, _ = _command(2, 100, sampler=sampler)
+    # Exercise the task's actual sampler checkpoint boundary without a simulator.
+    saved = MotionCommand.training_state_dict(command)
+    restored = _return_sampler(100, num_envs=2)
+
+    class Owner:
+        def __init__(self, sampler):
+            self.sampler = sampler
+
+        training_state_dict = MotionCommand.training_state_dict
+
+    MotionCommand.load_training_state_dict(Owner(restored), saved)
+    draws = torch.rand((32, 3), generator=torch.Generator().manual_seed(19)) * 2 - 1
+    for value in (3.0, 0.0, 4.0):
+        sampler.bin_return[0] = restored.bin_return[0] = value
+        sampler.rebuild()
+        restored.rebuild()
+        torch.testing.assert_close(sampler.bin_history, restored.bin_history)
+        torch.testing.assert_close(sampler.sampling_cdf, restored.sampling_cdf)
+        torch.testing.assert_close(sampler.sample(draws, 0.0), restored.sample(draws, 0.0))
+
+
 def test_return_sample_uses_integer_bin_addressing():
     sampler = _return_sampler(100, num_envs=1)
     # All mass on bin 2 (frames [50, 75)): search-left lands every unit in

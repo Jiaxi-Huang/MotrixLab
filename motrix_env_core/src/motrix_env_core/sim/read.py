@@ -6,7 +6,7 @@ from __future__ import annotations
 import abc
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -15,7 +15,25 @@ import torch
 # serializable declarations before backend compilation.
 @dataclass(frozen=True, kw_only=True)
 class SimDataQuery(abc.ABC):
-    """Backend-neutral descriptor for one fixed simulator quantity."""
+    """Backend-neutral descriptor for one fixed simulator quantity.
+
+    Concrete subclasses declare ``modelable`` — whether world-model
+    imagination can serve this query's semantic type from predicted state.
+    The declaration is the framework obligation that keeps a derived
+    modeling view honest: ``ManagerEnv.modeling_view()`` rejects read sets
+    containing non-modelable queries at derivation time, so adding a query
+    type without deciding its imaginability fails loudly, not silently.
+    """
+
+    modelable: ClassVar[bool]
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if "modelable" not in cls.__dict__:
+            raise TypeError(
+                f"{cls.__qualname__} must declare `modelable: ClassVar[bool]` — whether "
+                "imagination may serve this query type from predicted state."
+            )
 
     @abc.abstractmethod
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -25,6 +43,8 @@ class SimDataQuery(abc.ABC):
 @dataclass(frozen=True, kw_only=True)
 class BodyJointPositionQuery(SimDataQuery):
     """Articulated DOF positions for one body, excluding its floating base."""
+
+    modelable: ClassVar[bool] = True
 
     body: str
 
@@ -36,6 +56,8 @@ class BodyJointPositionQuery(SimDataQuery):
 class BodyJointVelocityQuery(SimDataQuery):
     """Articulated DOF velocities for one body, excluding its floating base."""
 
+    modelable: ClassVar[bool] = True
+
     body: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -44,6 +66,7 @@ class BodyJointVelocityQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class JointPositionQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     joints: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -52,6 +75,7 @@ class JointPositionQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class JointVelocityQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     joints: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -60,6 +84,7 @@ class JointVelocityQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class LinkPositionQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     link: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -68,6 +93,7 @@ class LinkPositionQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class BatchLinkPositionQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     links: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -76,6 +102,7 @@ class BatchLinkPositionQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class LinkQuaternionQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     link: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -84,6 +111,7 @@ class LinkQuaternionQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class BatchLinkQuaternionQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     links: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -92,6 +120,7 @@ class BatchLinkQuaternionQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class LinkLinearVelocityQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     link: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -100,6 +129,7 @@ class LinkLinearVelocityQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class BatchLinkLinearVelocityQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     links: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -108,6 +138,7 @@ class BatchLinkLinearVelocityQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class LinkAngularVelocityQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     link: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -116,6 +147,7 @@ class LinkAngularVelocityQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class BatchLinkAngularVelocityQuery(SimDataQuery):
+    modelable: ClassVar[bool] = True
     links: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -124,6 +156,7 @@ class BatchLinkAngularVelocityQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class LinkNetContactForceQuery(SimDataQuery):
+    modelable: ClassVar[bool] = False
     link: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -132,6 +165,7 @@ class LinkNetContactForceQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class BatchLinkNetContactForceQuery(SimDataQuery):
+    modelable: ClassVar[bool] = False
     links: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -142,6 +176,8 @@ class BatchLinkNetContactForceQuery(SimDataQuery):
 class BodyLinkNetContactForceQuery(SimDataQuery):
     """Read contact forces for one body's links except an explicit allow-list."""
 
+    modelable: ClassVar[bool] = False
+
     body: str
     exclude_links: tuple[str, ...] = ()
 
@@ -151,6 +187,7 @@ class BodyLinkNetContactForceQuery(SimDataQuery):
 
 @dataclass(frozen=True, kw_only=True)
 class SensorValuesQuery(SimDataQuery):
+    modelable: ClassVar[bool] = False
     sensors: tuple[str, ...]
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -169,6 +206,8 @@ class RaycastCameraImageQuery(SimDataQuery):
     pre-reset measurements, and -1 cannot distinguish unready from all misses.
     """
 
+    modelable: ClassVar[bool] = False
+
     sensor: str
     field: str = "depth"
 
@@ -180,6 +219,8 @@ class RaycastCameraImageQuery(SimDataQuery):
 class SitePositionQuery(SimDataQuery):
     """World position of one named site, shape ``(rows, 3)``."""
 
+    modelable: ClassVar[bool] = True
+
     site: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -189,6 +230,8 @@ class SitePositionQuery(SimDataQuery):
 @dataclass(frozen=True, kw_only=True)
 class SiteQuaternionQuery(SimDataQuery):
     """World orientation quaternion (x, y, z, w) of one named site, shape ``(rows, 4)``."""
+
+    modelable: ClassVar[bool] = True
 
     site: str
 
@@ -200,6 +243,8 @@ class SiteQuaternionQuery(SimDataQuery):
 class GeomPositionQuery(SimDataQuery):
     """World position of one named geom, shape ``(rows, 3)``."""
 
+    modelable: ClassVar[bool] = True
+
     geom: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -210,6 +255,8 @@ class GeomPositionQuery(SimDataQuery):
 class GeomQuaternionQuery(SimDataQuery):
     """World orientation quaternion (x, y, z, w) of one named geom, shape ``(rows, 4)``."""
 
+    modelable: ClassVar[bool] = True
+
     geom: str
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
@@ -219,6 +266,8 @@ class GeomQuaternionQuery(SimDataQuery):
 @dataclass(frozen=True, kw_only=True)
 class GeomLinearVelocityQuery(SimDataQuery):
     """World-frame linear velocity of a geom (includes rotational contribution)."""
+
+    modelable: ClassVar[bool] = True
 
     geom: str
 
@@ -234,6 +283,8 @@ class GeomPairCollidingQuery(SimDataQuery):
     the two geoms collide in that row and 0.0 otherwise.
     """
 
+    modelable: ClassVar[bool] = False
+
     # The resolved value is tuple[tuple[str, str], ...]. This stays Any because
     # OmegaConf structured configs cannot represent nested tuple annotations.
     pairs: Any
@@ -246,6 +297,8 @@ class GeomPairCollidingQuery(SimDataQuery):
 class DofPositionQuery(SimDataQuery):
     """Whole canonical DOF position space (includes floating bases)."""
 
+    modelable: ClassVar[bool] = True
+
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
         compiler.compile_dof_position(key)
 
@@ -254,6 +307,8 @@ class DofPositionQuery(SimDataQuery):
 class DofVelocityQuery(SimDataQuery):
     """Whole canonical DOF velocity space (includes floating bases)."""
 
+    modelable: ClassVar[bool] = True
+
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
         compiler.compile_dof_velocity(key)
 
@@ -261,6 +316,8 @@ class DofVelocityQuery(SimDataQuery):
 @dataclass(frozen=True, kw_only=True)
 class ActuatorCtrlQuery(SimDataQuery):
     """Canonical-order full-width actuator control targets."""
+
+    modelable: ClassVar[bool] = False
 
     def compile_with(self, compiler: SimDataQueryCompiler, *, key: str) -> None:
         compiler.compile_actuator_ctrl(key)

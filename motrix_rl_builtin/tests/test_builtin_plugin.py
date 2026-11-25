@@ -9,7 +9,7 @@ from motrix_rl import frameworks
 
 
 def test_builtin_plugin_registers_fastsac():
-    assert frameworks.supported_agents("motrix") == ("fastsac",)
+    assert "fastsac" in frameworks.supported_agents("motrix")
     assert frameworks.get_config_type("motrix", "fastsac") is FastSacCfg
     assert frameworks.supported_train_backends("motrix", "fastsac") == ("torch",)
     assert isinstance(frameworks.get_agent_provider("motrix", "fastsac", "torch"), FastSacProvider)
@@ -21,3 +21,13 @@ def test_fastsac_total_env_steps_counts_one_batch_per_iteration(iterations, num_
     cfg.trainer.num_learning_iterations = iterations
 
     assert FastSacProvider().total_env_steps(cfg, num_envs) == expected
+
+
+def test_builtin_plugin_registers_apg():
+    from motrix_rl_builtin.apg.config import ApgCfg
+    from motrix_rl_builtin.apg.provider import ApgProvider
+
+    assert "apg" in frameworks.supported_agents("motrix")
+    assert frameworks.get_config_type("motrix", "apg") is ApgCfg
+    assert frameworks.supported_train_backends("motrix", "apg") == ("torch",)
+    assert isinstance(frameworks.get_agent_provider("motrix", "apg", "torch"), ApgProvider)

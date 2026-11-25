@@ -564,3 +564,40 @@ def pin_worker_cpus(cpus: set[int]) -> None:
     import torch
 
     torch.set_num_threads(max(len(cpus), 1))
+
+
+@contextlib.contextmanager
+def spawn_worker_cpus(initial_cpus: set[int] | None):
+    """Spawn under the parent's original allocation, then restore its learner slice.
+
+    Pass the allocation captured before pinning the parent. This does not
+    change the parent's thread budget and never selects CPUs outside that
+    original allocation. Child workers apply their own slice on entry.
+    """
+    if initial_cpus is None:
+        yield
+        return
+    current = available_cpu_ids()
+    if current == initial_cpus:
+        yield
+        return
+    try:
+        _set_worker_cpu_affinity(initial_cpus)
+        yield
+    finally:
+        _set_worker_cpu_affinity(current)
+
+
+def log_worker_resources(role: str) -> None:
+    """Record the effective process budget; importing NUMA helpers stays Torch-free."""
+    import torch
+
+    logger.info(
+        "%s runtime: cpus=%s torch_threads=%s interop_threads=%s OMP_NUM_THREADS=%s MKL_NUM_THREADS=%s",
+        role,
+        sorted(available_cpu_ids()),
+        torch.get_num_threads(),
+        torch.get_num_interop_threads(),
+        os.environ.get("OMP_NUM_THREADS"),
+        os.environ.get("MKL_NUM_THREADS"),
+    )

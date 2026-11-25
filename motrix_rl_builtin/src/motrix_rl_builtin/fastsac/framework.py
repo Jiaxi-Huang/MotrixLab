@@ -4,6 +4,7 @@
 from motrix_rl import frameworks
 from motrix_rl.contracts import AgentProvider, RlFramework, TrainerBase, TrainerContext
 from motrix_rl.deploy.api import OnnxPolicyExporter
+from motrix_rl_builtin.apg.provider import ApgProvider
 from motrix_rl_builtin.fastsac.config import FastSacCfg
 
 
@@ -41,7 +42,7 @@ class FastSacProvider(AgentProvider[FastSacCfg]):
 
 class MotrixFramework(RlFramework):
     def __init__(self) -> None:
-        super().__init__((FastSacProvider(),))
+        super().__init__((FastSacProvider(), ApgProvider()))
 
     @property
     def name(self) -> str:

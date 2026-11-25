@@ -181,7 +181,12 @@ def read_task_config(
     algo_config_type: type[Any],
     cfg_override: dict[str, Any] | None = None,
 ) -> TaskConfig:
-    """Load a run's resolved task recipe and restore its typed algorithm config."""
+    """Restore a typed task recipe without rewriting its archived snapshot.
+
+    Provider config classes may define ``migrate_run_config(mapping)`` to
+    migrate an owned saved-config mapping before schema validation. CLI/user
+    overrides are merged afterwards and remain subject to the current schema.
+    """
     path = task_config_path(run_dir)
     if not path.is_file():
         raise FileNotFoundError(
@@ -189,7 +194,11 @@ def read_task_config(
             "playback requires a run created with a resolved task-config snapshot."
         )
     snapshot = OmegaConf.load(path)
-    algo_cfg = OmegaConf.merge(OmegaConf.structured(algo_config_type), snapshot.algo, cfg_override or {})
+    saved_algo = _resolved_mapping(snapshot.algo)
+    migrate = getattr(algo_config_type, "migrate_run_config", None)
+    if migrate is not None:
+        saved_algo = migrate(saved_algo)
+    algo_cfg = OmegaConf.merge(OmegaConf.structured(algo_config_type), saved_algo, cfg_override or {})
     return TaskConfig(
         task=TaskMeta(**_resolved_mapping(snapshot.task)),
         num_envs=int(snapshot.num_envs),

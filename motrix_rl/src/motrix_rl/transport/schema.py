@@ -13,6 +13,7 @@ compile-time decision of the transport.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -74,3 +75,44 @@ class TransitionSchema:
     def feature_width(self) -> int:
         """Summed per-env element count across fields (fused-slot width)."""
         return sum(field.per_env_numel for field in self.fields)
+
+
+def wm_transition_schema(
+    state_fields: Iterable[TransitionField],
+    act_dim: int,
+    *,
+    obs_dim: int | None = None,
+) -> TransitionSchema:
+    """Build the world-model transition schema for one modeling-state geometry.
+
+    The modeling state is task-derived (declared read set + exogenous
+    channels), so it arrives as named fields rather than one fused vector.
+    Every state field gets a same-shape ``next_<name>`` successor column: a
+    transition slot is self-contained, and the done rows' true (pre-reset)
+    successors — captured by the env's FinalState — are written by the
+    provider-side assembler. ``terminated`` and ``truncated`` stay separate
+    (lambda-return bootstrap semantics differ); the episode boundary is
+    their union. Episode/step ids are deliberately absent: the sequence
+    replay derives them from the done flags, and wide counters riding the
+    fused CUDA-IPC ring as floats would lose precision (see
+    ``gpu_ipc_ring``).
+
+    Provider-specific extra fields concatenate onto the returned schema's
+    ``fields``; the template itself stays the shared core.
+    """
+    states = tuple(state_fields)
+    prefixed = sorted(field.name for field in states if field.name.startswith("next_"))
+    if prefixed:
+        raise ValueError(f"WM state field names must not start with 'next_': {prefixed}")
+    successors = tuple(TransitionField(f"next_{field.name}", field.per_env_shape, field.dtype) for field in states)
+    fields = (
+        *states,
+        *successors,
+        TransitionField("actions", (act_dim,), torch.float32),
+        TransitionField("rewards", (), torch.float32),
+        TransitionField("terminated", (), torch.int64),
+        TransitionField("truncated", (), torch.int64),
+    )
+    if obs_dim is not None:
+        fields = (*fields, TransitionField("obs", (obs_dim,), torch.float32))
+    return TransitionSchema(fields=fields)

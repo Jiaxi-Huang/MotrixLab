@@ -1,0 +1,32 @@
+# @package _global_
+# Local 16 GiB recipe; temporal windows and update ratio inherit the reference base.
+defaults:
+  - /algo_base@algo: motrix.apg
+  - _self_
+task:
+  env: g1-wbt-supermimic
+  rllib: motrix
+  algo: apg
+num_envs: 2048
+play_num_envs: 1
+seed: 1
+checkpoint:
+  interval: 1000
+logging:
+  interval: 100
+algo:
+  agent:
+    actor_hidden_dims:
+      - 2048
+      - 1024
+      - 512
+    dynamics_hidden_dims:
+      - 1024
+      - 1024
+      - 1024
+    batch_size: 1024
+    buffer_size: 1000
+    world_model:
+      batch_size: 1024
+  trainer:
+    num_learning_iterations: 30000

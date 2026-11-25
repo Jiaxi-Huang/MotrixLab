@@ -1,0 +1,64 @@
+# APG follows FastSAC ownership: agent hyperparameters, trainer runtime budget.
+# num_updates counts joint learner rounds per collector step (fractional UTD).
+# world_model.num_updates counts WM gradient steps within each joint round.
+defaults:
+  - _motrix_apg_schema
+  - _self_
+device: null
+asynchronous: false
+agent:
+  compile: true
+  actor_hidden_dims:
+    - 2048
+    - 1024
+    - 512
+    - 256
+  critic_hidden_dims:
+    - 256
+    - 128
+  dynamics_hidden_dims:
+    - 2048
+    - 2048
+    - 2048
+  latent_dim: 32
+  history_length: 10
+  amp: true
+  imagination_noise: false
+  batch_size: 4096
+  horizon: 32
+  gamma: 0.99
+  lam: 0.95
+  exploration_noise: 0.1
+  grad_clip_value: 0.1
+  critic_epochs: 5
+  critic_minibatches: 4
+  actor_optimizer: muon
+  actor_learning_rate: 0.0004
+  critic_learning_rate: 0.0004
+  buffer_size: 1000
+  learning_starts: 0
+  num_updates: 0.4
+  policy_ema: 0.995
+  learning_rate_decay_steps: 250000
+  world_model:
+    optimizer: muon
+    learning_rate: 0.0004
+    num_updates: 10
+    batch_size: 2048
+    horizon: 8
+    root_position_error: 0.01
+    root_orientation_error: 0.02
+    root_linear_velocity_error: 0.1
+    root_angular_velocity_error: 0.3
+    joint_position_error: 0.1
+    joint_velocity_error: 3.14
+trainer:
+  async_options:
+    ring_capacity: 2
+    collector_inference_device: auto
+    weight_publish_interval: 1
+    collector_compile: false
+    idle_sleep_s: 0.001
+    learner_cpu_cores: null
+    collector_cpu_cores: null
+  num_learning_iterations: 1000000
