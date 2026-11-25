@@ -15,3 +15,5 @@
 
 - [fastsac-async-multi-learner.md](fastsac-async-multi-learner.md) — FastSAC 单机多卡（多 learner × DDP）实施计划
 - [motion-multi-clip-infra.md](motion-multi-clip-infra.md) — 多 motion clip 训练基础设施（MotionLibrary + WbtMotionCommand 原地泛化）分阶段实施计划
+
+- [APG 与 SuperMimic 实施计划](./apg-supermimic.md)

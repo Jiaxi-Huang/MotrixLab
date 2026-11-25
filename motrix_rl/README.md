@@ -168,3 +168,7 @@ a shared namespace package: **do not add `hydra_plugins/__init__.py`**. Hydra di
 namespace; no custom entry point or working-directory import convention is needed. Once installed, run
 `mxlab train task=my-task/skrl.ppo` from any directory. Environment callbacks only register environments; they do not
 install Hydra search paths. RL provider plugins still register separately through `motrix_rl.frameworks`.
+
+Provider configuration classes may implement `migrate_run_config(mapping)` to restore saved
+run recipes across schema changes. It receives an owned mapping before validation; explicit
+user overrides still use the current schema. Reading a run does not rewrite its archived recipe.

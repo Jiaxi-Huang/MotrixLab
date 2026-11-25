@@ -60,7 +60,7 @@ main 上唯一的 motion 消费者是 `WbtMotionCommand`，"单 clip"假设同�
 现有计数 EMA + 全局 bin + CDF 原样运行于拼接语料。已知的多 clip 统计缺口（裸计数的自增强偏置、
 全局 bin 跨 clip 边界、无 per-clip 等权、平滑跨 clip 泄漏、缺访问归一）**不在本版解决**。
 
-> 当前课程使用
+> **2026-11 更新**：该演进已由 [APG 设计](./wm-bptt-trainer.md) P1 落地为
 > `motion/sampler.py` 的 torch 原生 `MotionStartSampler` 族（uniform / adaptive /
 > return，`sampling_mode` 驱动，per-clip bins 消除跨 clip 混叠，课程状态驻留
 > sampler 对象而非共享 command term）；单 clip 语料的采样数学与全局 bin 版本逐位一致。
@@ -111,6 +111,7 @@ Return 课程在每次批量分布重建时，先由当前 bin return 计算低�
 混合 CDF。更新时钟是分布重建次数，不是 reset lane 数量；指标读取已缓存的 gauge，
 不触发额外历史更新。该历史是低回报分布的 EMA，不是实际采样次数直方图。
 
-按固定 RNG draws 采样不消耗额外随机数。
+`bin_history` 与其他全局课程张量由已有 motion training-state 接口保存和恢复；
+旧 checkpoint 的均匀历史可直接加载。按固定 RNG draws 采样不消耗额外随机数。
 集中概率与真实 transition 占比不同，分析课程效果应同时报告 bin/clip 概率、
 完整动作成功率和完成帧比例，不能仅用采样熵作为收敛指标。
