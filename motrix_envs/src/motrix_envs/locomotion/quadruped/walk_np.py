@@ -48,8 +48,6 @@ from motrix_envs.locomotion.quadruped.velocity_command import RandomPlanarVeloci
 
 def _torch_uniform(rng: torch.Generator, low, high, size) -> torch.Tensor:
     """Sample float32 uniform values in ``[low, high)`` from one torch stream."""
-    low = torch.as_tensor(low, dtype=torch.float32, device=rng.device)
-    high = torch.as_tensor(high, dtype=torch.float32, device=rng.device)
     return low + (high - low) * torch.rand(size, generator=rng, device=rng.device)
 
 
@@ -225,6 +223,15 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         )
         if cfg.randomization.enabled and has_non_position_actuator:
             raise TypeError("Quadruped PD randomization requires position actuators")
+        self._base_lin_vel_noise = torch.as_tensor(
+            cfg.randomization.base_lin_vel_noise, dtype=torch.float32, device=self.device
+        )
+        self._base_ang_vel_noise = torch.as_tensor(
+            cfg.randomization.base_ang_vel_noise, dtype=torch.float32, device=self.device
+        )
+        self._base_com_offset_noise = torch.as_tensor(
+            cfg.randomization.base_com_offset_noise, dtype=torch.float32, device=self.device
+        )
         self._randomize_action_delay = cfg.randomization.enabled and any(cfg.randomization.action_delay_steps)
         # Declare the enabled override writes once and batch every reset's
         # randomization into a single program execution.
@@ -482,10 +489,10 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
 
         self._commands[env_ids] = torch.as_tensor(self.resample_commands(num_reset), device=self.device)
         self._command_resampling_time[env_ids] = self._sample_command_resampling_time(num_reset)
-        self._phase[env_ids] = 0.0
-        self._feet_phase[env_ids] = 0.0
-        self._current_actions[env_ids] = 0.0
-        self._last_actions[env_ids] = 0.0
+        self._phase.index_fill_(0, env_ids.long(), 0)
+        self._feet_phase.index_fill_(0, env_ids.long(), 0)
+        self._current_actions.index_fill_(0, env_ids.long(), 0)
+        self._last_actions.index_fill_(0, env_ids.long(), 0)
 
     def resample_commands(self, num_envs: int) -> torch.Tensor:
         return self._velocity_command_binding.read_command(batch_size=num_envs).values
@@ -538,10 +545,10 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             )
 
         if any(randomization.base_lin_vel_noise):
-            noise = torch.as_tensor(randomization.base_lin_vel_noise, dtype=torch.float32, device=self.device)
+            noise = self._base_lin_vel_noise
             base_linear_velocity += _torch_uniform(rng, -noise, noise, (num_reset, 3))
         if any(randomization.base_ang_vel_noise):
-            noise = torch.as_tensor(randomization.base_ang_vel_noise, dtype=torch.float32, device=self.device)
+            noise = self._base_ang_vel_noise
             base_angular_velocity += _torch_uniform(rng, -noise, noise, (num_reset, 3))
 
     def _randomize_params(self, env_ids: torch.Tensor) -> None:
@@ -555,7 +562,7 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
         if self._randomize_action_delay:
             delay_low, delay_high = randomization.action_delay_steps
             if delay_low == delay_high:
-                self._action_delay_steps[env_ids] = delay_low
+                self._action_delay_steps.index_fill_(0, env_ids.long(), delay_low)
             else:
                 self._action_delay_steps[env_ids] = torch.randint(
                     delay_low, delay_high + 1, (num_reset,), generator=rng, device=self.device
@@ -580,9 +587,7 @@ class QuadrupedWalkTask(DirectEnv[QuadrupedWalkEnvCfg]):
             base_mass_scale = _torch_uniform(rng, *self.cfg.randomization.base_mass_scale_range, (num_reset,))
             program.buffer("mass")[env_ids, 0] = self.model.others["base_mass"] * base_mass_scale
         if self._randomize_base_com:
-            noise = torch.as_tensor(
-                self.cfg.randomization.base_com_offset_noise, dtype=torch.float32, device=self.device
-            )
+            noise = self._base_com_offset_noise
             base_com_offset = _torch_uniform(rng, -noise, noise, (num_reset, 3))
             program.buffer("com")[env_ids, 0] = self.model.others["base_com"] + base_com_offset
         program.execute(env_ids)

@@ -82,6 +82,11 @@ class DirectEnv(ArrayEnv[DirectEnvCfgType]):
             render_spacing=self.render_spacing,
         )
 
+    def _process_episode_boundaries(self) -> None:
+        if self.device.type == "cuda" and not self._state.done.any():
+            return
+        super()._process_episode_boundaries()
+
     def physics_step(self) -> None:
         self.sim.step(self._cfg.sim_substeps, result=self.engine_error_codes)
 

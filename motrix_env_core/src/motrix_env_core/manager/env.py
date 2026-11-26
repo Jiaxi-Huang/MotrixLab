@@ -73,7 +73,7 @@ def _validate_reset_ids(env_ids: torch.Tensor, label: str) -> torch.Tensor:
             f"ManagerEnv.reset {label} must have an integer dtype, got {env_ids.dtype}; "
             "use torch.tensor([...], dtype=torch.long)."
         )
-    return env_ids
+    return env_ids.long()
 
 
 def _merge_query_declarations(
@@ -549,7 +549,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         with self.perf.scope("clear_ctrl_targets"):
             for name, actuators in self._action_actuators.items():
                 if actuators is not None:
-                    self._action_writes.buffer(name)[env_ids] = 0.0
+                    self._action_writes.buffer(name).index_fill_(0, env_ids, 0)
         with self.perf.scope("apply_sim_reset"):
             assert self._task_program is not None
             self._sim_reset_runtime.apply(self._task_program, env_ids, episode_reset)
@@ -584,7 +584,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
         if env_ids.numel():
             self._clear_engine_error_rewards()
             with self.perf.scope("select_done"):
-                state.episode_steps[env_ids] = 0
+                state.episode_steps.index_fill_(0, env_ids, 0)
         with self.perf.scope("reset_envs"):
             self._reset_rows(
                 env_ids,
@@ -618,7 +618,7 @@ class ManagerEnv(ArrayEnv[EnvCfgType]):
             # Explicit callers can supply overlapping sets. Episode reset takes precedence.
             sim_reset_ids = sim_reset_ids[~torch.isin(sim_reset_ids, env_ids)]
         self._reset_rows(env_ids, sim_reset_ids)
-        self._state.episode_steps[env_ids] = 0
+        self._state.episode_steps.index_fill_(0, env_ids, 0)
 
     def _reset_rows(self, env_ids: torch.Tensor, sim_reset_ids: torch.Tensor | None = None) -> None:
         """Torch-control-plane reset shared by the public wrapper and the

@@ -98,7 +98,7 @@ class ObservationManager:
 
     def reset(self, env_ids: torch.Tensor) -> None:
         """Invalidate only episode-reset histories, not simulator-only resets."""
-        self._history_reset[env_ids] = True
+        self._history_reset.index_fill_(0, env_ids.long(), True)
 
     def publish_reset(self, env_ids: torch.Tensor, observe: Callable[[EnvObs], None]) -> None:
         """Repeat-fill explicit episode-reset lanes, leaving other rows untouched."""
@@ -115,7 +115,7 @@ class ObservationManager:
                 initialized = repeat_observation(values, group.history_length)
                 self._history[name][reset] = initialized
                 destination[reset] = initialized.flatten(1)
-        self._history_reset[env_ids] = False
+        self._history_reset.index_fill_(0, env_ids.long(), False)
 
     def commit(self, observe: Callable[[EnvObs], None]) -> None:
         """Publish exactly one control-step endpoint, repeat-filling new episodes."""

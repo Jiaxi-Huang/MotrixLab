@@ -72,9 +72,9 @@ class ActionTerm(abc.ABC):
     def process(self, actions: torch.Tensor) -> torch.Tensor | None:
         """Record raw tensor actions and process one batched action slice."""
         state = self.state
-        ptr = (int(state.action_ptr[0]) + 1) % state.action_queue.shape[1]
-        state.action_ptr[0] = ptr
-        state.action_queue[:, ptr] = actions
+        ptr = state.action_ptr
+        ptr.add_(1).remainder_(state.action_queue.shape[1])
+        state.action_queue.index_copy_(1, ptr, actions.unsqueeze(1))
         return self._process(actions)
 
     @abc.abstractmethod
@@ -83,7 +83,7 @@ class ActionTerm(abc.ABC):
 
     def reset(self, env_ids: torch.Tensor) -> None:
         """Clear raw history and reset action-specific state for selected rows."""
-        self.state.action_queue[env_ids] = 0.0
+        self.state.action_queue.index_fill_(0, env_ids.long(), 0)
         self._reset(env_ids)
 
     @abc.abstractmethod
