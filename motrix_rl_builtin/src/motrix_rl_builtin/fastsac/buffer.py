@@ -273,16 +273,20 @@ class SimpleReplayBuffer(nn.Module):
             lanes = torch.arange(self.n_env, device=self.device)[:, None]
             obs = self.observations[lanes, ring]
             next_obs = self.observations[lanes, next_ring]
-            critic = self.critic_observations[lanes, ring]
-            next_critic = self.critic_observations[lanes, next_ring]
             truncations = self.truncations[lanes, ring]
-            if self._final_slot is not None:
+            have_finals = len(self._final_free) < self._final_capacity
+            if have_finals:
                 final_ids = self._final_slot[lanes, ring].long()
                 has_final = truncations.bool() & (final_ids >= 0)
-                final_policy = self._final_obs_table[final_ids.clamp_min(0)]
-                final_value = self._final_critic_table[final_ids.clamp_min(0)]
-                next_obs = torch.where(has_final[..., None], final_policy, next_obs)
-                next_critic = torch.where(has_final[..., None], final_value, next_critic)
+                final_ids.clamp_min_(0)
+                next_obs = torch.where(has_final[..., None], self._final_obs_table[final_ids], next_obs)
+            if self._shared_observations:
+                critic, next_critic = obs, next_obs
+            else:
+                critic = self.critic_observations[lanes, ring]
+                next_critic = self.critic_observations[lanes, next_ring]
+                if have_finals:
+                    next_critic = torch.where(has_final[..., None], self._final_critic_table[final_ids], next_critic)
             flat = self.n_env * batch_size
             return {
                 "obs": obs.reshape(flat, self.n_obs),
