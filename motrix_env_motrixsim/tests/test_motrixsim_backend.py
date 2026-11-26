@@ -620,3 +620,38 @@ def test_cuda_compact_writes_route_rows_in_caller_order():
     torch.testing.assert_close(read["position"], expected)
     with pytest.raises(ValueError, match="conflict"):
         backend.compile_writes({"a": JointPositionWrite(joints), "b": JointPositionWrite(("hinge",))})
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA CUDA")
+def test_cuda_actuator_gains_skip_invalid_values_and_restore_selected_worlds():
+    pytest.importorskip("motrixsim.gpu")
+    from motrix_env_core import registry
+    from motrix_env_core.sim.write import ActuatorDampingWrite, ActuatorKpWrite
+
+    cfg = registry.make_env_config("go2-walk-flat")
+    cfg.sim.device = "cuda:0"
+    device = torch.device(cfg.sim.device)
+    backend = MotrixSimBackend.for_device(device)(cfg.scene, cfg.sim, 3)
+    actuators = backend.model.actuators[:2][::-1]
+    names = tuple(a.name for a in actuators)
+    gains = backend.compile_writes({"kp": ActuatorKpWrite(names), "kd": ActuatorDampingWrite(names)})
+    reset = backend.compile_writes({}, reset=True)
+    rows = torch.tensor([2, 0], device=device)
+    for key in ("kp", "kd"):
+        gains.buffer(key)[:2] = gains.buffer(key).new_tensor([[3.5, float("nan")], [float("inf"), 0]])
+    with backend.physics_stream():
+        defaults = [(a.get_kp_override(backend.data), a.get_damping_override(backend.data)) for a in actuators]
+    gains.execute_compact(rows, (gains.buffer("kp"), gains.buffer("kd")))
+    for restored in (False, True):
+        if restored:
+            reset.execute(rows[:1])
+        with backend.physics_stream():
+            for column, actuator in enumerate(actuators):
+                for initial, getter in zip(defaults[column], (actuator.get_kp_override, actuator.get_damping_override)):
+                    expected = initial.copy()
+                    if column == 0 and not restored:
+                        expected[2] = 3.5
+                    elif column == 1:
+                        expected[0] = 0
+                    np.testing.assert_array_equal(getter(backend.data), expected)

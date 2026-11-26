@@ -14,7 +14,7 @@ from pathlib import Path
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 BASE = "3ca072f9bcc97640926392089e5f366aae6a4c6f"
-CANDIDATE = "c0c71b94822da1fc9af0db77852d4ee2aa5cd5da"
+CANDIDATE = "b87798f7de624f609f46b90024f0ec7a9b217d58"
 STEPS = 600
 
 
@@ -60,7 +60,7 @@ def main():
         env={**os.environ, "GIT_LFS_SKIP_SMUDGE": "1"},
     )
     subprocess.run(["git", "lfs", "checkout", "motrix_robots/**", "motrix_envs/**"], cwd=baseline, check=True)
-    assert subprocess.check_output(["git", "rev-parse", "HEAD^"], text=True).strip() == CANDIDATE
+    subprocess.run(["git", "diff", "--quiet", CANDIDATE, "HEAD", "--", ":(exclude)scripts/train.py"], check=True)
     results = []
     for task in ("go2-walk-flat", "g1-wbt-dance"):
         for cards, envs in ((1, 256), (2, 256), (2, 512)):
