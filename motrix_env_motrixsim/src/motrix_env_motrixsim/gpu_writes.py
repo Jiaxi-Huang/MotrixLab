@@ -54,6 +54,7 @@ class CudaWrites(WriteProgram):
         self._channels: list[_Channel] = []
         mocaps: dict[str, list] = {}
         self._parameters: list[_Parameter] = []
+        self._gains: list[tuple[int, torch.Tensor, torch.Tensor]] = []
         for slot, (name, field) in enumerate(fields):
             for indices, target in (
                 (field.ctrl_indices, backend.control),
@@ -87,6 +88,19 @@ class CudaWrites(WriteProgram):
         backend = self._backend
         model = backend.model
         names = source.selection
+        if isinstance(source, (write.ActuatorKpOverride, write.ActuatorDampingOverride)):
+            actuators = [model.get_actuator(name) for name in names]
+            slots = model.low.actuator_model.joint_slot_by_ctrl_index
+            if all(a.typ == "position" and a.target_type == "joint" and a.index in slots for a in actuators):
+                columns = torch.tensor([slots[a.index] for a in actuators], device=backend.device)
+                attr = (
+                    "actuator_kp_overrides"
+                    if isinstance(source, write.ActuatorKpOverride)
+                    else "actuator_damping_overrides"
+                )
+                self._gains.append((slot, backend.gain_table(attr), columns))
+                return (len(names),)
+
         if isinstance(source, write.GeomFrictionOverride):
             handles = [model.get_geom(n) for n in names]
             accessors = [(h.get_friction_override, h.set_friction_override) for h in handles]
@@ -160,6 +174,13 @@ class CudaWrites(WriteProgram):
                 else:
                     row_index = rows if ids is None else ids[:, None]
                     channel.target[row_index, channel.columns] = values
+            for slot, table, columns in self._gains:
+                row_index = rows if ids is None else ids[:, None]
+                values = buffers[slot][source_rows]
+                # The SDK ignores negative and non-finite gain overrides per world.
+                table[row_index, columns] = torch.where(
+                    values.isfinite() & (values >= 0), values, table[row_index, columns]
+                )
             for parameter in self._parameters:
                 values = buffers[parameter.slot][source_rows]
                 if parameter.spin_roll is not None:

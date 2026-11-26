@@ -89,6 +89,7 @@ class MotrixCudaBackend(SimBackend):
                 tensor = wp.to_torch(array)
                 self._reset_arrays.append((tensor, torch.zeros_like(tensor[0])))
         self._overflow = wp.to_torch(collision.overflow)
+        self._gain_tables: dict[str, torch.Tensor] = {}
         self._reset_parameters = {}
         self._mocap_defaults = []
         with self.physics_stream():
@@ -155,6 +156,13 @@ class MotrixCudaBackend(SimBackend):
             return None
         self._mocap_mask.zero_().index_fill_(0, ids, True)
         return wp.from_torch(self._mocap_mask)
+
+    def gain_table(self, attribute: str) -> torch.Tensor:
+        if attribute not in self._gain_tables:
+            table = wp.to_torch(getattr(self.data, attribute))
+            self._gain_tables[attribute] = table
+            self._reset_arrays.append((table, table[0].clone()))
+        return self._gain_tables[attribute]
 
     def reset_rows(self, rows: slice | torch.Tensor, mocap_mask) -> None:
         self.position[rows] = self.initial_position
