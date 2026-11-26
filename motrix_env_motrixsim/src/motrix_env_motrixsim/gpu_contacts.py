@@ -158,3 +158,210 @@ def touch_force(
                 total += wp.abs(impulses[world, row])
                 break
     output[world, 0] = total * inv_dt
+
+
+@wp.kernel
+def geom_pair_hits(
+    contacts: wp.array2d(dtype=Any),
+    counts: wp.array(dtype=wp.int32),
+    pairs: wp.array2d(dtype=wp.int32),
+    offsets: wp.array(dtype=wp.int32),
+    output: wp.array2d(dtype=wp.float32),
+):
+    world, group = wp.tid()
+    for i in range(wp.min(counts[world], contacts.shape[1])):
+        pair = contacts[world, i].pair_index
+        for j in range(offsets[group], offsets[group + 1]):
+            a, b = pairs[j, 0], pairs[j, 1]
+            if (pair[0] == a and pair[1] == b) or (pair[0] == b and pair[1] == a):
+                output[world, group] = 1.0
+                return
+    output[world, group] = 0.0
+
+
+class ContactReaders:
+    """Bind solver storage and share one dense row lookup per snapshot refresh."""
+
+    def __init__(self, backend):
+        self.backend = backend
+        self._rows = None
+        self.prepare_rows = None
+
+    def pair_reader(self, groups):
+        offsets = [0]
+        flat = []
+        for group in groups:
+            flat.extend(group)
+            offsets.append(len(flat))
+        backend = self.backend
+        if not flat:
+            result = backend.position.new_zeros((backend.data.num_worlds, len(groups)))
+            return lambda: result
+        device = backend._warp_device
+        pairs = wp.array(flat, dtype=wp.int32, device=device).reshape((-1, 2))
+        bounds = wp.array(offsets, dtype=wp.int32, device=device)
+        shape = (backend.data.num_worlds, len(groups))
+        output = wp.empty(shape, dtype=wp.float32, device=device)
+        result = wp.to_torch(output)
+        collision = backend._domains["rigid_collision"]
+
+        def fetch():
+            wp.launch(
+                geom_pair_hits,
+                shape,
+                inputs=[collision.contacts, collision.contact_count, pairs, bounds, output],
+                device=device,
+            )
+            return result
+
+        return fetch
+
+    def sensor_reader(self, name):
+        if name in self.backend._touch_sensors:
+            return self.touch_reader(self.backend._touch_sensors[name])
+        sensor = self.backend._contact_sensors.get(name)
+        if sensor is None:
+            return None
+        report = sensor.report
+        if (
+            report.normal
+            and not any((report.found, report.force, report.torque, report.pos, report.tangent, report.dist))
+            and sensor.max_num == 1
+            and sensor.reduce == "none"
+        ):
+            return self.geom_contact_reader(sensor.collider_pairs, normal=True)
+        if (
+            not report.found
+            or any((report.force, report.torque, report.pos, report.normal, report.tangent, report.dist))
+            or sensor.max_num != 1
+        ):
+            raise NotImplementedError(
+                f"MotrixSim CUDA cannot provide contact sensor {name!r} with its requested report"
+            )
+        return self.geom_contact_reader(sensor.collider_pairs)
+
+    def link_contact_reader(self, indices):
+        if not indices:
+            empty = self.backend.position.new_empty((self.backend.data.num_worlds, 0, 6))
+            return lambda: empty
+
+        collision = self.backend._domains["rigid_collision"]
+        solver = self.backend._domains["solver"]
+        maps = self.backend.host_model.low.link_low_maps
+        # A high-level link can span virtual joints. Its colliders belong to the final rigid link.
+        low = [maps[i].index + maps[i].num - 1 for i in indices]
+        high_ids = wp.array(indices, dtype=wp.int32, device=self.backend._warp_device)
+        low_ids = wp.array(low, dtype=wp.int32, device=self.backend._warp_device)
+        output = wp.zeros(
+            (self.backend.data.num_worlds, len(indices), 6), dtype=wp.float32, device=self.backend._warp_device
+        )
+        result = wp.to_torch(output)
+
+        rows = self._contact_rows()
+        poses = self.backend.model.get_link_poses(self.backend.data)
+
+        def fetch():
+            wp.launch(
+                link_contact_wrenches,
+                (self.backend.data.num_worlds, len(indices)),
+                inputs=[
+                    collision.contacts,
+                    collision.contact_count,
+                    rows,
+                    solver.constraint_lambdas.unilateral,
+                    poses,
+                    self.backend._domains["overrides"].apparent_link_com,
+                    high_ids,
+                    low_ids,
+                    1.0 / self.backend.model.timestep,
+                    output,
+                ],
+                device=self.backend._warp_device,
+            )
+            return result
+
+        return fetch
+
+    def _contact_rows(self):
+        if self._rows is not None:
+            return self._rows
+        collision = self.backend._domains["rigid_collision"]
+        solver = self.backend._domains["solver"]
+        sparse = solver.sparse_jacobian
+        if sparse is not None:
+            self._rows = sparse.contact_rows.rows
+        else:
+            rows = wp.empty((*collision.contacts.shape, 6), dtype=wp.int32, device=self.backend._warp_device)
+            warm = solver.persistent_lambdas
+
+            def prepare():
+                wp.launch(
+                    dense_contact_rows,
+                    collision.contacts.shape,
+                    inputs=[collision.contacts, collision.contact_count, warm.slots, warm.rows, warm.row_counter, rows],
+                    device=self.backend._warp_device,
+                )
+
+            self._rows = rows
+            self.prepare_rows = prepare
+        return self._rows
+
+    def touch_reader(self, sensor):
+        shape = sensor.shape.shape_type
+        if shape not in ("sphere", "box") or sensor.loc.location_type != "Frame":
+            raise NotImplementedError(f"Unsupported touch sensor geometry for {sensor.name!r}: {shape}")
+        collision = self.backend._domains["rigid_collision"]
+        impulses = self.backend._domains["solver"].constraint_lambdas.unilateral
+        sensors = self.backend._domains["sensors"]
+        colliders = wp.array(sensor.colliders, dtype=wp.int32, device=self.backend._warp_device)
+        output = wp.zeros((self.backend.data.num_worlds, 1), dtype=wp.float32, device=self.backend._warp_device)
+        result = wp.to_torch(output)
+        rows = self._contact_rows()
+        size = wp.vec3(*sensor.size)
+
+        def fetch():
+            wp.launch(
+                touch_force,
+                self.backend.data.num_worlds,
+                inputs=[
+                    collision.contacts,
+                    collision.contact_count,
+                    rows,
+                    impulses,
+                    sensors.base_to_frames,
+                    sensors.frame_len,
+                    sensor.loc.location_id,
+                    colliders,
+                    size,
+                    shape == "box",
+                    1.0 / self.backend.model.timestep,
+                    output,
+                ],
+                device=self.backend._warp_device,
+            )
+            return result
+
+        return fetch
+
+    def geom_contact_reader(self, collider_pairs, *, normal=False):
+        collision = self.backend._domains["rigid_collision"]
+        if not collider_pairs:
+            empty = self.backend.position.new_zeros((self.backend.data.num_worlds, 3 if normal else 1))
+            return lambda: empty
+        pairs = wp.array(collider_pairs, dtype=wp.int32, device=self.backend._warp_device).reshape((-1, 2))
+        output = wp.zeros(
+            (self.backend.data.num_worlds, 3 if normal else 1), dtype=wp.float32, device=self.backend._warp_device
+        )
+
+        result = wp.to_torch(output)
+
+        def fetch():
+            wp.launch(
+                read_geom_contacts,
+                self.backend.data.num_worlds,
+                inputs=[collision.contacts, collision.contact_count, pairs, normal, output],
+                device=self.backend._warp_device,
+            )
+            return result
+
+        return fetch

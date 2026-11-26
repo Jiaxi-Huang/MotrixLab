@@ -3,6 +3,9 @@
 
 """Batched CUDA physics on a Warp stream ordered with the calling Torch stream."""
 
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
 
@@ -10,9 +13,13 @@ import torch
 import warp as wp
 from motrixsim import gpu
 
-from motrix_env_core.sim.backend import SimBackend
+from motrix_env_core.config.scene import SceneCfg
+from motrix_env_core.config.sim import SimCfg
+from motrix_env_core.sim.backend import RenderConfig, SimBackend, SimRenderer
+from motrix_env_core.sim.model import ModelQuery, SimModel
+from motrix_env_core.sim.read import PhysicsReadProgram, SimDataQuery
 from motrix_env_motrixsim.compiler import MotrixSimSceneCompiler
-from motrix_env_motrixsim.gpu_reads import CudaReads
+from motrix_env_motrixsim.gpu_reads import CudaReadCompiler
 from motrix_env_motrixsim.gpu_writes import CudaWriteCompiler
 from motrix_env_motrixsim.runtime import MotrixSimModelCompiler
 
@@ -33,7 +40,7 @@ def _device_metadata(value, device):
 class MotrixCudaBackend(SimBackend):
     name = "motrixsim"
 
-    def __init__(self, scene, sim, num_envs, *, render=None):
+    def __init__(self, scene: SceneCfg, sim: SimCfg, num_envs: int, *, render: RenderConfig | None = None) -> None:
         super().__init__(scene, sim, num_envs, render=render)
         device = torch.device(sim.device)
         self.device = torch.device("cuda", torch.cuda.current_device() if device.index is None else device.index)
@@ -165,160 +172,7 @@ class MotrixCudaBackend(SimBackend):
                 poses[rows] = default
                 self.set_mocap_pose(mocap, poses, rows)
 
-    def sensor_reader(self, name):
-        if name in self._touch_sensors:
-            return self.touch_reader(self._touch_sensors[name])
-        sensor = self._contact_sensors.get(name)
-        if sensor is None:
-            return lambda: wp.to_torch(self.model.get_sensor_value(name, self.data))
-        report = sensor.report
-        if (
-            report.normal
-            and not any((report.found, report.force, report.torque, report.pos, report.tangent, report.dist))
-            and sensor.max_num == 1
-            and sensor.reduce == "none"
-        ):
-            return self.geom_contact_reader(sensor.collider_pairs, normal=True)
-        if (
-            not report.found
-            or any((report.force, report.torque, report.pos, report.normal, report.tangent, report.dist))
-            or sensor.max_num != 1
-        ):
-            raise NotImplementedError(
-                f"MotrixSim CUDA cannot provide contact sensor {name!r} with its requested report"
-            )
-        return self.geom_contact_reader(sensor.collider_pairs)
-
-    def link_contact_reader(self, indices):
-        from motrix_env_motrixsim.gpu_contacts import link_contact_wrenches
-
-        if not indices:
-            empty = self.position.new_empty((self.data.num_worlds, 0, 6))
-            return lambda: empty
-
-        collision = self._domains["rigid_collision"]
-        solver = self._domains["solver"]
-        maps = self.host_model.low.link_low_maps
-        # A high-level link can span virtual joints. Its colliders belong to the final rigid link.
-        low = [maps[i].index + maps[i].num - 1 for i in indices]
-        high_ids = wp.array(indices, dtype=wp.int32, device=self._warp_device)
-        low_ids = wp.array(low, dtype=wp.int32, device=self._warp_device)
-        output = wp.zeros((self.data.num_worlds, len(indices), 6), dtype=wp.float32, device=self._warp_device)
-        result = wp.to_torch(output)
-
-        fetch_rows = self._contact_rows_reader()
-
-        def fetch():
-            rows = fetch_rows()
-            wp.launch(
-                link_contact_wrenches,
-                (self.data.num_worlds, len(indices)),
-                inputs=[
-                    collision.contacts,
-                    collision.contact_count,
-                    rows,
-                    solver.constraint_lambdas.unilateral,
-                    self.model.get_link_poses(self.data),
-                    self._domains["overrides"].apparent_link_com,
-                    high_ids,
-                    low_ids,
-                    1.0 / self.model.timestep,
-                    output,
-                ],
-                device=self._warp_device,
-            )
-            return result
-
-        return fetch
-
-    def _contact_rows_reader(self):
-        from motrix_env_motrixsim.gpu_contacts import dense_contact_rows
-
-        collision = self._domains["rigid_collision"]
-        solver = self._domains["solver"]
-        sparse = solver.sparse_jacobian
-        rows = (
-            wp.empty((*collision.contacts.shape, 6), dtype=wp.int32, device=self._warp_device)
-            if sparse is None
-            else sparse.contact_rows.rows
-        )
-
-        def fetch_rows():
-            if sparse is None:
-                warm = solver.persistent_lambdas
-                wp.launch(
-                    dense_contact_rows,
-                    collision.contacts.shape,
-                    inputs=[collision.contacts, collision.contact_count, warm.slots, warm.rows, warm.row_counter, rows],
-                    device=self._warp_device,
-                )
-            return rows
-
-        return fetch_rows
-
-    def touch_reader(self, sensor):
-        from motrix_env_motrixsim.gpu_contacts import touch_force
-
-        shape = sensor.shape.shape_type
-        if shape not in ("sphere", "box") or sensor.loc.location_type != "Frame":
-            raise NotImplementedError(f"Unsupported touch sensor geometry for {sensor.name!r}: {shape}")
-        collision = self._domains["rigid_collision"]
-        impulses = self._domains["solver"].constraint_lambdas.unilateral
-        sensors = self._domains["sensors"]
-        colliders = wp.array(sensor.colliders, dtype=wp.int32, device=self._warp_device)
-        output = wp.zeros((self.data.num_worlds, 1), dtype=wp.float32, device=self._warp_device)
-        result = wp.to_torch(output)
-        fetch_rows = self._contact_rows_reader()
-        size = wp.vec3(*sensor.size)
-
-        def fetch():
-            wp.launch(
-                touch_force,
-                self.data.num_worlds,
-                inputs=[
-                    collision.contacts,
-                    collision.contact_count,
-                    fetch_rows(),
-                    impulses,
-                    sensors.base_to_frames,
-                    sensors.frame_len,
-                    sensor.loc.location_id,
-                    colliders,
-                    size,
-                    shape == "box",
-                    1.0 / self.model.timestep,
-                    output,
-                ],
-                device=self._warp_device,
-            )
-            return result
-
-        return fetch
-
-    def geom_contact_reader(self, collider_pairs, *, normal=False):
-        from motrix_env_motrixsim.gpu_contacts import read_geom_contacts
-
-        collision = self._domains["rigid_collision"]
-        if not collider_pairs:
-            empty = self.position.new_zeros((self.data.num_worlds, 3 if normal else 1))
-            return lambda: empty
-        pairs = wp.array(collider_pairs, dtype=wp.int32, device=self._warp_device).reshape((-1, 2))
-        output = wp.zeros((self.data.num_worlds, 3 if normal else 1), dtype=wp.float32, device=self._warp_device)
-
-        result = wp.to_torch(output)
-
-        def fetch():
-            wp.launch(
-                read_geom_contacts,
-                self.data.num_worlds,
-                inputs=[collision.contacts, collision.contact_count, pairs, normal, output],
-                device=self._warp_device,
-            )
-            return result
-
-        return fetch
-
-    def sample_terrain_height(self, geom_name, env_ids, xy):
+    def sample_terrain_height(self, geom_name: str, env_ids: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
         from motrix_env_core.mdp.terrain import heightfield_lookup
         from motrix_env_core.sim.model import HeightFieldDataQuery
 
@@ -335,13 +189,13 @@ class MotrixCudaBackend(SimBackend):
             return xy.new_full(xy.shape[:-1], terrain)
         return heightfield_lookup(terrain, xy[..., 0].double(), xy[..., 1].double()).float()
 
-    def compile_model(self, queries):
+    def compile_model(self, queries: Mapping[str, ModelQuery]) -> SimModel:
         return _device_metadata(super().compile_model(queries), self.device)
 
-    def compile_reads(self, queries):
-        return CudaReads(self, queries)
+    def compile_reads(self, queries: Mapping[str, SimDataQuery]) -> PhysicsReadProgram:
+        return CudaReadCompiler(self, queries).build()
 
-    def step(self, substeps, result=None):
+    def step(self, substeps: int, result: torch.Tensor | None = None) -> None:
         with self.physics_stream():
             for _ in range(substeps):
                 self.model.step(self.data, stream=self._stream)
