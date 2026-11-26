@@ -96,10 +96,12 @@ class MotrixCudaBackend(SimBackend):
                 if body.is_mocap:
                     mocap = body.mocap
                     self._mocap_defaults.append((mocap, wp.to_torch(mocap.get_pose(self.data))[0].clone()))
+        if self._mocap_defaults:
+            self._mocap_mask = torch.empty(num_envs, dtype=torch.bool, device=self.device)
         self._write_compiler = CudaWriteCompiler(self)
 
     @contextmanager
-    def physics_stream(self):
+    def physics_stream(self) -> Iterator[None]:
         current = torch.cuda.current_stream(self.device)
         with wp.ScopedStream(self._stream, sync_enter=False, sync_exit=False):
             if current.cuda_stream == self._stream.cuda_stream:
@@ -116,26 +118,26 @@ class MotrixCudaBackend(SimBackend):
     step_context = physics_stream
 
     @property
-    def model_compiler(self):
+    def model_compiler(self) -> MotrixSimModelCompiler:
         return self._model_compiler
 
     @property
-    def write_compiler(self):
+    def write_compiler(self) -> CudaWriteCompiler:
         return self._write_compiler
 
     @property
-    def num_dof_pos(self):
+    def num_dof_pos(self) -> int:
         return self.model.num_dof_pos
 
     @property
-    def num_dof_vel(self):
+    def num_dof_vel(self) -> int:
         return self.model.num_dof_vel
 
     @property
-    def num_actuators(self):
+    def num_actuators(self) -> int:
         return self.model.num_actuators
 
-    def create_renderer(self, config, *, num_envs, render_spacing):
+    def create_renderer(self, config: RenderConfig, *, num_envs: int, render_spacing: float) -> SimRenderer:
         from motrix_env_motrixsim.renderer import MotrixSimRenderer
 
         return MotrixSimRenderer(
@@ -148,29 +150,34 @@ class MotrixCudaBackend(SimBackend):
             render_app=gpu.render.RenderApp(headless=config.headless),
         )
 
-    def set_mocap_pose(self, mocap, poses, rows):
-        mask = None
-        if isinstance(rows, torch.Tensor):
-            selected = torch.zeros(self.data.num_worlds, device=self.device, dtype=torch.bool)
-            selected[rows] = True
-            mask = wp.from_torch(selected)
-        mocap.set_pose(self.data, wp.from_torch(poses), world_mask=mask)
+    def mocap_mask(self, ids: torch.Tensor | None):
+        if ids is None:
+            return None
+        self._mocap_mask.zero_().index_fill_(0, ids, True)
+        return wp.from_torch(self._mocap_mask)
 
-    def reset_rows(self, rows):
+    def reset_rows(self, rows: slice | torch.Tensor, mocap_mask) -> None:
         self.position[rows] = self.initial_position
-        self.velocity[rows] = 0
-        self.control[rows] = 0
+        if isinstance(rows, torch.Tensor):
+            self.velocity.index_fill_(0, rows, 0)
+            self.control.index_fill_(0, rows, 0)
+        else:
+            self.velocity.zero_()
+            self.control.zero_()
         for tensor, initial in self._reset_arrays:
             tensor[rows] = initial
-        with self.physics_stream():
-            for setter, default in self._reset_parameters.values():
-                values = torch.full_like(default, torch.nan)
-                values[rows] = default[rows]
-                setter(self.data, wp.from_torch(values))
-            for mocap, default in self._mocap_defaults:
-                poses = wp.to_torch(mocap.get_pose(self.data))
-                poses[rows] = default
-                self.set_mocap_pose(mocap, poses, rows)
+        for setter, default, scratch in self._reset_parameters.values():
+            if isinstance(rows, slice):
+                values = default
+            else:
+                scratch.fill_(torch.nan)
+                scratch[rows] = default[rows]
+                values = scratch
+            setter(self.data, wp.from_torch(values))
+        for mocap, default in self._mocap_defaults:
+            poses = wp.to_torch(mocap.get_pose(self.data))
+            poses[rows] = default
+            mocap.set_pose(self.data, wp.from_torch(poses), world_mask=mocap_mask)
 
     def sample_terrain_height(self, geom_name: str, env_ids: torch.Tensor, xy: torch.Tensor) -> torch.Tensor:
         from motrix_env_core.mdp.terrain import heightfield_lookup

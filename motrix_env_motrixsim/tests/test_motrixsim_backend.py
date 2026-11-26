@@ -593,3 +593,30 @@ def test_cuda_contact_reports_for_offset_load(tmp_path):
     torch.testing.assert_close(reads["wrench"][:, 0], expected.expand(2, -1), atol=0.01, rtol=0.001)
     reports = torch.tensor([9.81, 0, 0, 0, 1, 0, 0, -1], device=device)
     torch.testing.assert_close(reads["reports"], reports.expand(2, -1), atol=0.01, rtol=0.001)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires NVIDIA CUDA")
+def test_cuda_compact_writes_route_rows_in_caller_order():
+    pytest.importorskip("motrixsim.gpu")
+    from motrix_env_core import registry
+
+    cfg = registry.make_env_config("dm-finger-spin", mode="play")
+    cfg.sim.device = "cuda:0"
+    device = torch.device(cfg.sim.device)
+    backend = MotrixSimBackend.for_device(device)(cfg.scene, cfg.sim, 4)
+    joints = ("distal", "hinge")
+    program = backend.compile_writes({"position": JointPositionWrite(joints)}, reset=True)
+    read = backend.compile_reads({"position": JointPositionQuery(joints=joints)})
+    read.execute()
+    expected = read["position"].clone()
+    ids = torch.tensor([3, 0], device=device)
+    compact = torch.tensor([[0.2, -0.1], [-0.4, 0.3]], device=device)
+    staging = program.buffer("position")
+    staging[:2].copy_(compact)
+    program.execute_compact(ids, (staging,))
+    read.execute()
+    expected[ids] = compact
+    torch.testing.assert_close(read["position"], expected)
+    with pytest.raises(ValueError, match="conflict"):
+        backend.compile_writes({"a": JointPositionWrite(joints), "b": JointPositionWrite(("hinge",))})
